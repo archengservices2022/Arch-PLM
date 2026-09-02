@@ -1,0 +1,201 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// ============================================================
+// ARCH PLM - CORE ENUMS
+// ============================================================
+
+enum UserRole {
+  ADMIN
+  ENGINEER
+  DESIGNER
+  REVIEWER
+  APPROVER
+  VIEWER
+}
+
+enum ItemType {
+  PART
+  ASSEMBLY
+  DOCUMENT
+}
+
+enum LifecycleState {
+  WORKING
+  IN_REVIEW
+  APPROVED
+  RELEASED
+  SUPERSEDED
+  OBSOLETE
+}
+
+
+// ============================================================
+// ORGANIZATION
+// ============================================================
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  code      String   @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  customers Customer[]
+  projects  Project[]
+  items     Item[]
+}
+
+
+// ============================================================
+// USER
+// ============================================================
+
+model User {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  email          String
+  name           String
+  role           UserRole     @default(ENGINEER)
+  active         Boolean      @default(true)
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+
+// ============================================================
+// CUSTOMER
+// ============================================================
+
+model Customer {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name           String
+  customerNumber String?
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  projects       Project[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, customerNumber])
+  @@index([organizationId])
+}
+
+
+// ============================================================
+// PROJECT
+// ============================================================
+
+model Project {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  customerId     String?
+  customer       Customer?    @relation(fields: [organizationId, customerId], references: [organizationId, id], onDelete: Restrict)
+
+  projectNumber  String
+  name           String
+  description    String?
+
+  active         Boolean      @default(true)
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  items          Item[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, projectNumber])
+  @@index([organizationId])
+  @@index([customerId])
+}
+
+
+// ============================================================
+// ITEM
+//
+// Permanent engineering identity.
+// Example: 10073-MFD-AS210
+// ============================================================
+
+model Item {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  projectId      String?
+  project        Project?     @relation(fields: [organizationId, projectId], references: [organizationId, id], onDelete: Restrict)
+
+  itemNumber     String
+  description    String
+  type           ItemType
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  revisions      ItemRevision[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, itemNumber])
+  @@index([organizationId])
+  @@index([projectId])
+  @@index([itemNumber])
+}
+
+
+// ============================================================
+// ITEM REVISION
+//
+// Item 10073-MFD-AS210
+//   Rev A
+//   Rev B
+//
+// Revision != CAD file version
+// ============================================================
+
+model ItemRevision {
+  id          String         @id @default(cuid())
+
+  itemId      String
+  item        Item           @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  revision    String
+  description String?
+
+  lifecycle   LifecycleState @default(WORKING)
+  releasedAt  DateTime?
+
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([itemId, revision])
+  @@index([itemId])
+  @@index([lifecycle])
+}
