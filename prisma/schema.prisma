@@ -53,6 +53,20 @@ enum CadDocumentType {
   OTHER
 }
 
+// PDM: the kind of directional relationship between two CAD documents.
+//   COMPONENT          IAM assembly contains/references an IPT or IAM component
+//   DRAWING_REFERENCE  IDW/DWG drawing references an IAM/IPT model
+//   DERIVED            a CAD document is derived from another CAD document
+//   REFERENCE          generic external/reference relationship
+//   OTHER              fallback
+enum CadDependencyType {
+  COMPONENT
+  DRAWING_REFERENCE
+  DERIVED
+  REFERENCE
+  OTHER
+}
+
 // ============================================================
 // ORGANIZATION
 // ============================================================
@@ -73,6 +87,7 @@ model Organization {
   cadDocuments          CadDocument[]
   fileVersions          FileVersion[]
   itemRevisionDocuments ItemRevisionDocument[]
+  cadDependencies       CadDependency[]
 }
 
 // ============================================================
@@ -98,6 +113,7 @@ model User {
   createdCadDocuments          CadDocument[]
   createdFileVersions          FileVersion[]
   createdItemRevisionDocuments ItemRevisionDocument[]
+  createdCadDependencies       CadDependency[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -268,6 +284,12 @@ model CadDocument {
   fileVersions  FileVersion[]
   revisionLinks ItemRevisionDocument[]
 
+  // CAD reference graph (Milestone 2). Directional edges:
+  //   outgoingDependencies -> documents THIS document references / uses
+  //   incomingDependencies -> documents that reference THIS document ("where used")
+  outgoingDependencies CadDependency[] @relation("CadDependencyParent")
+  incomingDependencies CadDependency[] @relation("CadDependencyChild")
+
   @@unique([organizationId, id])
   @@unique([organizationId, documentNumber])
   @@index([organizationId])
@@ -352,5 +374,59 @@ model FileVersion {
   @@unique([organizationId, id])
   @@index([organizationId])
   @@index([cadDocumentId])
+  @@index([createdById])
+}
+
+// ============================================================
+// CAD DEPENDENCY  (PDM Milestone 2 - CAD reference graph)
+//
+// A directional edge between two CAD documents in the SAME
+// organization:
+//
+//   parentDocument  --(dependencyType)-->  childDocument
+//
+//   Assembly.iam  --COMPONENT-->          Part.ipt
+//   Assembly.iam  --COMPONENT-->          Subassembly.iam
+//   Drawing.idw   --DRAWING_REFERENCE-->  Assembly.iam
+//
+// ARCHITECTURAL DECISION: dependencies are between logical CAD
+// DOCUMENTS, not individual FileVersions. The logical reference
+// ("Assembly.iam uses Part.ipt") survives across file versions.
+// A version-specific dependency snapshot captured at check-in /
+// release is a deliberately separate, future concern.
+//
+// All three foreign keys are composite and organization-aware:
+// parentDocument, childDocument and createdBy must ALL belong to
+// this row's organization. A cross-tenant edge is impossible at
+// the database level.
+// ============================================================
+
+model CadDependency {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  parentDocumentId String
+  parentDocument   CadDocument @relation("CadDependencyParent", fields: [organizationId, parentDocumentId], references: [organizationId, id], onDelete: Cascade)
+
+  childDocumentId String
+  childDocument   CadDocument @relation("CadDependencyChild", fields: [organizationId, childDocumentId], references: [organizationId, id], onDelete: Cascade)
+
+  dependencyType CadDependencyType
+
+  // Set from the authenticated actor on the server, never from the client.
+  createdById String
+  createdBy   User   @relation(fields: [organizationId, createdById], references: [organizationId, id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, id])
+  // The same directional edge + type cannot be recorded twice.
+  @@unique([organizationId, parentDocumentId, childDocumentId, dependencyType])
+  @@index([organizationId])
+  @@index([parentDocumentId])
+  @@index([childDocumentId])
   @@index([createdById])
 }

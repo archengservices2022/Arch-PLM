@@ -2,9 +2,11 @@ import {
   LifecycleState,
   ItemType,
   CadDocumentType,
+  CadDependencyType,
 } from "@/app/generated/prisma/enums";
 import {
   advanceRevision,
+  createCadDependency,
   createCadDocument,
   createFileVersion,
   createItem,
@@ -35,59 +37,98 @@ async function getDashboardData(organizationId: string) {
       projects: [],
       items: [],
       revisions: [],
+      cadDocuments: [],
+      cadDependencies: [],
       cadDocumentCount: 0,
       lifecycleCounts: emptyLifecycleCounts(),
       openRevisions: [],
     };
   }
 
-  const [projects, items, revisions, cadDocumentCount] = await Promise.all([
-    prisma.project.findMany({
-      where: { organizationId: organization.id },
-      orderBy: { projectNumber: "asc" },
-      include: { customer: true },
-    }),
-    prisma.item.findMany({
-      where: { organizationId: organization.id },
-      orderBy: { itemNumber: "asc" },
-      include: {
-        project: true,
-        revisions: {
-          orderBy: { createdAt: "desc" },
+  const [projects, items, revisions, cadDocuments, cadDependencies] =
+    await Promise.all([
+      prisma.project.findMany({
+        where: { organizationId: organization.id },
+        orderBy: { projectNumber: "asc" },
+        include: { customer: true },
+      }),
+      prisma.item.findMany({
+        where: { organizationId: organization.id },
+        orderBy: { itemNumber: "asc" },
+        include: {
+          project: true,
+          revisions: {
+            orderBy: { createdAt: "desc" },
+          },
         },
-      },
-    }),
-    prisma.itemRevision.findMany({
-      where: { organizationId: organization.id },
-      orderBy: [{ lifecycle: "asc" }, { updatedAt: "desc" }],
-      include: {
-        item: true,
-        // CAD documents are associated through the ItemRevisionDocument link,
-        // not owned by the revision.
-        documentLinks: {
-          orderBy: { cadDocument: { documentNumber: "asc" } },
-          select: {
-            id: true,
-            cadDocument: {
-              select: {
-                id: true,
-                documentNumber: true,
-                fileName: true,
-                documentType: true,
-                _count: { select: { fileVersions: true } },
-                fileVersions: {
-                  orderBy: { versionNumber: "desc" },
-                  take: 1,
-                  select: { versionNumber: true, createdAt: true },
+      }),
+      prisma.itemRevision.findMany({
+        where: { organizationId: organization.id },
+        orderBy: [{ lifecycle: "asc" }, { updatedAt: "desc" }],
+        include: {
+          item: true,
+          // CAD documents are associated through the ItemRevisionDocument link,
+          // not owned by the revision.
+          documentLinks: {
+            orderBy: { cadDocument: { documentNumber: "asc" } },
+            select: {
+              id: true,
+              cadDocument: {
+                select: {
+                  id: true,
+                  documentNumber: true,
+                  fileName: true,
+                  documentType: true,
+                  _count: { select: { fileVersions: true } },
+                  fileVersions: {
+                    orderBy: { versionNumber: "desc" },
+                    take: 1,
+                    select: { versionNumber: true, createdAt: true },
+                  },
                 },
               },
             },
           },
         },
-      },
-    }),
-    prisma.cadDocument.count({ where: { organizationId: organization.id } }),
-  ]);
+      }),
+      // All CAD documents in the workspace (for the reference-graph form and
+      // "Where used" is derived from the edge list below (distinct parents),
+      // so no per-document dependency counts are needed here.
+      prisma.cadDocument.findMany({
+        where: { organizationId: organization.id },
+        orderBy: { documentNumber: "asc" },
+        select: {
+          id: true,
+          fileName: true,
+          documentNumber: true,
+          documentType: true,
+        },
+      }),
+      // The CAD reference graph edges themselves.
+      prisma.cadDependency.findMany({
+        where: { organizationId: organization.id },
+        orderBy: [
+          { parentDocument: { documentNumber: "asc" } },
+          { dependencyType: "asc" },
+          { childDocument: { documentNumber: "asc" } },
+        ],
+        select: {
+          id: true,
+          dependencyType: true,
+          parentDocument: {
+            select: { id: true, fileName: true, documentNumber: true },
+          },
+          childDocument: {
+            select: {
+              id: true,
+              fileName: true,
+              documentNumber: true,
+              documentType: true,
+            },
+          },
+        },
+      }),
+    ]);
 
   const lifecycleCounts = revisions.reduce((counts, revision) => {
     counts[revision.lifecycle] += 1;
@@ -105,7 +146,9 @@ async function getDashboardData(organizationId: string) {
     projects,
     items,
     revisions,
-    cadDocumentCount,
+    cadDocuments,
+    cadDependencies,
+    cadDocumentCount: cadDocuments.length,
     lifecycleCounts,
     openRevisions,
   };
@@ -177,6 +220,8 @@ export default async function Home() {
     projects,
     items,
     revisions,
+    cadDocuments,
+    cadDependencies,
     cadDocumentCount,
     lifecycleCounts,
     openRevisions,
@@ -184,6 +229,51 @@ export default async function Home() {
   const revisionsWithCad = revisions.filter(
     (revision) => revision.documentLinks.length > 0,
   );
+
+  // Group dependency edges by parent document for the "references" view.
+  type CadEdge = (typeof cadDependencies)[number];
+  type DependencyGroup = { parent: CadEdge["parentDocument"]; edges: CadEdge[] };
+  const dependencyGroups = cadDependencies.reduce<DependencyGroup[]>(
+    (groups, edge) => {
+      const existing = groups.find(
+        (group) => group.parent.id === edge.parentDocument.id,
+      );
+      if (existing) {
+        existing.edges.push(edge);
+      } else {
+        groups.push({ parent: edge.parentDocument, edges: [edge] });
+      }
+      return groups;
+    },
+    [],
+  );
+
+  // "Where used": for each child document, the count of DISTINCT parent CAD
+  // documents that reference it. The schema intentionally allows the same
+  // parent->child pair with different dependency types (COMPONENT + REFERENCE),
+  // so a raw edge/row count would over-report. Derived from the already-fetched
+  // edge list — no extra query.
+  const whereUsed = Array.from(
+    cadDependencies
+      .reduce<Map<string, { document: CadEdge["childDocument"]; parents: Set<string> }>>(
+        (map, edge) => {
+          const entry = map.get(edge.childDocument.id) ?? {
+            document: edge.childDocument,
+            parents: new Set<string>(),
+          };
+          entry.parents.add(edge.parentDocument.id);
+          map.set(edge.childDocument.id, entry);
+          return map;
+        },
+        new Map(),
+      )
+      .values(),
+  )
+    .map((entry) => ({
+      document: entry.document,
+      parentCount: entry.parents.size,
+    }))
+    .sort((a, b) => a.document.fileName.localeCompare(b.document.fileName));
 
   return (
     <main className="min-h-screen bg-stone-100 text-slate-950">
@@ -441,6 +531,126 @@ export default async function Home() {
                   file version never changes an engineering revision.
                 </p>
               ) : null}
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <h2 className="text-lg font-semibold">CAD references</h2>
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                {cadDependencies.length} relationship
+                {cadDependencies.length === 1 ? "" : "s"} · document-to-document ·
+                independent of file versions
+              </span>
+            </div>
+
+            <form
+              action={createCadDependency}
+              className="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_170px_1fr_110px]"
+            >
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                Parent CAD document
+                <select
+                  name="parentDocumentId"
+                  required
+                  defaultValue={cadDocuments[0]?.id ?? ""}
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                >
+                  {cadDocuments.length === 0 ? (
+                    <option value="">No CAD documents yet</option>
+                  ) : null}
+                  {cadDocuments.map((document) => (
+                    <option key={document.id} value={document.id}>
+                      {document.fileName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                Relationship
+                <select
+                  name="dependencyType"
+                  defaultValue={CadDependencyType.COMPONENT}
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                >
+                  {Object.values(CadDependencyType).map((type) => (
+                    <option key={type} value={type}>
+                      {formatState(type)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                Child CAD document
+                <select
+                  name="childDocumentId"
+                  required
+                  defaultValue={cadDocuments[1]?.id ?? ""}
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                >
+                  {cadDocuments.length === 0 ? (
+                    <option value="">No CAD documents yet</option>
+                  ) : null}
+                  {cadDocuments.map((document) => (
+                    <option key={document.id} value={document.id}>
+                      {document.fileName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="h-10 self-end rounded-md bg-slate-950 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-40"
+                disabled={cadDocuments.length < 2}
+              >
+                Link
+              </button>
+            </form>
+
+            <div className="grid gap-6 px-5 py-4 lg:grid-cols-[1fr_260px]">
+              <div className="flex flex-col gap-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  References / uses
+                </p>
+                {dependencyGroups.map((group) => (
+                  <div key={group.parent.id}>
+                    <p className="font-semibold">{group.parent.fileName}</p>
+                    <ul className="mt-1 flex flex-col gap-1">
+                      {group.edges.map((edge) => (
+                        <li key={edge.id} className="text-sm text-slate-700">
+                          <span className="font-mono text-xs uppercase text-teal-700">
+                            {edge.dependencyType}
+                          </span>{" "}
+                          → {edge.childDocument.fileName}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+                {cadDependencies.length === 0 ? (
+                  <p className="text-sm text-slate-600">
+                    No CAD relationships recorded yet.
+                  </p>
+                ) : null}
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-slate-200 pt-4 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Where used
+                </p>
+                {whereUsed.map((entry) => (
+                  <div key={entry.document.id} className="text-sm text-slate-700">
+                    <span className="font-semibold">{entry.document.fileName}</span>
+                    <span className="text-slate-500">
+                      {" "}
+                      · {entry.parentCount} parent
+                      {entry.parentCount === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                ))}
+                {whereUsed.length === 0 ? (
+                  <p className="text-sm text-slate-600">Nothing referenced yet.</p>
+                ) : null}
+              </div>
             </div>
           </section>
         </div>

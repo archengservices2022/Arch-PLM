@@ -5,6 +5,7 @@ import {
   LifecycleState,
   ItemType,
   CadDocumentType,
+  CadDependencyType,
 } from "@/app/generated/prisma/enums";
 import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/app/lib/prisma";
@@ -291,4 +292,242 @@ export async function createFileVersion(formData: FormData) {
   throw new Error(
     "Could not allocate a file version number after multiple attempts, please retry",
   );
+}
+
+// ============================================================
+// PDM Milestone 2: CAD dependency / reference graph
+//
+// ARCHITECTURAL DECISION: dependencies link logical CAD DOCUMENTS,
+// never individual FileVersions. "Assembly.iam uses Part.ipt" is a
+// stable logical fact that survives every file version bump. A
+// version-pinned dependency snapshot taken at check-in / release is
+// a separate future milestone and is NOT implemented here.
+// ============================================================
+
+// Defensive bound: the largest number of distinct documents the cycle
+// check will traverse before refusing to continue. Manual test graphs
+// are tiny; this only exists so malformed / adversarial data cannot
+// spin the traversal forever.
+const CAD_GRAPH_TRAVERSAL_LIMIT = 2000;
+
+/**
+ * Would adding the edge `parentDocumentId -> childDocumentId` create a cycle?
+ *
+ * A cycle appears iff `parentDocumentId` is already reachable FROM
+ * `childDocumentId` by following existing parent -> child edges
+ * (i.e. a path child ->* parent already exists).
+ *
+ * Breadth-first, tenant-scoped, with a visited set (so pre-existing
+ * malformed cycles cannot loop) and a hard node cap.
+ *
+ * NOTE: this only prevents NEW edges from closing a cycle. Detecting and
+ * repairing pre-existing malformed / cyclic graphs (e.g. imported by a
+ * future Inventor add-in or created before this guard existed) is out of
+ * scope here and belongs in a later administrative "graph integrity check"
+ * feature. TODO(pdm-admin): dependency graph integrity audit + repair tool.
+ */
+async function edgeWouldCreateCycle(
+  db: Prisma.TransactionClient,
+  organizationId: string,
+  parentDocumentId: string,
+  childDocumentId: string,
+): Promise<boolean> {
+  if (parentDocumentId === childDocumentId) {
+    return true;
+  }
+
+  const visited = new Set<string>([childDocumentId]);
+  let frontier: string[] = [childDocumentId];
+
+  while (frontier.length > 0) {
+    const edges = await db.cadDependency.findMany({
+      where: {
+        organizationId,
+        parentDocumentId: { in: frontier },
+      },
+      select: { childDocumentId: true },
+    });
+
+    const next: string[] = [];
+
+    for (const edge of edges) {
+      if (edge.childDocumentId === parentDocumentId) {
+        // child ->* parent path exists; the new parent -> child edge closes it.
+        return true;
+      }
+
+      if (!visited.has(edge.childDocumentId)) {
+        visited.add(edge.childDocumentId);
+        next.push(edge.childDocumentId);
+
+        if (visited.size > CAD_GRAPH_TRAVERSAL_LIMIT) {
+          throw new Error(
+            "The CAD reference graph is too large to validate safely. " +
+              "Please contact an administrator.",
+          );
+        }
+      }
+    }
+
+    frontier = next;
+  }
+
+  return false;
+}
+
+/**
+ * Manually record a directional CAD dependency:
+ *   parentDocument --(dependencyType)--> childDocument
+ *
+ * - Authenticated, active, non-viewer actor only.
+ * - organizationId and createdById come from the session, never FormData.
+ * - Both documents must belong to the actor's organization.
+ * - Self-references are rejected.
+ * - The edge is rejected if it would create a cycle in the existing graph.
+ * - Only a duplicate of the parent+child+type edge unique constraint is
+ *   translated to a friendly message; any other P2002 propagates as-is.
+ *
+ * The document lookup, cycle check and insert run in one Serializable
+ * transaction so two concurrent writers cannot each pass the cycle check
+ * and then jointly form a cycle.
+ */
+export async function createCadDependency(formData: FormData) {
+  const actor = await requireActor();
+  assertCanMutate(actor);
+
+  const parentDocumentId = requiredValue(formData, "parentDocumentId");
+  const childDocumentId = requiredValue(formData, "childDocumentId");
+  const dependencyType = enumValue(
+    CadDependencyType,
+    requiredValue(formData, "dependencyType"),
+    "dependencyType",
+  );
+
+  if (parentDocumentId === childDocumentId) {
+    throw new Error("A CAD document cannot depend on itself");
+  }
+
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await prisma.$transaction(
+        async (tx) => {
+          // Both endpoints must exist inside the actor's organization.
+          // (The composite FKs are a second, database-level guard.)
+          const documents = await tx.cadDocument.findMany({
+            where: {
+              organizationId: actor.organizationId,
+              id: { in: [parentDocumentId, childDocumentId] },
+            },
+            select: { id: true },
+          });
+          const foundIds = new Set(documents.map((document) => document.id));
+
+          if (
+            !foundIds.has(parentDocumentId) ||
+            !foundIds.has(childDocumentId)
+          ) {
+            throw new Error(
+              "Both CAD documents must exist in your organization",
+            );
+          }
+
+          if (
+            await edgeWouldCreateCycle(
+              tx,
+              actor.organizationId,
+              parentDocumentId,
+              childDocumentId,
+            )
+          ) {
+            throw new Error(
+              "That dependency would create a circular reference in the CAD graph",
+            );
+          }
+
+          await tx.cadDependency.create({
+            data: {
+              organizationId: actor.organizationId,
+              parentDocumentId,
+              childDocumentId,
+              dependencyType,
+              createdById: actor.userId,
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+
+      revalidatePath("/");
+      return;
+    } catch (error) {
+      // Only the parent+child+type edge-uniqueness constraint means
+      // "duplicate edge". Any other P2002 (e.g. the [organizationId, id]
+      // constraint) is unexpected and must not be masked.
+      if (isDuplicateDependencyEdgeError(error)) {
+        throw new Error("That CAD dependency already exists");
+      }
+
+      // Serialization failure under concurrent writes: retry a couple of times.
+      if (isSerializationError(error) && attempt < MAX_ATTEMPTS) {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error(
+    "Could not record the CAD dependency due to concurrent changes, please retry",
+  );
+}
+
+function isSerializationError(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2034"
+  );
+}
+
+// Postgres truncates the generated index name to 63 chars.
+const CAD_DEPENDENCY_EDGE_UNIQUE_CONSTRAINT =
+  "CadDependency_organizationId_parentDocumentId_childDocument_key";
+
+/**
+ * True only when a P2002 was raised by the CadDependency edge-uniqueness
+ * constraint (organizationId, parentDocumentId, childDocumentId, dependencyType).
+ * `error.meta.target` is `unknown` per Prisma's types, so it is narrowed by hand
+ * and may be either a field-name list or the constraint name string.
+ */
+function isDuplicateDependencyEdgeError(error: unknown): boolean {
+  if (
+    !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+    error.code !== "P2002"
+  ) {
+    return false;
+  }
+
+  const target: unknown = error.meta?.target;
+
+  if (Array.isArray(target)) {
+    const fields = target.filter(
+      (field): field is string => typeof field === "string",
+    );
+    return (
+      fields.includes("parentDocumentId") &&
+      fields.includes("childDocumentId") &&
+      fields.includes("dependencyType")
+    );
+  }
+
+  if (typeof target === "string") {
+    return (
+      target === CAD_DEPENDENCY_EDGE_UNIQUE_CONSTRAINT ||
+      (target.includes("parentDocumentId") &&
+        target.includes("childDocumentId"))
+    );
+  }
+
+  return false;
 }
