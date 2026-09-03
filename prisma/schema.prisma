@@ -14,7 +14,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-
 // ============================================================
 // ARCH PLM - CORE ENUMS
 // ============================================================
@@ -43,25 +42,38 @@ enum LifecycleState {
   OBSOLETE
 }
 
+// PDM: physical CAD document formats. Engineering revision lifecycle
+// (LifecycleState) is deliberately unrelated to CAD file versioning.
+enum CadDocumentType {
+  IPT
+  IAM
+  IDW
+  DWG
+  PDF
+  OTHER
+}
 
 // ============================================================
 // ORGANIZATION
 // ============================================================
 
 model Organization {
-  id        String   @id @default(cuid())
-  name      String
-  code      String   @unique
+  id   String @id @default(cuid())
+  name String
+  code String @unique
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  users     User[]
-  customers Customer[]
-  projects  Project[]
-  items     Item[]
+  users                 User[]
+  customers             Customer[]
+  projects              Project[]
+  items                 Item[]
+  itemRevisions         ItemRevision[]
+  cadDocuments          CadDocument[]
+  fileVersions          FileVersion[]
+  itemRevisionDocuments ItemRevisionDocument[]
 }
-
 
 // ============================================================
 // USER
@@ -72,22 +84,27 @@ model User {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
 
-  email          String
-  name           String
-  passwordHash   String?
-  lastLoginAt    DateTime?
+  email        String
+  name         String
+  passwordHash String?
+  lastLoginAt  DateTime?
 
+  role   UserRole @default(ENGINEER)
+  active Boolean  @default(true)
 
-  role           UserRole     @default(ENGINEER)
-  active         Boolean      @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdCadDocuments          CadDocument[]
+  createdFileVersions          FileVersion[]
+  createdItemRevisionDocuments ItemRevisionDocument[]
 
+  // Enables tenant-aware composite foreign keys that reference a user
+  // together with their organization.
+  @@unique([organizationId, id])
   @@unique([organizationId, email])
   @@index([organizationId])
 }
-
 
 // ============================================================
 // CUSTOMER
@@ -101,16 +118,15 @@ model Customer {
   name           String
   customerNumber String?
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  projects       Project[]
+  projects Project[]
 
   @@unique([organizationId, id])
   @@unique([organizationId, customerNumber])
   @@index([organizationId])
 }
-
 
 // ============================================================
 // PROJECT
@@ -121,26 +137,25 @@ model Project {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
 
-  customerId     String?
-  customer       Customer?    @relation(fields: [organizationId, customerId], references: [organizationId, id], onDelete: Restrict)
+  customerId String?
+  customer   Customer? @relation(fields: [organizationId, customerId], references: [organizationId, id], onDelete: Restrict)
 
-  projectNumber  String
-  name           String
-  description    String?
+  projectNumber String
+  name          String
+  description   String?
 
-  active         Boolean      @default(true)
+  active Boolean @default(true)
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  items          Item[]
+  items Item[]
 
   @@unique([organizationId, id])
   @@unique([organizationId, projectNumber])
   @@index([organizationId])
   @@index([customerId])
 }
-
 
 // ============================================================
 // ITEM
@@ -154,17 +169,17 @@ model Item {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
 
-  projectId      String?
-  project        Project?     @relation(fields: [organizationId, projectId], references: [organizationId, id], onDelete: Restrict)
+  projectId String?
+  project   Project? @relation(fields: [organizationId, projectId], references: [organizationId, id], onDelete: Restrict)
 
-  itemNumber     String
-  description    String
-  type           ItemType
+  itemNumber  String
+  description String
+  type        ItemType
 
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  revisions      ItemRevision[]
+  revisions ItemRevision[]
 
   @@unique([organizationId, id])
   @@unique([organizationId, itemNumber])
@@ -172,7 +187,6 @@ model Item {
   @@index([projectId])
   @@index([itemNumber])
 }
-
 
 // ============================================================
 // ITEM REVISION
@@ -185,21 +199,158 @@ model Item {
 // ============================================================
 
 model ItemRevision {
-  id          String         @id @default(cuid())
+  id String @id @default(cuid())
 
-  itemId      String
-  item        Item           @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  // Denormalized tenant key, consistent with Item / Project / Customer.
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  itemId String
+  item   Item   @relation(fields: [organizationId, itemId], references: [organizationId, id], onDelete: Cascade)
 
   revision    String
   description String?
 
-  lifecycle   LifecycleState @default(WORKING)
-  releasedAt  DateTime?
+  lifecycle  LifecycleState @default(WORKING)
+  releasedAt DateTime?
 
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
+  // CAD documents are linked through ItemRevisionDocument, not owned directly.
+  documentLinks ItemRevisionDocument[]
+
+  @@unique([organizationId, id])
   @@unique([itemId, revision])
+  @@index([organizationId])
   @@index([itemId])
   @@index([lifecycle])
+}
+
+// ============================================================
+// CAD DOCUMENT  (PDM)
+//
+// A logical CAD document identity, e.g. 10073-MFD-AS210.iam
+//
+// ITEM != ENGINEERING REVISION != CAD DOCUMENT != FILE VERSION
+//
+// A CadDocument belongs to the Organization, NOT to a single
+// ItemRevision. Its identity (and full file-version history) survives
+// across engineering revisions. Association with one or more
+// ItemRevisions is expressed through the ItemRevisionDocument link.
+//
+// Saving a newer CAD file adds a FileVersion; it never touches
+// ItemRevision.revision or ItemRevision.lifecycle and never creates
+// an ItemRevision.
+//
+// Binary CAD data is NOT stored here. FileVersion.storageKey is a
+// pointer to future object storage.
+// ============================================================
+
+model CadDocument {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  documentNumber String
+  fileName       String
+  documentType   CadDocumentType
+  description    String?
+
+  // Set from the authenticated actor on the server, never from the client.
+  createdById String
+  createdBy   User   @relation(fields: [organizationId, createdById], references: [organizationId, id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  fileVersions  FileVersion[]
+  revisionLinks ItemRevisionDocument[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, documentNumber])
+  @@index([organizationId])
+  @@index([createdById])
+}
+
+// ============================================================
+// ITEM REVISION <-> CAD DOCUMENT LINK  (PDM)
+//
+// Explicit join between an engineering revision and a CAD document.
+// The same CadDocument may be linked to multiple ItemRevisions over
+// its life (e.g. Rev A and Rev B both reference 10073-MFD-AS210.iam).
+//
+// All three foreign keys are composite and organization-aware, so a
+// link can only ever join an ItemRevision and a CadDocument that both
+// belong to the SAME organization. Cross-tenant links are impossible
+// at the database level.
+// ============================================================
+
+model ItemRevisionDocument {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  itemRevisionId String
+  itemRevision   ItemRevision @relation(fields: [organizationId, itemRevisionId], references: [organizationId, id], onDelete: Cascade)
+
+  cadDocumentId String
+  cadDocument   CadDocument @relation(fields: [organizationId, cadDocumentId], references: [organizationId, id], onDelete: Cascade)
+
+  // Set from the authenticated actor on the server, never from the client.
+  createdById String
+  createdBy   User   @relation(fields: [organizationId, createdById], references: [organizationId, id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, id])
+  // A CadDocument can be linked to a given ItemRevision at most once.
+  @@unique([itemRevisionId, cadDocumentId])
+  @@index([organizationId])
+  @@index([itemRevisionId])
+  @@index([cadDocumentId])
+  @@index([createdById])
+}
+
+// ============================================================
+// FILE VERSION  (PDM)
+//
+// A physical, immutable version of a CadDocument: V1, V2, V3 ...
+//
+// versionNumber is an integer assigned server-side. It is fully
+// independent of the engineering revision letter.
+// ============================================================
+
+model FileVersion {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Composite tenant-aware FK: a FileVersion can only ever point at a
+  // CadDocument in the SAME organization.
+  cadDocumentId String
+  cadDocument   CadDocument @relation(fields: [organizationId, cadDocumentId], references: [organizationId, id], onDelete: Cascade)
+
+  versionNumber Int
+
+  originalFileName String
+  // Metadata-only pointer to future object storage. No binary data in PostgreSQL.
+  storageKey       String
+  fileSize         BigInt?
+  checksum         String?
+
+  createdById String
+  createdBy   User   @relation(fields: [organizationId, createdById], references: [organizationId, id])
+
+  createdAt DateTime @default(now())
+
+  // Guarantees a CadDocument can never hold two rows with the same version.
+  @@unique([cadDocumentId, versionNumber])
+  @@unique([organizationId, id])
+  @@index([organizationId])
+  @@index([cadDocumentId])
+  @@index([createdById])
 }

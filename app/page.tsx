@@ -1,5 +1,14 @@
-import { LifecycleState, ItemType } from "@/app/generated/prisma/enums";
-import { advanceRevision, createItem } from "@/app/actions";
+import {
+  LifecycleState,
+  ItemType,
+  CadDocumentType,
+} from "@/app/generated/prisma/enums";
+import {
+  advanceRevision,
+  createCadDocument,
+  createFileVersion,
+  createItem,
+} from "@/app/actions";
 import { prisma } from "@/app/lib/prisma";
 import { requireDashboardActor, type Actor } from "@/app/lib/authz";
 import { signOut } from "@/auth";
@@ -25,12 +34,14 @@ async function getDashboardData(organizationId: string) {
       organization: null,
       projects: [],
       items: [],
+      revisions: [],
+      cadDocumentCount: 0,
       lifecycleCounts: emptyLifecycleCounts(),
       openRevisions: [],
     };
   }
 
-  const [projects, items, revisions] = await Promise.all([
+  const [projects, items, revisions, cadDocumentCount] = await Promise.all([
     prisma.project.findMany({
       where: { organizationId: organization.id },
       orderBy: { projectNumber: "asc" },
@@ -47,10 +58,35 @@ async function getDashboardData(organizationId: string) {
       },
     }),
     prisma.itemRevision.findMany({
-      where: { item: { organizationId: organization.id } },
+      where: { organizationId: organization.id },
       orderBy: [{ lifecycle: "asc" }, { updatedAt: "desc" }],
-      include: { item: true },
+      include: {
+        item: true,
+        // CAD documents are associated through the ItemRevisionDocument link,
+        // not owned by the revision.
+        documentLinks: {
+          orderBy: { cadDocument: { documentNumber: "asc" } },
+          select: {
+            id: true,
+            cadDocument: {
+              select: {
+                id: true,
+                documentNumber: true,
+                fileName: true,
+                documentType: true,
+                _count: { select: { fileVersions: true } },
+                fileVersions: {
+                  orderBy: { versionNumber: "desc" },
+                  take: 1,
+                  select: { versionNumber: true, createdAt: true },
+                },
+              },
+            },
+          },
+        },
+      },
     }),
+    prisma.cadDocument.count({ where: { organizationId: organization.id } }),
   ]);
 
   const lifecycleCounts = revisions.reduce((counts, revision) => {
@@ -68,6 +104,8 @@ async function getDashboardData(organizationId: string) {
     organization,
     projects,
     items,
+    revisions,
+    cadDocumentCount,
     lifecycleCounts,
     openRevisions,
   };
@@ -134,7 +172,18 @@ export default async function Home() {
     );
   }
 
-  const { organization, projects, items, lifecycleCounts, openRevisions } = dashboard;
+  const {
+    organization,
+    projects,
+    items,
+    revisions,
+    cadDocumentCount,
+    lifecycleCounts,
+    openRevisions,
+  } = dashboard;
+  const revisionsWithCad = revisions.filter(
+    (revision) => revision.documentLinks.length > 0,
+  );
 
   return (
     <main className="min-h-screen bg-stone-100 text-slate-950">
@@ -263,6 +312,133 @@ export default async function Home() {
               {openRevisions.length === 0 ? (
                 <p className="px-5 py-8 text-sm text-slate-600">
                   No open revision work is waiting.
+                </p>
+              ) : null}
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <h2 className="text-lg font-semibold">CAD documents</h2>
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                {cadDocumentCount} document{cadDocumentCount === 1 ? "" : "s"} in workspace ·
+                linked to revisions · file versions independent of the revision
+              </span>
+            </div>
+
+            <form
+              action={createCadDocument}
+              className="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_1fr_140px_110px]"
+            >
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                Item revision
+                <select
+                  name="itemRevisionId"
+                  required
+                  defaultValue={revisions[0]?.id ?? ""}
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                >
+                  {revisions.length === 0 ? (
+                    <option value="">No revisions yet</option>
+                  ) : null}
+                  {revisions.map((revision) => (
+                    <option key={revision.id} value={revision.id}>
+                      {revision.item.itemNumber} Rev {revision.revision}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                File name
+                <input
+                  name="fileName"
+                  required
+                  placeholder="10073-MFD-AS210.iam"
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                Type
+                <select
+                  name="documentType"
+                  defaultValue={CadDocumentType.IAM}
+                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                >
+                  {Object.values(CadDocumentType).map((type) => (
+                    <option key={type} value={type}>
+                      {type}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="h-10 self-end rounded-md bg-slate-950 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-40"
+                disabled={revisions.length === 0}
+              >
+                Attach
+              </button>
+            </form>
+
+            <div className="divide-y divide-slate-200">
+              {revisionsWithCad.map((revision) => (
+                <div key={revision.id} className="px-5 py-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    {revision.item.itemNumber} Rev {revision.revision}
+                  </p>
+                  <div className="mt-3 flex flex-col gap-3">
+                    {revision.documentLinks.map((link) => {
+                      const cadDocument = link.cadDocument;
+                      const latestVersion = cadDocument.fileVersions[0];
+
+                      return (
+                        <div
+                          key={link.id}
+                          className="grid gap-3 rounded-md border border-slate-200 px-4 py-3 md:grid-cols-[1fr_90px_120px_150px]"
+                        >
+                          <div>
+                            <p className="font-semibold">{cadDocument.fileName}</p>
+                            <p className="mt-0.5 text-xs text-slate-500">
+                              {cadDocument.documentNumber}
+                            </p>
+                          </div>
+                          <span className="inline-flex h-6 items-center self-center justify-center rounded-full bg-slate-100 px-2 text-xs font-semibold text-slate-700">
+                            {cadDocument.documentType}
+                          </span>
+                          <div className="self-center text-sm text-slate-700">
+                            <p>
+                              Latest{" "}
+                              <span className="font-semibold">
+                                {latestVersion ? `V${latestVersion.versionNumber}` : "—"}
+                              </span>
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {cadDocument._count.fileVersions} version
+                              {cadDocument._count.fileVersions === 1 ? "" : "s"}
+                            </p>
+                          </div>
+                          <form
+                            action={createFileVersion}
+                            className="flex items-center self-center"
+                          >
+                            <input
+                              type="hidden"
+                              name="cadDocumentId"
+                              value={cadDocument.id}
+                            />
+                            <button className="h-9 rounded-md bg-teal-700 px-3 text-xs font-semibold text-white transition hover:bg-teal-800">
+                              Add file version
+                            </button>
+                          </form>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              {cadDocumentCount === 0 ? (
+                <p className="px-5 py-8 text-sm text-slate-600">
+                  No CAD documents in this workspace yet. Attaching a document or adding a
+                  file version never changes an engineering revision.
                 </p>
               ) : null}
             </div>
