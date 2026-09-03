@@ -9,10 +9,10 @@ import {
   createCadDependency,
   createCadDocument,
   createEngineeringRevision,
-  createFileVersion,
   createItem,
   linkExistingCadDocumentToRevision,
 } from "@/app/actions";
+import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { prisma } from "@/app/lib/prisma";
 import { requireDashboardActor, type Actor } from "@/app/lib/authz";
 import {
@@ -92,7 +92,12 @@ async function getDashboardData(organizationId: string) {
                   fileVersions: {
                     orderBy: { versionNumber: "desc" },
                     take: 1,
-                    select: { versionNumber: true, createdAt: true },
+                    select: {
+                      id: true,
+                      versionNumber: true,
+                      createdAt: true,
+                      checksum: true,
+                    },
                   },
                 },
               },
@@ -535,42 +540,46 @@ export default async function Home() {
                       return (
                         <div
                           key={link.id}
-                          className="grid gap-3 rounded-md border border-slate-200 px-4 py-3 md:grid-cols-[1fr_90px_120px_150px]"
+                          className="rounded-md border border-slate-200 px-4 py-3"
                         >
-                          <div>
-                            <p className="font-semibold">{cadDocument.fileName}</p>
-                            <p className="mt-0.5 text-xs text-slate-500">
-                              {cadDocument.documentNumber}
-                            </p>
+                          <div className="grid gap-3 md:grid-cols-[1fr_90px_120px_150px]">
+                            <div>
+                              <p className="font-semibold">{cadDocument.fileName}</p>
+                              <p className="mt-0.5 text-xs text-slate-500">
+                                {cadDocument.documentNumber}
+                              </p>
+                            </div>
+                            <span className="inline-flex h-6 items-center self-center justify-center rounded-full bg-slate-100 px-2 text-xs font-semibold text-slate-700">
+                              {cadDocument.documentType}
+                            </span>
+                            <div className="self-center text-sm text-slate-700">
+                              <p>
+                                Latest{" "}
+                                <span className="font-semibold">
+                                  {latestVersion ? `V${latestVersion.versionNumber}` : "—"}
+                                </span>
+                              </p>
+                              <p className="text-xs text-slate-500">
+                                {cadDocument._count.fileVersions} version
+                                {cadDocument._count.fileVersions === 1 ? "" : "s"}
+                              </p>
+                            </div>
+                            <div className="self-center text-xs text-slate-500">
+                              Upload stores real bytes
+                            </div>
                           </div>
-                          <span className="inline-flex h-6 items-center self-center justify-center rounded-full bg-slate-100 px-2 text-xs font-semibold text-slate-700">
-                            {cadDocument.documentType}
-                          </span>
-                          <div className="self-center text-sm text-slate-700">
-                            <p>
-                              Latest{" "}
-                              <span className="font-semibold">
-                                {latestVersion ? `V${latestVersion.versionNumber}` : "—"}
-                              </span>
-                            </p>
-                            <p className="text-xs text-slate-500">
-                              {cadDocument._count.fileVersions} version
-                              {cadDocument._count.fileVersions === 1 ? "" : "s"}
-                            </p>
+
+                          <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-2">
+                            <UploadFileVersion cadDocumentId={cadDocument.id} />
+                            {latestVersion ? (
+                              <a
+                                href={`/api/file-versions/${latestVersion.id}/content`}
+                                className="text-xs font-semibold text-teal-700 underline"
+                              >
+                                Download V{latestVersion.versionNumber}
+                              </a>
+                            ) : null}
                           </div>
-                          <form
-                            action={createFileVersion}
-                            className="flex items-center self-center"
-                          >
-                            <input
-                              type="hidden"
-                              name="cadDocumentId"
-                              value={cadDocument.id}
-                            />
-                            <button className="h-9 rounded-md bg-teal-700 px-3 text-xs font-semibold text-white transition hover:bg-teal-800">
-                              Add file version
-                            </button>
-                          </form>
                         </div>
                       );
                     })}

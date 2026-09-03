@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Node test runner files (run via `node --test`, not part of the app build).
+    "tests/**",
+    // Local PDM binary storage.
+    ".pdm-storage/**",
   ]),
 ]);
 

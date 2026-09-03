@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# PDM local binary storage (CAD file versions) - never commit CAD binaries
+/.pdm-storage/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

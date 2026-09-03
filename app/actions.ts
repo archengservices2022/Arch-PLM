@@ -663,83 +663,11 @@ export async function createCadDocument(formData: FormData) {
   revalidatePath("/");
 }
 
-/**
- * Record a new physical file version (V1, V2, V3 ...) for a CAD document.
- *
- * The version number is allocated on the server. `versionNumber` from the
- * browser is ignored. Creating V2/V3 does not alter or create any
- * ItemRevision.
- */
-export async function createFileVersion(formData: FormData) {
-  const actor = await requireActor();
-  assertCanMutate(actor);
-
-  const cadDocumentId = requiredValue(formData, "cadDocumentId");
-  const providedFileName = optionalValue(formData, "originalFileName");
-
-  // The parent CadDocument must belong to the actor's organization.
-  const cadDocument = await prisma.cadDocument.findFirst({
-    where: {
-      id: cadDocumentId,
-      organizationId: actor.organizationId,
-    },
-    select: { id: true, fileName: true },
-  });
-
-  if (!cadDocument) {
-    throw new Error("CAD document not found in your organization");
-  }
-
-  const originalFileName = providedFileName ?? cadDocument.fileName;
-
-  // Concurrency-safe sequencing:
-  //   next = MAX(versionNumber) + 1, then INSERT.
-  // The @@unique([cadDocumentId, versionNumber]) constraint is the source of
-  // truth: if two requests race, the loser hits P2002 and simply recomputes.
-  const MAX_ATTEMPTS = 5;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    const latest = await prisma.fileVersion.findFirst({
-      where: {
-        cadDocumentId: cadDocument.id,
-        organizationId: actor.organizationId,
-      },
-      orderBy: { versionNumber: "desc" },
-      select: { versionNumber: true },
-    });
-
-    const nextVersion = (latest?.versionNumber ?? 0) + 1;
-
-    // storageKey is metadata only for this milestone. No file is stored.
-    const storageKey = `organizations/${actor.organizationId}/documents/${cadDocument.id}/versions/${nextVersion}/${originalFileName}`;
-
-    try {
-      await prisma.fileVersion.create({
-        data: {
-          organizationId: actor.organizationId,
-          cadDocumentId: cadDocument.id,
-          versionNumber: nextVersion,
-          originalFileName,
-          storageKey,
-          createdById: actor.userId,
-        },
-      });
-
-      revalidatePath("/");
-      return;
-    } catch (error) {
-      if (isUniqueConstraintError(error) && attempt < MAX_ATTEMPTS) {
-        continue;
-      }
-
-      throw error;
-    }
-  }
-
-  throw new Error(
-    "Could not allocate a file version number after multiple attempts, please retry",
-  );
-}
+// FileVersion rows are created only by the storage upload path
+// (app/lib/storage.ts + app/api/cad-documents/[cadDocumentId]/file-versions).
+// Every FileVersion represents real, immutable, checksum-verified stored
+// bytes - there is no metadata-only / synthetic-storage-key creation path.
+// Creating a file version still never creates or mutates an ItemRevision.
 
 // ============================================================
 // PDM Milestone 2: CAD dependency / reference graph
