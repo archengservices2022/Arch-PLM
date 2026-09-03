@@ -10,12 +10,14 @@ import {
 import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/app/lib/prisma";
 import { assertCanMutate, requireActor } from "@/app/lib/authz";
-
-const terminalLifecycleStates = new Set<LifecycleState>([
-  LifecycleState.RELEASED,
-  LifecycleState.SUPERSEDED,
-  LifecycleState.OBSOLETE,
-]);
+import {
+  canCreateSuccessorFrom,
+  isCarryForwardMode,
+  isManualTransitionAllowed,
+  isTerminalLifecycle,
+  nextRevisionLetter,
+  normalizeRevision,
+} from "@/app/lib/revisions";
 
 function requiredValue(formData: FormData, name: string) {
   const value = formData.get(name);
@@ -49,14 +51,97 @@ function enumValue<T extends Record<string, string>>(
   return value as T[keyof T];
 }
 
+/**
+ * Run a callback inside a PostgreSQL SERIALIZABLE transaction with a small
+ * bounded retry on serialization / write-conflict failures (Prisma P2034).
+ *
+ * Every attempt re-runs the ENTIRE callback, so any state the callback reads
+ * (e.g. an ItemRevision's lifecycle) is read again from a fresh snapshot on
+ * retry. Non-P2034 errors (domain errors, other Prisma errors) propagate
+ * immediately and are never retried.
+ */
+async function runSerializable<T>(
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  exhaustedMessage: string,
+): Promise<T> {
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await prisma.$transaction(fn, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      });
+    } catch (error) {
+      if (isSerializationError(error) && attempt < MAX_ATTEMPTS) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error(exhaustedMessage);
+}
+
+interface LockedItemRevision {
+  id: string;
+  organizationId: string;
+  lifecycle: LifecycleState;
+}
+
+/**
+ * Take a `SELECT ... FOR UPDATE` row lock on the target ItemRevision inside an
+ * open transaction and return its (tenant-scoped) lifecycle.
+ *
+ * This produces a DETERMINISTIC database row conflict with advanceRevision,
+ * whose UPDATE locks the same ItemRevision row:
+ *   - if this transaction acquires the lock first, a concurrent release waits
+ *     until we commit / roll back;
+ *   - if a release owns the row first, this call blocks and then observes the
+ *     committed terminal lifecycle (or, under SERIALIZABLE, a P2034 that
+ *     runSerializable retries into a fresh snapshot that sees it).
+ *
+ * Parameterised raw SQL — the `${...}` values are Prisma bind parameters, not
+ * string interpolation. Server-only (needs a Prisma transaction client); this
+ * helper is not exported and is never reachable from client code.
+ *
+ * Returns null when the revision is not in the actor's organization.
+ */
+async function lockItemRevisionForCadMutation(
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  itemRevisionId: string,
+): Promise<LockedItemRevision | null> {
+  const rows = await tx.$queryRaw<
+    Array<{ id: string; organizationId: string; lifecycle: string }>
+  >`
+    SELECT "id", "organizationId", "lifecycle"
+    FROM "ItemRevision"
+    WHERE "id" = ${itemRevisionId}
+      AND "organizationId" = ${organizationId}
+    FOR UPDATE
+  `;
+
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    organizationId: row.organizationId,
+    // Validate + narrow the raw enum string to LifecycleState without `any`.
+    lifecycle: enumValue(LifecycleState, row.lifecycle, "lifecycle"),
+  };
+}
+
 export async function createItem(formData: FormData) {
   // Tenant + identity come only from the authenticated session.
   const actor = await requireActor();
   assertCanMutate(actor);
 
+  // Engineering revisions are single letters A–Z. "a" -> "A"; reject "01"/"BETA"/"A1".
   const rawRevision = optionalValue(formData, "revision");
-  const revision =
-    rawRevision && rawRevision !== "" ? rawRevision.toUpperCase() : "A";
+  const revision = rawRevision ? normalizeRevision(rawRevision) : "A";
 
   // If a project is supplied, it must belong to the actor's organization.
   const projectId = optionalValue(formData, "projectId");
@@ -86,6 +171,8 @@ export async function createItem(formData: FormData) {
         create: {
           revision,
           description: requiredValue(formData, "revisionDescription"),
+          // Milestone 3: audit lineage. Initial revision has no source.
+          createdById: actor.userId,
         },
       },
     },
@@ -94,45 +181,380 @@ export async function createItem(formData: FormData) {
   revalidatePath("/");
 }
 
+/**
+ * Move an ItemRevision to a new lifecycle state.
+ *
+ * The transition map is enforced entirely on the server (see
+ * app/lib/revisions.ts). The browser cannot decide whether a transition is
+ * legal, and it cannot name which revision gets superseded.
+ *
+ * CONCURRENCY: the whole thing runs in a SERIALIZABLE transaction (with a
+ * bounded P2034 retry), and the transition is ALSO applied with an OPTIMISTIC
+ * CONDITIONAL UPDATE — `WHERE ... lifecycle = <the state we validated
+ * against>`. If a concurrent request already moved the revision, 0 rows match
+ * and we abort instead of applying a transition that was only valid from a
+ * now-stale state. Serializable isolation additionally makes this transaction
+ * part of the same serializable set as createCadDocument /
+ * linkExistingCadDocumentToRevision, so once this transaction commits a
+ * terminal lifecycle, no concurrent CAD-association transaction that started
+ * from an earlier non-terminal snapshot can commit against it.
+ *
+ * When a revision transitions to RELEASED, and it was derived from a source
+ * revision that is itself currently RELEASED, the source is atomically moved
+ * to SUPERSEDED in the SAME transaction — but only if the successor's
+ * conditional release actually succeeded. `releasedAt` is set only on the
+ * successful RELEASED transition; superseding a source never touches its
+ * `releasedAt`.
+ */
 export async function advanceRevision(formData: FormData) {
   const actor = await requireActor();
   assertCanMutate(actor);
 
   const revisionId = requiredValue(formData, "revisionId");
-  const lifecycle = enumValue(
+  const target = enumValue(
     LifecycleState,
     requiredValue(formData, "lifecycle"),
     "lifecycle",
   );
 
-  // Only revisions whose Item belongs to the actor's organization are visible.
-  const currentRevision = await prisma.itemRevision.findFirst({
-    where: {
-      id: revisionId,
-      item: { organizationId: actor.organizationId },
-    },
-    select: { lifecycle: true },
-  });
+  await runSerializable(async (tx) => {
+    const current = await tx.itemRevision.findFirst({
+      where: { id: revisionId, organizationId: actor.organizationId },
+      select: {
+        id: true,
+        itemId: true,
+        lifecycle: true,
+        sourceRevisionId: true,
+      },
+    });
 
-  if (!currentRevision) {
-    throw new Error("Revision not found");
+    if (!current) {
+      throw new Error("Revision not found");
+    }
+
+    // Release immutability + existing terminal protection.
+    if (isTerminalLifecycle(current.lifecycle)) {
+      throw new Error("Released or terminal revisions cannot be changed");
+    }
+
+    if (!isManualTransitionAllowed(current.lifecycle, target)) {
+      throw new Error(
+        `Invalid lifecycle transition: ${current.lifecycle} -> ${target}`,
+      );
+    }
+
+    // Optimistic conditional update: only apply if the revision is STILL in
+    // the state we validated the transition against.
+    const updated = await tx.itemRevision.updateMany({
+      where: {
+        id: current.id,
+        organizationId: actor.organizationId,
+        lifecycle: current.lifecycle,
+      },
+      data:
+        target === LifecycleState.RELEASED
+          ? { lifecycle: target, releasedAt: new Date() }
+          : { lifecycle: target },
+    });
+
+    if (updated.count === 0) {
+      throw new Error(
+        "The revision changed while you were updating it. Refresh and try again.",
+      );
+    }
+
+    // Automatic supersession along source-revision lineage — runs only
+    // because the conditional release above succeeded.
+    if (target === LifecycleState.RELEASED && current.sourceRevisionId) {
+      await tx.itemRevision.updateMany({
+        where: {
+          id: current.sourceRevisionId,
+          organizationId: actor.organizationId,
+          itemId: current.itemId, // lineage invariant: same Item
+          lifecycle: LifecycleState.RELEASED, // no-op if already SUPERSEDED/other
+        },
+        data: { lifecycle: LifecycleState.SUPERSEDED },
+      });
+    }
+  }, "Could not update the revision due to concurrent changes, please retry");
+
+  revalidatePath("/");
+}
+
+// ============================================================
+// PDM Milestone 3: engineering revision + CAD revision-link workflow
+//
+// "Create next revision" derives Rev B from an APPROVED/RELEASED Rev A:
+//   - a NEW ItemRevision (WORKING) is created, with audit lineage
+//     (createdById, sourceRevisionId)
+//   - the source revision's logical CadDocuments are CARRIED FORWARD by
+//     creating new ItemRevisionDocument link rows that point at the SAME
+//     existing CadDocument rows
+//   - NOTHING is cloned: no CadDocument, no FileVersion, no CadDependency.
+//     File-version history and the CadDependency graph are attached to the
+//     logical document, so they remain intact and shared automatically.
+// ============================================================
+
+function isDuplicateRevisionError(error: unknown): boolean {
+  if (
+    !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+    error.code !== "P2002"
+  ) {
+    return false;
+  }
+  const target: unknown = error.meta?.target;
+  if (Array.isArray(target)) {
+    const fields = target.filter(
+      (field): field is string => typeof field === "string",
+    );
+    return fields.includes("itemId") && fields.includes("revision");
+  }
+  if (typeof target === "string") {
+    return target.includes("itemId") && target.includes("revision");
+  }
+  return false;
+}
+
+/**
+ * Create the next engineering revision (A->B, B->C, ...) from an eligible
+ * source revision, carrying forward its CAD document links.
+ *
+ * Server rules:
+ *  - sourceRevisionId comes from the form; the source revision and its Item
+ *    must belong to the actor's organization.
+ *  - The source must be APPROVED or RELEASED (WORKING / IN_REVIEW / OBSOLETE /
+ *    SUPERSEDED are rejected).
+ *  - The new revision letter is DERIVED server-side from the source; any
+ *    submitted "revision" field is ignored.
+ *  - carryForwardMode is EXPLICIT ("all" | "selected" | "none"); it is never
+ *    inferred from the presence/absence of checkbox values. In "selected"
+ *    mode every submitted id must actually be linked to the source revision
+ *    and belong to the actor's organization.
+ *  - description: the trimmed user value if non-empty, otherwise the source
+ *    revision's description is copied forward.
+ *  - organizationId / createdById always come from the session.
+ *  - The new revision + all carry-forward links are one atomic transaction.
+ *  - A concurrent duplicate is caught via @@unique([itemId, revision]) -> P2002
+ *    and reported as a clear domain error.
+ */
+export async function createEngineeringRevision(formData: FormData) {
+  const actor = await requireActor();
+  assertCanMutate(actor);
+
+  const sourceRevisionId = requiredValue(formData, "sourceRevisionId");
+
+  // Explicit carry-forward mode. Default "all"; unknown values are rejected.
+  const carryForwardMode = optionalValue(formData, "carryForwardMode") ?? "all";
+  if (!isCarryForwardMode(carryForwardMode)) {
+    throw new Error(`Unknown carry-forward mode: "${carryForwardMode}"`);
   }
 
-  // Lifecycle protection: terminal / released revisions stay locked.
-  if (terminalLifecycleStates.has(currentRevision.lifecycle)) {
-    throw new Error("Released or terminal revisions cannot be changed");
+  // Submitted document ids (only meaningful in "selected" mode).
+  const selectedDocumentIds = new Set<string>();
+  for (const value of formData.getAll("carryForwardDocumentId")) {
+    if (typeof value === "string" && value.trim() !== "") {
+      selectedDocumentIds.add(value.trim());
+    }
+  }
+  const csv = optionalValue(formData, "carryForwardDocumentIds");
+  if (csv) {
+    for (const part of csv.split(",")) {
+      if (part.trim() !== "") selectedDocumentIds.add(part.trim());
+    }
   }
 
-  await prisma.itemRevision.updateMany({
-    where: {
-      id: revisionId,
-      item: { organizationId: actor.organizationId },
-    },
-    data: {
-      lifecycle,
-      releasedAt: lifecycle === LifecycleState.RELEASED ? new Date() : null,
-    },
+  const providedDescription = optionalValue(formData, "description");
+
+  await prisma.$transaction(async (tx) => {
+    // 1-2. Source revision + its Item must be in the actor's organization.
+    const source = await tx.itemRevision.findFirst({
+      where: { id: sourceRevisionId, organizationId: actor.organizationId },
+      select: {
+        id: true,
+        itemId: true,
+        revision: true,
+        lifecycle: true,
+        description: true,
+        item: { select: { organizationId: true } },
+        documentLinks: { select: { cadDocumentId: true } },
+      },
+    });
+
+    if (!source || source.item.organizationId !== actor.organizationId) {
+      throw new Error("Source revision not found in your organization");
+    }
+
+    // 9. Eligibility: only APPROVED / RELEASED sources.
+    if (!canCreateSuccessorFrom(source.lifecycle)) {
+      throw new Error(
+        `A successor revision can only be created from an APPROVED or RELEASED revision (this revision is ${source.lifecycle}).`,
+      );
+    }
+
+    // 6 + 10. Next revision letter is derived on the server.
+    const newRevision = nextRevisionLetter(source.revision);
+
+    // 7. Reject an existing revision for the same Item (fast path; the unique
+    // constraint below is the real guard against races).
+    const clash = await tx.itemRevision.findFirst({
+      where: { itemId: source.itemId, revision: newRevision },
+      select: { id: true },
+    });
+    if (clash) {
+      throw new Error(
+        `Revision ${newRevision} already exists for this item.`,
+      );
+    }
+
+    // 5. Resolve carry-forward set from the EXPLICIT mode.
+    const sourceDocumentIds = source.documentLinks.map(
+      (link) => link.cadDocumentId,
+    );
+    let carryForwardIds: string[];
+    if (carryForwardMode === "none") {
+      carryForwardIds = [];
+    } else if (carryForwardMode === "all") {
+      carryForwardIds = sourceDocumentIds;
+    } else {
+      // "selected": carry only the submitted ids, each of which must be
+      // linked to the source revision.
+      for (const id of selectedDocumentIds) {
+        if (!sourceDocumentIds.includes(id)) {
+          throw new Error(
+            "A selected CAD document is not linked to the source revision.",
+          );
+        }
+      }
+      carryForwardIds = [...selectedDocumentIds];
+    }
+
+    // Defense in depth: every carry-forward document is in the actor's org.
+    if (carryForwardIds.length > 0) {
+      const owned = await tx.cadDocument.findMany({
+        where: {
+          id: { in: carryForwardIds },
+          organizationId: actor.organizationId,
+        },
+        select: { id: true },
+      });
+      if (owned.length !== carryForwardIds.length) {
+        throw new Error(
+          "A selected CAD document was not found in your organization.",
+        );
+      }
+    }
+
+    // 8-10. Create the new revision (WORKING) with lineage.
+    let created;
+    try {
+      created = await tx.itemRevision.create({
+        data: {
+          organizationId: actor.organizationId,
+          itemId: source.itemId,
+          revision: newRevision,
+          lifecycle: LifecycleState.WORKING,
+          // description: user's value if non-empty, else carry the source's.
+          description: providedDescription ?? source.description,
+          createdById: actor.userId,
+          sourceRevisionId: source.id,
+        },
+        select: { id: true, revision: true },
+      });
+    } catch (error) {
+      if (isDuplicateRevisionError(error)) {
+        throw new Error(
+          `Revision ${newRevision} already exists for this item.`,
+        );
+      }
+      throw error;
+    }
+
+    // 5 + 15. Carry forward the SAME logical CadDocuments (no cloning).
+    if (carryForwardIds.length > 0) {
+      await tx.itemRevisionDocument.createMany({
+        data: carryForwardIds.map((cadDocumentId) => ({
+          organizationId: actor.organizationId,
+          itemRevisionId: created.id,
+          cadDocumentId,
+          createdById: actor.userId,
+        })),
+      });
+    }
   });
+
+  revalidatePath("/");
+}
+
+/**
+ * Link an already-existing CadDocument to an existing ItemRevision in the same
+ * organization. Useful when a document created against one revision needs to be
+ * associated with another later revision without going through
+ * "Create next revision".
+ *
+ * Tenant-safe: revision and document must both belong to the actor's
+ * organization (application check + composite FKs). Duplicate links are a
+ * no-op (idempotent). organizationId / createdById come from the session.
+ *
+ * CONCURRENCY (strict): inside ONE SERIALIZABLE transaction (bounded P2034
+ * retry) the target ItemRevision row is locked with SELECT ... FOR UPDATE
+ * BEFORE the lifecycle is validated or the link is written, giving a
+ * deterministic row-lock conflict with advanceRevision (which updates the
+ * same row). If a release owns the row first, this action waits and then
+ * observes the committed terminal lifecycle and is rejected.
+ */
+export async function linkExistingCadDocumentToRevision(formData: FormData) {
+  const actor = await requireActor();
+  assertCanMutate(actor);
+
+  const itemRevisionId = requiredValue(formData, "itemRevisionId");
+  const cadDocumentId = requiredValue(formData, "cadDocumentId");
+
+  try {
+    await runSerializable(async (tx) => {
+      // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
+      const revision = await lockItemRevisionForCadMutation(
+        tx,
+        actor.organizationId,
+        itemRevisionId,
+      );
+      if (!revision) {
+        throw new Error("Item revision not found in your organization");
+      }
+
+      // 2. Validate lifecycle from the LOCKED row.
+      if (isTerminalLifecycle(revision.lifecycle)) {
+        throw new Error(
+          "CAD documents cannot be linked to a released or terminal revision.",
+        );
+      }
+
+      // 3. Validate the existing CadDocument belongs to the actor's org.
+      const document = await tx.cadDocument.findFirst({
+        where: { id: cadDocumentId, organizationId: actor.organizationId },
+        select: { id: true },
+      });
+      if (!document) {
+        throw new Error("CAD document not found in your organization");
+      }
+
+      // 4. Only now — still holding the row lock — create the link.
+      await tx.itemRevisionDocument.create({
+        data: {
+          organizationId: actor.organizationId,
+          itemRevisionId: revision.id,
+          cadDocumentId: document.id,
+          createdById: actor.userId,
+        },
+      });
+    }, "Could not link the CAD document due to concurrent changes, please retry");
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      // Already linked — treat as success (idempotent).
+      revalidatePath("/");
+      return;
+    }
+    throw error;
+  }
 
   revalidatePath("/");
 }
@@ -145,6 +567,15 @@ export async function advanceRevision(formData: FormData) {
 // These actions never read, write, or create ItemRevision.revision
 // or ItemRevision.lifecycle. Adding CAD file versions is completely
 // independent of the engineering revision lifecycle.
+//
+// TODO(release-snapshot): a logical CadDocument can keep receiving
+// FileVersions AFTER an older ItemRevision that references it has been
+// RELEASED. So a released revision's "latest CAD version" is NOT a frozen
+// release baseline today — it tracks the live document. Before Arch PLM can
+// claim strict released CAD baselines it needs a release-snapshot / version-
+// pinning model (e.g. capture the exact FileVersion id per CadDocument at
+// the moment a revision is RELEASED). That model is intentionally not built
+// here and does not change the current FileVersion architecture.
 // ============================================================
 
 function isUniqueConstraintError(error: unknown): boolean {
@@ -158,8 +589,18 @@ function isUniqueConstraintError(error: unknown): boolean {
  * Create a new CAD document identity (owned by the organization) and link it
  * to the selected ItemRevision through ItemRevisionDocument.
  *
- * The document and the revision link are created atomically in one transaction.
  * Does NOT create a file version and does NOT touch the engineering revision.
+ *
+ * CONCURRENCY (strict): inside ONE SERIALIZABLE transaction (bounded P2034
+ * retry) the target ItemRevision row is locked with SELECT ... FOR UPDATE
+ * BEFORE the lifecycle is validated or anything is written. advanceRevision
+ * updates the same row, so the two operations take a deterministic row-lock
+ * conflict:
+ *   - if this action holds the lock, a concurrent release waits for our commit;
+ *   - if a release holds the row first, this action waits and then sees the
+ *     committed terminal lifecycle and is rejected.
+ * The CadDocument insert is in the SAME transaction, so any failure rolls it
+ * back — no orphan CadDocument.
  */
 export async function createCadDocument(formData: FormData) {
   const actor = await requireActor();
@@ -175,21 +616,27 @@ export async function createCadDocument(formData: FormData) {
   );
   const description = optionalValue(formData, "description");
 
-  // The target ItemRevision must belong to the actor's organization.
-  // (The composite FKs below are a second, database-level guard.)
-  const itemRevision = await prisma.itemRevision.findFirst({
-    where: {
-      id: itemRevisionId,
-      organizationId: actor.organizationId,
-    },
-    select: { id: true },
-  });
+  await runSerializable(async (tx) => {
+    // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
+    const revision = await lockItemRevisionForCadMutation(
+      tx,
+      actor.organizationId,
+      itemRevisionId,
+    );
 
-  if (!itemRevision) {
-    throw new Error("Item revision not found in your organization");
-  }
+    if (!revision) {
+      throw new Error("Item revision not found in your organization");
+    }
 
-  await prisma.$transaction(async (tx) => {
+    // 2. Validate lifecycle from the LOCKED row. A RELEASED / SUPERSEDED /
+    //    OBSOLETE revision is immutable: its CAD associations cannot change.
+    if (isTerminalLifecycle(revision.lifecycle)) {
+      throw new Error(
+        "CAD documents cannot be added to a released or terminal revision.",
+      );
+    }
+
+    // 3. Only now — still holding the row lock — create the document + link.
     const cadDocument = await tx.cadDocument.create({
       data: {
         organizationId: actor.organizationId,
@@ -206,12 +653,12 @@ export async function createCadDocument(formData: FormData) {
     await tx.itemRevisionDocument.create({
       data: {
         organizationId: actor.organizationId,
-        itemRevisionId: itemRevision.id,
+        itemRevisionId: revision.id,
         cadDocumentId: cadDocument.id,
         createdById: actor.userId,
       },
     });
-  });
+  }, "Could not add the CAD document due to concurrent changes, please retry");
 
   revalidatePath("/");
 }
@@ -484,10 +931,28 @@ export async function createCadDependency(formData: FormData) {
 }
 
 function isSerializationError(error: unknown): boolean {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2034"
-  );
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
+    return false;
+  }
+
+  // Write conflict / deadlock reported directly by Prisma.
+  if (error.code === "P2034") {
+    return true;
+  }
+
+  // A raw query (e.g. `SELECT ... FOR UPDATE` in lockItemRevisionForCadMutation)
+  // can surface the PostgreSQL SQLSTATE through P2010 instead of P2034.
+  //   40001 = serialization_failure, 40P01 = deadlock_detected
+  if (error.code === "P2010") {
+    const meta: unknown = error.meta;
+    const pgCode =
+      meta && typeof meta === "object" && "code" in meta
+        ? (meta as { code: unknown }).code
+        : undefined;
+    return pgCode === "40001" || pgCode === "40P01";
+  }
+
+  return false;
 }
 
 // Postgres truncates the generated index name to 63 chars.

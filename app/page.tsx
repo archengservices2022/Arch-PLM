@@ -8,11 +8,18 @@ import {
   advanceRevision,
   createCadDependency,
   createCadDocument,
+  createEngineeringRevision,
   createFileVersion,
   createItem,
+  linkExistingCadDocumentToRevision,
 } from "@/app/actions";
 import { prisma } from "@/app/lib/prisma";
 import { requireDashboardActor, type Actor } from "@/app/lib/authz";
+import {
+  canCreateSuccessorFrom,
+  manualTransitionTargets,
+  nextRevisionLetter,
+} from "@/app/lib/revisions";
 import { signOut } from "@/auth";
 
 export const dynamic = "force-dynamic";
@@ -64,9 +71,11 @@ async function getDashboardData(organizationId: string) {
       }),
       prisma.itemRevision.findMany({
         where: { organizationId: organization.id },
-        orderBy: [{ lifecycle: "asc" }, { updatedAt: "desc" }],
+        orderBy: [{ item: { itemNumber: "asc" } }, { revision: "asc" }],
         include: {
           item: true,
+          createdBy: { select: { name: true, email: true } },
+          sourceRevision: { select: { revision: true, lifecycle: true } },
           // CAD documents are associated through the ItemRevisionDocument link,
           // not owned by the revision.
           documentLinks: {
@@ -230,6 +239,20 @@ export default async function Home() {
     (revision) => revision.documentLinks.length > 0,
   );
 
+  // Engineering revisions grouped by item (for the lineage / lifecycle view).
+  type RevisionRow = (typeof revisions)[number];
+  const revisionsByItem = revisions.reduce<
+    { item: RevisionRow["item"]; revs: RevisionRow[] }[]
+  >((groups, revision) => {
+    const group = groups.find((g) => g.item.id === revision.item.id);
+    if (group) {
+      group.revs.push(revision);
+    } else {
+      groups.push({ item: revision.item, revs: [revision] });
+    }
+    return groups;
+  }, []);
+
   // Group dependency edges by parent document for the "references" view.
   type CadEdge = (typeof cadDependencies)[number];
   type DependencyGroup = { parent: CadEdge["parentDocument"]; edges: CadEdge[] };
@@ -364,47 +387,76 @@ export default async function Home() {
           </section>
 
           <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
-            <div className="border-b border-slate-200 px-5 py-4">
-              <h2 className="text-lg font-semibold">Revision work queue</h2>
+            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+              <h2 className="text-lg font-semibold">Engineering revisions</h2>
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                {openRevisions.length} open · lifecycle transitions are enforced
+                server-side
+              </span>
             </div>
             <div className="divide-y divide-slate-200">
-              {openRevisions.map((revision) => (
-                <form
-                  key={revision.id}
-                  action={advanceRevision}
-                  className="grid gap-3 px-5 py-4 md:grid-cols-[1fr_190px_120px]"
-                >
-                  <input type="hidden" name="revisionId" value={revision.id} />
-                  <div>
-                    <p className="font-semibold">
-                      {revision.item.itemNumber} Rev {revision.revision}
-                    </p>
-                    <p className="mt-1 text-sm text-slate-600">
-                      {revision.description ?? revision.item.description}
-                    </p>
-                  </div>
-                  <select
-                    name="lifecycle"
-                    defaultValue={revision.lifecycle}
-                    className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm"
-                  >
-                    {lifecycleOrder.map((state) => (
-                      <option key={state} value={state}>
-                        {formatState(state)}
-                      </option>
+              {revisionsByItem.map((group) => (
+                <div key={group.item.id} className="px-5 py-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    {group.item.itemNumber}
+                    <span className="ml-2 font-normal normal-case text-slate-500">
+                      {group.item.description}
+                    </span>
+                  </p>
+                  <div className="mt-3 flex flex-col gap-3">
+                    {group.revs.map((revision) => (
+                      <RevisionCard key={revision.id} revision={revision} />
                     ))}
-                  </select>
-                  <button className="h-10 rounded-md bg-teal-700 px-4 text-sm font-semibold text-white transition hover:bg-teal-800">
-                    Update
-                  </button>
-                </form>
+                  </div>
+                </div>
               ))}
-              {openRevisions.length === 0 ? (
+              {revisions.length === 0 ? (
                 <p className="px-5 py-8 text-sm text-slate-600">
-                  No open revision work is waiting.
+                  No engineering revisions yet.
                 </p>
               ) : null}
             </div>
+
+            {cadDocuments.length > 0 && revisions.length > 0 ? (
+              <form
+                action={linkExistingCadDocumentToRevision}
+                className="grid gap-3 border-t border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_1fr_110px]"
+              >
+                <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                  Link existing CAD document → revision
+                  <select
+                    name="itemRevisionId"
+                    required
+                    defaultValue={revisions[0]?.id ?? ""}
+                    className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                  >
+                    {revisions.map((revision) => (
+                      <option key={revision.id} value={revision.id}>
+                        {revision.item.itemNumber} Rev {revision.revision}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                  CAD document
+                  <select
+                    name="cadDocumentId"
+                    required
+                    defaultValue={cadDocuments[0]?.id ?? ""}
+                    className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+                  >
+                    {cadDocuments.map((document) => (
+                      <option key={document.id} value={document.id}>
+                        {document.fileName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button className="h-10 self-end rounded-md border border-slate-300 px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-100">
+                  Link
+                </button>
+              </form>
+            ) : null}
           </section>
 
           <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
@@ -726,6 +778,149 @@ export default async function Home() {
         </aside>
       </section>
     </main>
+  );
+}
+
+function RevisionCard({
+  revision,
+}: {
+  revision: {
+    id: string;
+    revision: string;
+    lifecycle: LifecycleState;
+    createdBy: { name: string; email: string } | null;
+    sourceRevision: { revision: string; lifecycle: LifecycleState } | null;
+    documentLinks: { id: string; cadDocument: { id: string; fileName: string } }[];
+  };
+}) {
+  const transitionTargets = manualTransitionTargets(revision.lifecycle);
+  const canCreateNext = canCreateSuccessorFrom(revision.lifecycle);
+
+  let nextRev: string | null = null;
+  try {
+    nextRev = nextRevisionLetter(revision.revision);
+  } catch {
+    nextRev = null; // revision Z – no successor supported yet
+  }
+
+  return (
+    <div className="rounded-md border border-slate-200 px-4 py-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-semibold">Rev {revision.revision}</span>
+        <StateBadge state={revision.lifecycle} />
+        {revision.sourceRevision ? (
+          <span className="text-xs text-slate-500">
+            from Rev {revision.sourceRevision.revision}
+          </span>
+        ) : null}
+        <span className="text-xs text-slate-500">
+          {revision.documentLinks.length} CAD document
+          {revision.documentLinks.length === 1 ? "" : "s"}
+        </span>
+        <span className="text-xs text-slate-400">
+          {revision.createdBy
+            ? `by ${revision.createdBy.name || revision.createdBy.email}`
+            : "creator unknown"}
+        </span>
+      </div>
+
+      {transitionTargets.length > 0 ? (
+        <form
+          action={advanceRevision}
+          className="mt-3 flex flex-wrap items-end gap-2"
+        >
+          <input type="hidden" name="revisionId" value={revision.id} />
+          <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+            Move to
+            <select
+              name="lifecycle"
+              defaultValue={transitionTargets[0]}
+              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm"
+            >
+              {transitionTargets.map((state) => (
+                <option key={state} value={state}>
+                  {formatState(state)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="h-9 rounded-md bg-teal-700 px-3 text-xs font-semibold text-white transition hover:bg-teal-800">
+            Update
+          </button>
+        </form>
+      ) : null}
+
+      {canCreateNext ? (
+        nextRev ? (
+          <form
+            action={createEngineeringRevision}
+            className="mt-3 rounded-md bg-slate-50 p-3"
+          >
+            <input type="hidden" name="sourceRevisionId" value={revision.id} />
+            <p className="text-xs font-semibold text-slate-700">
+              Create Rev {nextRev} from Rev {revision.revision}
+            </p>
+            <p className="mt-0.5 text-xs text-slate-500">
+              The new revision starts as Working. Carried-forward CAD documents
+              are the same logical documents — all their file versions and
+              references stay shared. Nothing is copied.
+            </p>
+            <label className="mt-2 flex flex-col gap-1 text-xs font-medium text-slate-600">
+              CAD documents
+              <select
+                name="carryForwardMode"
+                defaultValue="all"
+                className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+              >
+                <option value="all">Carry forward all</option>
+                <option value="selected">Carry forward only the checked ones</option>
+                <option value="none">Start with none</option>
+              </select>
+            </label>
+            {revision.documentLinks.length > 0 ? (
+              <div className="mt-2 flex flex-col gap-1">
+                {revision.documentLinks.map((link) => (
+                  <label
+                    key={link.id}
+                    className="flex items-center gap-2 text-xs text-slate-700"
+                  >
+                    <input
+                      type="checkbox"
+                      name="carryForwardDocumentId"
+                      value={link.cadDocument.id}
+                      defaultChecked
+                    />
+                    {link.cadDocument.fileName}
+                  </label>
+                ))}
+                <span className="text-xs text-slate-400">
+                  Checkboxes apply only in “only the checked ones” mode.
+                </span>
+              </div>
+            ) : (
+              <p className="mt-2 text-xs text-slate-500">
+                No CAD documents linked to this revision.
+              </p>
+            )}
+            <label className="mt-2 flex flex-col gap-1 text-xs font-medium text-slate-600">
+              Description (optional)
+              <input
+                name="description"
+                placeholder="defaults to the source revision's description"
+                className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+              />
+            </label>
+            <button className="mt-3 h-9 rounded-md bg-slate-950 px-3 text-xs font-semibold text-white transition hover:bg-slate-800">
+              Create Rev {nextRev}
+            </button>
+          </form>
+        ) : (
+          <p className="mt-3 text-xs text-slate-500">
+            Revisions beyond Z are not supported yet.
+          </p>
+        )
+      ) : null}
+    </div>
   );
 }
 

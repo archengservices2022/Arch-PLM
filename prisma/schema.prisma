@@ -114,6 +114,7 @@ model User {
   createdFileVersions          FileVersion[]
   createdItemRevisionDocuments ItemRevisionDocument[]
   createdCadDependencies       CadDependency[]
+  createdItemRevisions         ItemRevision[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -230,6 +231,22 @@ model ItemRevision {
   lifecycle  LifecycleState @default(WORKING)
   releasedAt DateTime?
 
+  // Milestone 3: audit lineage. Set from the authenticated actor on the
+  // server, never from the client. Tenant-scoped via composite FKs.
+  //
+  // NULLABLE on purpose: historical ItemRevision rows created before this
+  // milestone have no recoverable creator, and we do NOT fabricate one.
+  // Every revision the application creates (createItem, createEngineeringRevision)
+  // always sets createdById = actor.userId; a NULL means "pre-lineage".
+  createdById String?
+  createdBy   User?   @relation(fields: [organizationId, createdById], references: [organizationId, id], onDelete: Restrict, onUpdate: Cascade)
+
+  // The revision this one was derived from ("Create next revision").
+  // Same organization (composite FK) and, enforced in the action, same Item.
+  sourceRevisionId String?
+  sourceRevision   ItemRevision?  @relation("ItemRevisionLineage", fields: [organizationId, sourceRevisionId], references: [organizationId, id], onDelete: NoAction, onUpdate: NoAction)
+  derivedRevisions ItemRevision[] @relation("ItemRevisionLineage")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -241,6 +258,8 @@ model ItemRevision {
   @@index([organizationId])
   @@index([itemId])
   @@index([lifecycle])
+  @@index([createdById])
+  @@index([sourceRevisionId])
 }
 
 // ============================================================
