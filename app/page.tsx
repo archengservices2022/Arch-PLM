@@ -1,12 +1,19 @@
 import { LifecycleState, ItemType } from "@/app/generated/prisma/enums";
-import { advanceRevision, createDemoWorkspace, createItem } from "@/app/actions";
+import { advanceRevision, createItem } from "@/app/actions";
 import { prisma } from "@/app/lib/prisma";
+import { requireDashboardActor, type Actor } from "@/app/lib/authz";
+import { signOut } from "@/auth";
 
 export const dynamic = "force-dynamic";
 
-async function getDashboardData() {
-  const organization = await prisma.organization.findFirst({
-    orderBy: { createdAt: "asc" },
+async function signOutAction() {
+  "use server";
+  await signOut({ redirectTo: "/login" });
+}
+
+async function getDashboardData(organizationId: string) {
+  const organization = await prisma.organization.findUnique({
+    where: { id: organizationId },
     include: {
       users: { orderBy: { name: "asc" } },
       customers: { orderBy: { name: "asc" } },
@@ -76,17 +83,17 @@ function emptyLifecycleCounts() {
 type DashboardData =
   | ({ status: "ready" } & Awaited<ReturnType<typeof getDashboardData>>)
   | {
-      status: "setup";
+      status: "unavailable";
       message: string;
     };
 
-async function loadDashboard(): Promise<DashboardData> {
+async function loadDashboard(organizationId: string): Promise<DashboardData> {
   try {
-    const data = await getDashboardData();
+    const data = await getDashboardData(organizationId);
     return { status: "ready", ...data };
   } catch (error) {
     return {
-      status: "setup",
+      status: "unavailable",
       message:
         error instanceof Error
           ? error.message
@@ -105,24 +112,23 @@ const lifecycleOrder = [
 ];
 
 export default async function Home() {
-  const dashboard = await loadDashboard();
+  const actor = await requireDashboardActor();
+  const dashboard = await loadDashboard(actor.organizationId);
 
-  if (dashboard.status === "setup") {
+  if (dashboard.status === "unavailable") {
     return (
       <main className="min-h-screen bg-stone-100 px-6 py-10 text-slate-950">
         <section className="mx-auto flex max-w-3xl flex-col gap-6">
-          <p className="text-sm font-semibold uppercase tracking-[0.18em] text-teal-700">
-            Arch PLM
-          </p>
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-teal-700">
+              Arch PLM
+            </p>
+            <SessionBar actor={actor} />
+          </div>
           <h1 className="text-4xl font-semibold tracking-normal">
-            Connect the database to start the PLM workspace.
+            The PLM workspace is temporarily unavailable.
           </h1>
           <p className="text-base leading-7 text-slate-700">{dashboard.message}</p>
-          <form action={createDemoWorkspace}>
-            <button className="h-11 rounded-md bg-slate-950 px-5 text-sm font-semibold text-white transition hover:bg-slate-800">
-              Create demo workspace
-            </button>
-          </form>
         </section>
       </main>
     );
@@ -135,9 +141,12 @@ export default async function Home() {
       <section className="border-b border-slate-300 bg-white">
         <div className="mx-auto grid max-w-7xl gap-8 px-6 py-8 lg:grid-cols-[1fr_360px]">
           <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-teal-700">
-              Arch PLM Core
-            </p>
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-teal-700">
+                Arch PLM Core
+              </p>
+              <SessionBar actor={actor} />
+            </div>
             <h1 className="mt-3 text-4xl font-semibold tracking-normal">
               {organization?.name ?? "No workspace yet"}
             </h1>
@@ -322,17 +331,35 @@ export default async function Home() {
                 </div>
               ))}
               {projects.length === 0 ? (
-                <form action={createDemoWorkspace}>
-                  <button className="h-10 rounded-md bg-teal-700 px-4 text-sm font-semibold text-white transition hover:bg-teal-800">
-                    Create demo workspace
-                  </button>
-                </form>
+                <p className="text-sm text-slate-600">
+                  No projects exist in this workspace yet.
+                </p>
               ) : null}
             </div>
           </section>
         </aside>
       </section>
     </main>
+  );
+}
+
+function SessionBar({ actor }: { actor: Actor }) {
+  return (
+    <div className="flex items-center gap-3 text-xs text-slate-600">
+      <span className="text-right leading-tight">
+        <span className="block font-semibold text-slate-800">
+          {actor.name || actor.email}
+        </span>
+        <span className="block uppercase tracking-wide text-slate-500">
+          {formatState(actor.role)}
+        </span>
+      </span>
+      <form action={signOutAction}>
+        <button className="h-8 rounded-md border border-slate-300 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100">
+          Sign out
+        </button>
+      </form>
+    </div>
   );
 }
 

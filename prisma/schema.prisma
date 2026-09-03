@@ -74,6 +74,10 @@ model User {
 
   email          String
   name           String
+  passwordHash   String?
+  lastLoginAt    DateTime?
+
+
   role           UserRole     @default(ENGINEER)
   active         Boolean      @default(true)
 
