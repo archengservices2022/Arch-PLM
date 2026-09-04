@@ -10,10 +10,11 @@ import {
 import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/app/lib/prisma";
 import { assertCanMutate, requireActor } from "@/app/lib/authz";
+import { getStorageProvider } from "@/app/lib/storage";
+import { advanceRevisionForActor } from "@/app/lib/release-db";
 import {
   canCreateSuccessorFrom,
   isCarryForwardMode,
-  isManualTransitionAllowed,
   isTerminalLifecycle,
   nextRevisionLetter,
   normalizeRevision,
@@ -205,6 +206,13 @@ export async function createItem(formData: FormData) {
  * conditional release actually succeeded. `releasedAt` is set only on the
  * successful RELEASED transition; superseding a source never touches its
  * `releasedAt`.
+ *
+ * P3D-1: a RELEASED transition ALSO atomically captures a frozen release
+ * baseline (the exact FileVersion of every directly associated CadDocument)
+ * in the SAME transaction. This thin wrapper only extracts form input and
+ * delegates to `app/lib/release-db.ts`'s `advanceRevisionForActor`, which is
+ * what the focused tests exercise directly with an in-memory fake database
+ * - see that module for the full transition/baseline/concurrency design.
  */
 export async function advanceRevision(formData: FormData) {
   const actor = await requireActor();
@@ -217,66 +225,7 @@ export async function advanceRevision(formData: FormData) {
     "lifecycle",
   );
 
-  await runSerializable(async (tx) => {
-    const current = await tx.itemRevision.findFirst({
-      where: { id: revisionId, organizationId: actor.organizationId },
-      select: {
-        id: true,
-        itemId: true,
-        lifecycle: true,
-        sourceRevisionId: true,
-      },
-    });
-
-    if (!current) {
-      throw new Error("Revision not found");
-    }
-
-    // Release immutability + existing terminal protection.
-    if (isTerminalLifecycle(current.lifecycle)) {
-      throw new Error("Released or terminal revisions cannot be changed");
-    }
-
-    if (!isManualTransitionAllowed(current.lifecycle, target)) {
-      throw new Error(
-        `Invalid lifecycle transition: ${current.lifecycle} -> ${target}`,
-      );
-    }
-
-    // Optimistic conditional update: only apply if the revision is STILL in
-    // the state we validated the transition against.
-    const updated = await tx.itemRevision.updateMany({
-      where: {
-        id: current.id,
-        organizationId: actor.organizationId,
-        lifecycle: current.lifecycle,
-      },
-      data:
-        target === LifecycleState.RELEASED
-          ? { lifecycle: target, releasedAt: new Date() }
-          : { lifecycle: target },
-    });
-
-    if (updated.count === 0) {
-      throw new Error(
-        "The revision changed while you were updating it. Refresh and try again.",
-      );
-    }
-
-    // Automatic supersession along source-revision lineage — runs only
-    // because the conditional release above succeeded.
-    if (target === LifecycleState.RELEASED && current.sourceRevisionId) {
-      await tx.itemRevision.updateMany({
-        where: {
-          id: current.sourceRevisionId,
-          organizationId: actor.organizationId,
-          itemId: current.itemId, // lineage invariant: same Item
-          lifecycle: LifecycleState.RELEASED, // no-op if already SUPERSEDED/other
-        },
-        data: { lifecycle: LifecycleState.SUPERSEDED },
-      });
-    }
-  }, "Could not update the revision due to concurrent changes, please retry");
+  await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider());
 
   revalidatePath("/");
 }

@@ -1,4 +1,4 @@
-import { LifecycleState } from "@/app/generated/prisma/enums";
+import { LifecycleState } from "../generated/prisma/enums.ts";
 
 // ============================================================
 // Arch PLM — engineering revision rules (Milestone 3)

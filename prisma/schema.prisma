@@ -98,6 +98,8 @@ model Organization {
   cadDependencies       CadDependency[]
   cadCheckouts          CadCheckout[]
   cadCheckoutEvents     CadCheckoutEvent[]
+  releaseBaselines      ReleaseBaseline[]
+  releaseBaselineEntries ReleaseBaselineEntry[]
 }
 
 // ============================================================
@@ -134,6 +136,9 @@ model User {
   // release (they differ for ADMIN_UNLOCK) - see CadCheckoutEvent.
   checkoutEventsAsOwner CadCheckoutEvent[] @relation("CadCheckoutEventOwner")
   checkoutEventsAsActor CadCheckoutEvent[] @relation("CadCheckoutEventActor")
+
+  // Frozen release baselines this user created (P3D-1).
+  createdReleaseBaselines ReleaseBaseline[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -272,6 +277,11 @@ model ItemRevision {
   // CAD documents are linked through ItemRevisionDocument, not owned directly.
   documentLinks ItemRevisionDocument[]
 
+  // At most one row - see ReleaseBaseline's own doc comment for why a plain
+  // optional relation (backed by a unique constraint) is sufficient, exactly
+  // like CadDocument.checkout.
+  releaseBaseline ReleaseBaseline?
+
   @@unique([organizationId, id])
   @@unique([itemId, revision])
   @@index([organizationId])
@@ -335,6 +345,10 @@ model CadDocument {
   // Durable checkout-lifecycle history (P3C-3) - survives after the live
   // CadCheckout row above is deleted. See CadCheckoutEvent's doc comment.
   checkoutEvents CadCheckoutEvent[]
+
+  // Frozen release-baseline pins naming this document (P3D-1) - see
+  // ReleaseBaselineEntry's doc comment.
+  releaseBaselineEntries ReleaseBaselineEntry[]
 
   @@unique([organizationId, id])
   @@unique([organizationId, documentNumber])
@@ -421,10 +435,20 @@ model FileVersion {
   // Same, but recorded durably in checkout HISTORY (P3C-3) - see
   // CadCheckoutEvent's doc comment.
   baseForCheckoutEvents CadCheckoutEvent[]
+  // Pinned into a frozen engineering release baseline (P3D-1) - see
+  // ReleaseBaselineEntry's doc comment.
+  baselineEntries ReleaseBaselineEntry[]
 
   // Guarantees a CadDocument can never hold two rows with the same version.
   @@unique([cadDocumentId, versionNumber])
   @@unique([organizationId, id])
+  // P3D-1: lets ReleaseBaselineEntry's FK be a composite
+  // (organizationId, cadDocumentId, fileVersionId) that references THIS
+  // constraint - which mathematically forces the referenced FileVersion's
+  // OWN cadDocumentId to match the entry's cadDocumentId. A plain
+  // (organizationId, id) FK alone could not prove that; see
+  // ReleaseBaselineEntry's doc comment for the full reasoning.
+  @@unique([organizationId, cadDocumentId, id])
   @@index([organizationId])
   @@index([cadDocumentId])
   @@index([createdById])
@@ -642,4 +666,141 @@ model CadCheckoutEvent {
   @@index([organizationId, cadDocumentId, occurredAt])
   @@index([organizationId, checkoutOwnerId])
   @@index([organizationId, actedById])
+}
+
+// ============================================================
+// RELEASE BASELINE  (P3D-1 - frozen engineering release snapshot)
+//
+// When an ItemRevision transitions to RELEASED, this permanently captures
+// the EXACT CAD FileVersion that constituted that release for each
+// DIRECTLY associated CadDocument (ItemRevisionDocument links only - the
+// full CadDependency graph closure is explicitly OUT of scope here; see
+// ReleaseBaselineEntry). A later FileVersion on the same CadDocument (a
+// direct upload, or a NEW check-in after further checkout/edit) never
+// moves this baseline - it is evidence of what the release WAS, not a live
+// view of the document's current state (that remains
+// ItemRevisionDocument's job - see that model's own doc comment).
+//
+// ONE baseline per ItemRevision: `@@unique([organizationId,
+// itemRevisionId])` is deliberately the SAME "optional 1:1 relation backed
+// by a unique constraint" pattern as CadDocument.checkout - it is both the
+// modeling choice (ItemRevision.releaseBaseline is `ReleaseBaseline?`) and
+// the DB-enforced backstop for "a repeated release request must never
+// create a second baseline": the application layer already refuses this
+// (advanceRevisionForActor's terminal-lifecycle guard rejects any lifecycle
+// change, including a second RELEASED transition, on a revision that is
+// already RELEASED/terminal - see app/lib/release-db.ts), so this
+// constraint should never actually fire in normal operation, but it is the
+// database's own proof that it cannot, regardless of what future
+// application code does.
+//
+// IMMUTABILITY (P3D-1, application-level + strong DB constraints - no
+// admin override, no update/delete path exposed anywhere):
+//   - no route/action ever calls .update() or .delete() on ReleaseBaseline
+//     or ReleaseBaselineEntry;
+//   - onDelete: Restrict on itemRevisionId / createdById (see below) means
+//     the evidence this row represents cannot be silently erased by
+//     deleting the ItemRevision or User it names, even though no such
+//     delete path exists anywhere in this app today - if one is ever
+//     added, it must reckon with released evidence deliberately, not by
+//     accident.
+//
+// AUDIT, NOT A GENERIC FRAMEWORK: only createdById + createdAt are
+// captured. No broader audit-event model is introduced here - see
+// CadCheckoutEvent for the (separate, already-existing) checkout-history
+// mechanism, which this deliberately does not duplicate or extend.
+// ============================================================
+
+model ReleaseBaseline {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Composite tenant-aware FK, Restrict (not Cascade) - released evidence
+  // must outlive the revision record if that record is ever deletable in
+  // the future (no such path exists today).
+  itemRevisionId String
+  itemRevision   ItemRevision @relation(fields: [organizationId, itemRevisionId], references: [organizationId, id], onDelete: Restrict)
+
+  // Set from the authenticated actor on the server, never from the client.
+  // Restrict - the same "evidence must outlive the User it names" reasoning
+  // used throughout (CadCheckoutEvent, etc).
+  createdById String
+  createdBy   User   @relation(fields: [organizationId, createdById], references: [organizationId, id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  entries ReleaseBaselineEntry[]
+
+  @@unique([organizationId, id])
+  // At most one baseline per revision - see the model comment above.
+  @@unique([organizationId, itemRevisionId])
+  @@index([organizationId])
+  @@index([createdById])
+}
+
+// ============================================================
+// RELEASE BASELINE ENTRY  (P3D-1)
+//
+// One pinned (CadDocument, FileVersion) pair per DIRECTLY associated
+// CadDocument (via ItemRevisionDocument) at the moment of release. Scope is
+// deliberately limited to direct associations only - NOT the transitive
+// CadDependency closure (Assembly.iam's referenced Part.ipt is not
+// automatically pinned just because Assembly.iam is). Dependency-closure
+// snapshot/reproducibility validation is explicitly future P3D work.
+//
+// KEY CONSTRAINT - proving fileVersionId actually belongs to cadDocumentId:
+// a naive `fileVersionId -> FileVersion(organizationId, id)` FK only proves
+// the FileVersion exists in the SAME organization - nothing stops a caller
+// (or a bug) from pairing cadDocumentId=Assembly.iam with a fileVersionId
+// that actually belongs to Frame.ipt. Instead, this FK is the COMPOSITE
+// (organizationId, cadDocumentId, fileVersionId), referencing FileVersion's
+// (organizationId, cadDocumentId, id) unique constraint (added in P3D-1
+// specifically to make this possible). Because FileVersion's OWN
+// cadDocumentId is part of that referenced key, the database itself proves
+// the pinned FileVersion belongs to the pinned CadDocument - a mismatched
+// pair is a foreign-key violation, not just an application-level bug that
+// could slip through.
+//
+// Deliberately does NOT store originalFileName / any display data:
+// "released snapshot identity must not depend on filename" - the pinned
+// identity is (cadDocumentId, fileVersionId) only. A caller needing display
+// data joins CadDocument / FileVersion at read time.
+//
+// FK strategy: cadDocumentId and the FileVersion composite FK both use
+// Restrict (never Cascade) - the SAME "evidence must outlive the thing it
+// names" reasoning as ReleaseBaseline itself; releaseBaselineId uses
+// Cascade because an entry has no independent meaning once its OWNING
+// baseline is gone (P3D-1 exposes no delete path for ReleaseBaseline at
+// all, so this never actually fires - it exists only for referential
+// consistency if a baseline were ever administratively removed later).
+// ============================================================
+
+model ReleaseBaselineEntry {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  releaseBaselineId String
+  releaseBaseline   ReleaseBaseline @relation(fields: [organizationId, releaseBaselineId], references: [organizationId, id], onDelete: Cascade)
+
+  cadDocumentId String
+  cadDocument   CadDocument @relation(fields: [organizationId, cadDocumentId], references: [organizationId, id], onDelete: Restrict)
+
+  // Composite FK proving fileVersionId belongs to cadDocumentId - see the
+  // model comment above. NOT a plain (organizationId, id) reference.
+  fileVersionId String
+  fileVersion   FileVersion @relation(fields: [organizationId, cadDocumentId, fileVersionId], references: [organizationId, cadDocumentId, id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, id])
+  // One entry per CadDocument per baseline.
+  @@unique([releaseBaselineId, cadDocumentId])
+  @@index([organizationId])
+  @@index([releaseBaselineId])
+  @@index([cadDocumentId])
+  @@index([fileVersionId])
 }
