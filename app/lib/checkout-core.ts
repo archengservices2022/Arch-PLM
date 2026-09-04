@@ -17,11 +17,21 @@
  *
  * SCOPE (P3C-1): checkout is a CadDocument-level editing LOCK only. It never
  * creates a FileVersion, never mutates ItemRevision or lifecycle state, and
- * never touches CadDependency or stored binaries. There is no check-in,
- * undo, admin unlock, or automatic expiration in this milestone - see
- * `checkout-db.ts` for why a single database unique constraint is the entire
- * concurrency strategy under those constraints.
+ * never touches CadDependency or stored binaries. There is no undo, admin
+ * unlock, or automatic expiration in this milestone - see `checkout-db.ts`
+ * for the concurrency strategy (a unique constraint for actor-vs-actor
+ * conflicts, plus - since P3C-2 - a CadDocument row lock shared with direct
+ * upload and Check-In).
+ *
+ * VERSION RESOLUTION (P3C-2): the "current usable FileVersion" algorithm is
+ * shared with Get Latest and Check-In via `file-version-resolution-core.ts` -
+ * see that module's doc comment. This file no longer maintains its own copy;
+ * the types/function below are thin aliases kept for call-site stability.
  */
+import {
+  resolveCurrentFileVersion,
+  type FileVersionResolutionRow,
+} from "./file-version-resolution-core.ts";
 
 // ------------------------------------------------------------
 // Errors
@@ -62,6 +72,20 @@ export class CheckoutConflictError extends Error {
   }
 }
 
+/** Thrown only after the CadDocument-row-locked SERIALIZABLE transaction
+ *  (shared with direct FileVersion upload - see `db-concurrency-db.ts`)
+ *  exhausted its bounded retries under genuine concurrent load. Never
+ *  carries Prisma internals - a safe, controlled conflict distinct from
+ *  `CheckoutConflictError` (which means "someone else already holds it"). */
+export class CheckoutConcurrencyConflictError extends Error {
+  constructor() {
+    super(
+      "Could not complete checkout due to concurrent changes, please retry",
+    );
+    this.name = "CheckoutConcurrencyConflictError";
+  }
+}
+
 // ------------------------------------------------------------
 // Checkout record / outcome / status shapes
 // ------------------------------------------------------------
@@ -96,15 +120,9 @@ export type CheckoutStatus =
 // Base-version resolution (no fallback - Get Latest integrity philosophy)
 // ------------------------------------------------------------
 
-export const DEFAULT_MAX_VERSIONS_SCANNED = 500;
+export { DEFAULT_MAX_VERSIONS_SCANNED } from "./file-version-resolution-core.ts";
 
-export interface CheckoutVersionRow {
-  id: string;
-  versionNumber: number;
-  checksum: string | null;
-  fileSize: number | null;
-  storageKey: string;
-}
+export type CheckoutVersionRow = FileVersionResolutionRow;
 
 export interface CheckoutVersionDeps {
   /** Tenant-scoped, newest versionNumber first, already capped by the caller. */
@@ -119,25 +137,9 @@ export type CheckoutVersionResolution =
   | { kind: "missing-version" }
   | { kind: "missing-binary"; row: CheckoutVersionRow };
 
-/** A version row is a real, immutable binary version iff it carries a
- *  server-computed checksum and byte size (the metadata-only creation path
- *  that produced neither was removed in P3A-1). */
-function isBinaryBacked(row: CheckoutVersionRow): boolean {
-  return (
-    typeof row.checksum === "string" &&
-    row.checksum.length > 0 &&
-    typeof row.fileSize === "number" &&
-    Number.isFinite(row.fileSize) &&
-    row.fileSize >= 0
-  );
-}
-
 /**
- * Resolve the CadDocument's current newest binary-backed FileVersion.
- *
- * Newest-first, first metadata-complete (checksum + size) row wins; if that
- * row's bytes are missing from storage, this returns `missing-binary` rather
- * than silently falling back to an older, still-present version - a
+ * Resolve the CadDocument's current usable FileVersion - see
+ * `file-version-resolution-core.ts` for the exact (shared) semantics. A
  * checkout's base must always represent the document's true current state,
  * exactly like Get Latest never ships stale bytes labeled "latest".
  */
@@ -145,19 +147,5 @@ export async function resolveLatestBinaryVersionForCheckout(
   cadDocumentId: string,
   deps: CheckoutVersionDeps,
 ): Promise<CheckoutVersionResolution> {
-  const maxScan = deps.maxVersionsScanned ?? DEFAULT_MAX_VERSIONS_SCANNED;
-  const rows = (await deps.loadVersionsNewestFirst(cadDocumentId)).slice(
-    0,
-    maxScan,
-  );
-
-  const latest = rows.find(isBinaryBacked);
-  if (!latest) {
-    return { kind: "missing-version" };
-  }
-
-  const exists = await deps.objectExists(latest.storageKey);
-  return exists
-    ? { kind: "ok", row: latest }
-    : { kind: "missing-binary", row: latest };
+  return resolveCurrentFileVersion<CheckoutVersionRow>(cadDocumentId, deps);
 }

@@ -2,17 +2,22 @@ import "server-only";
 
 import type { Readable } from "node:stream";
 
-import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/app/lib/prisma";
 import type { Actor } from "@/app/lib/authz";
 import {
   LocalFilesystemStorage,
   resolveMaxUploadBytes,
   resolveStorageRoot,
-  uploadCadFileVersion,
   type StorageProvider,
   type UploadedFileVersion,
 } from "@/app/lib/storage-core";
+import {
+  storeCadFileVersionForActor,
+  ActiveCheckoutBlocksUploadError,
+  CadDocumentNotFoundError,
+  UploadConcurrencyConflictError,
+  type UploadGuardDb,
+} from "@/app/lib/upload-guard-db";
 
 /**
  * Server-only wiring for the PDM storage foundation: it binds the
@@ -41,12 +46,7 @@ export function getStorageProvider(): StorageProvider {
 // Domain errors (mapped to HTTP status in the route handlers)
 // ------------------------------------------------------------
 
-export class CadDocumentNotFoundError extends Error {
-  constructor() {
-    super("CAD document not found in your organization");
-    this.name = "CadDocumentNotFoundError";
-  }
-}
+export { ActiveCheckoutBlocksUploadError, CadDocumentNotFoundError, UploadConcurrencyConflictError };
 
 export class FileVersionNotFoundError extends Error {
   constructor() {
@@ -69,13 +69,6 @@ export class StoredFileCorruptError extends Error {
   }
 }
 
-function isVersionNumberConflict(error: unknown): boolean {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2002"
-  );
-}
-
 // ------------------------------------------------------------
 // Upload
 // ------------------------------------------------------------
@@ -93,69 +86,28 @@ function isVersionNumberConflict(error: unknown): boolean {
  * Invariant: this NEVER creates or mutates an ItemRevision or lifecycle state -
  * it only reads CadDocument and writes a FileVersion row.
  *
- * The filesystem/object store does NOT participate in the DB transaction;
- * `uploadCadFileVersion` handles storage-success/DB-failure cleanup.
+ * Thin wrapper: all logic (including the P3C-2 exclusive-checkout guard and
+ * its shared CadDocument-row-lock concurrency design) lives in the plain,
+ * non-`server-only` `app/lib/upload-guard-db.ts`, which is what the focused
+ * tests exercise directly with an in-memory fake database.
  */
 export async function storeCadFileVersion(
   actor: Actor,
   cadDocumentId: string,
   source: Readable,
   originalFileName: string | null | undefined,
+  db: UploadGuardDb = prisma,
+  provider: StorageProvider = getStorageProvider(),
+  maxBytes: number = resolveMaxUploadBytes(),
 ): Promise<UploadedFileVersion> {
-  const cadDocument = await prisma.cadDocument.findFirst({
-    where: { id: cadDocumentId, organizationId: actor.organizationId },
-    select: { id: true, fileName: true },
-  });
-
-  if (!cadDocument) {
-    throw new CadDocumentNotFoundError();
-  }
-
-  const provider = getStorageProvider();
-
-  return uploadCadFileVersion(
-    {
-      organizationId: actor.organizationId,
-      cadDocumentId: cadDocument.id,
-      actorUserId: actor.userId,
-      source,
-      maxBytes: resolveMaxUploadBytes(),
-      originalFileName: originalFileName ?? cadDocument.fileName,
-    },
-    {
-      provider,
-      isVersionNumberConflict,
-      async allocateNextVersionNumber() {
-        // Reuse the existing version-number concurrency model: MAX+1, with the
-        // @@unique([cadDocumentId, versionNumber]) constraint as the source of
-        // truth (a losing race retries).
-        const latest = await prisma.fileVersion.findFirst({
-          where: {
-            cadDocumentId: cadDocument.id,
-            organizationId: actor.organizationId,
-          },
-          orderBy: { versionNumber: "desc" },
-          select: { versionNumber: true },
-        });
-        return (latest?.versionNumber ?? 0) + 1;
-      },
-      async persistFileVersionRow(row) {
-        const created = await prisma.fileVersion.create({
-          data: {
-            organizationId: row.organizationId,
-            cadDocumentId: row.cadDocumentId,
-            createdById: row.createdById,
-            versionNumber: row.versionNumber,
-            originalFileName: row.originalFileName,
-            storageKey: row.storageKey,
-            fileSize: BigInt(row.fileSize),
-            checksum: row.checksum,
-          },
-          select: { id: true, versionNumber: true },
-        });
-        return created;
-      },
-    },
+  return storeCadFileVersionForActor(
+    actor,
+    cadDocumentId,
+    source,
+    originalFileName,
+    maxBytes,
+    db,
+    provider,
   );
 }
 

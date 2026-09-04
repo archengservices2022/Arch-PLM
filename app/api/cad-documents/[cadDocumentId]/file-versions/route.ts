@@ -2,7 +2,9 @@ import { Readable } from "node:stream";
 
 import { getActor, assertCanMutate } from "@/app/lib/authz";
 import {
+  ActiveCheckoutBlocksUploadError,
   CadDocumentNotFoundError,
+  UploadConcurrencyConflictError,
   storeCadFileVersion,
 } from "@/app/lib/storage";
 import { EmptyUploadError, UploadTooLargeError } from "@/app/lib/storage-core";
@@ -75,6 +77,12 @@ export async function POST(
   } catch (error) {
     if (error instanceof CadDocumentNotFoundError) {
       return jsonError(404, error.message);
+    }
+    if (error instanceof ActiveCheckoutBlocksUploadError) {
+      return jsonError(409, error.message);
+    }
+    if (error instanceof UploadConcurrencyConflictError) {
+      return jsonError(409, error.message);
     }
     if (error instanceof UploadTooLargeError) {
       return jsonError(413, "File exceeds the maximum upload size");

@@ -13,7 +13,12 @@
  * on disk, does not generate a ZIP, and does not read or write ItemRevision /
  * lifecycle state. "Get Latest" tracks the live latest FileVersion of each
  * document; it is deliberately NOT an engineering release baseline.
+ *
+ * VERSION RESOLUTION (P3C-2): the "current usable FileVersion" algorithm is
+ * shared with Checkout and Check-In via `file-version-resolution-core.ts` -
+ * see that module's doc comment. This file no longer maintains its own copy.
  */
+import { resolveCurrentFileVersion } from "./file-version-resolution-core.ts";
 
 // Control characters: NUL..US (0x00-0x1F) plus DEL (0x7F). Built from a string
 // so the source file stays pure ASCII (matching app/lib/storage-core.ts).
@@ -350,40 +355,15 @@ type VersionResolution =
   | { kind: "missing-version" }
   | { kind: "missing-binary"; row: ManifestVersionRow };
 
-/** A version row is a real, immutable binary version iff it carries a
- *  server-computed checksum and byte size (the metadata-only creation path
- *  that produced neither was removed in P3A-1). */
-function isBinaryBacked(row: ManifestVersionRow): boolean {
-  return (
-    typeof row.checksum === "string" &&
-    row.checksum.length > 0 &&
-    typeof row.fileSize === "number" &&
-    Number.isFinite(row.fileSize) &&
-    row.fileSize >= 0
-  );
-}
-
 async function resolveLatestVersion(
   cadDocumentId: string,
   deps: GetLatestDeps,
 ): Promise<VersionResolution> {
-  const maxScan = deps.maxVersionsScanned ?? DEFAULT_MAX_VERSIONS_SCANNED;
-  const rows = (await deps.loadVersionsNewestFirst(cadDocumentId)).slice(
-    0,
-    maxScan,
-  );
-
-  // Newest-first: the first metadata-complete row is "the latest version".
-  const latest = rows.find(isBinaryBacked);
-  if (!latest) {
-    return { kind: "missing-version" };
-  }
-
-  // The latest version must have its bytes in storage. We deliberately do NOT
-  // fall back to an older version: the document's current state would be
-  // misrepresented by shipping stale bytes as "latest".
-  const exists = await deps.objectExists(latest.storageKey);
-  return exists ? { kind: "ok", row: latest } : { kind: "missing-binary", row: latest };
+  return resolveCurrentFileVersion<ManifestVersionRow>(cadDocumentId, {
+    loadVersionsNewestFirst: deps.loadVersionsNewestFirst,
+    objectExists: deps.objectExists,
+    maxVersionsScanned: deps.maxVersionsScanned ?? DEFAULT_MAX_VERSIONS_SCANNED,
+  });
 }
 
 // ------------------------------------------------------------

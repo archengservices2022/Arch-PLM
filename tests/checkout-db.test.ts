@@ -47,6 +47,26 @@ class FakeP2002Error extends Error {
   }
 }
 
+/** A REAL per-key async mutex (not a synchronous check-and-set shortcut),
+ *  acquired on the CadDocument `FOR UPDATE` lock query and released only
+ *  when the transaction's callback settles - mirrors
+ *  `tests/checkin-db.test.ts`'s RowLock, so the checkout-vs-direct-upload
+ *  cross-module race genuinely exercises blocking + post-unblock
+ *  re-evaluation, not luck. */
+class RowLock {
+  #tail: Promise<void> = Promise.resolve();
+  async acquire(): Promise<() => void> {
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prior = this.#tail;
+    this.#tail = prior.then(() => mine);
+    await prior;
+    return release;
+  }
+}
+
 interface DocRow {
   organizationId: string;
   id: string;
@@ -81,7 +101,49 @@ class FakeDatabase {
   readonly versions: VersionRow[] = [];
   readonly users: UserRow[] = [];
   readonly checkouts: CheckoutRow[] = [];
+  readonly #locks = new Map<string, RowLock>();
   createAttempts = 0;
+  transactionAttempts = 0;
+
+  #lockFor(key: string): RowLock {
+    let lock = this.#locks.get(key);
+    if (!lock) {
+      lock = new RowLock();
+      this.#locks.set(key, lock);
+    }
+    return lock;
+  }
+
+  #createCheckout(data: {
+    organizationId: string;
+    cadDocumentId: string;
+    baseFileVersionId: string;
+    checkedOutById: string;
+  }) {
+    this.createAttempts += 1;
+    // Faithfully simulate the (organizationId, cadDocumentId) unique index:
+    // check-and-insert as one synchronous, non-interruptible step (no
+    // `await` in between), exactly like a real unique index gives Postgres.
+    const conflict = this.checkouts.some(
+      (c) =>
+        c.organizationId === data.organizationId &&
+        c.cadDocumentId === data.cadDocumentId,
+    );
+    if (conflict) {
+      throw new FakeP2002Error();
+    }
+    const row: CheckoutRow = {
+      organizationId: data.organizationId,
+      id: `co-${randomBytes(6).toString("hex")}`,
+      cadDocumentId: data.cadDocumentId,
+      baseFileVersionId: data.baseFileVersionId,
+      checkedOutById: data.checkedOutById,
+      checkedOutAt: new Date(),
+      note: null,
+    };
+    this.checkouts.push(row);
+    return this.#hydrate(row);
+  }
 
   addDoc(organizationId: string, id: string): this {
     this.docs.push({ organizationId, id });
@@ -160,32 +222,72 @@ class FakeDatabase {
             checkedOutById: string;
           };
         }) => {
-          self.createAttempts += 1;
-          // Faithfully simulate the (organizationId, cadDocumentId) unique
-          // index: check-and-insert as one synchronous, non-interruptible
-          // step (no `await` in between), exactly like a real unique index
-          // gives Postgres.
-          const conflict = self.checkouts.some(
-            (c) =>
-              c.organizationId === args.data.organizationId &&
-              c.cadDocumentId === args.data.cadDocumentId,
-          );
-          if (conflict) {
-            throw new FakeP2002Error();
-          }
-          const row: CheckoutRow = {
-            organizationId: args.data.organizationId,
-            id: `co-${randomBytes(6).toString("hex")}`,
-            cadDocumentId: args.data.cadDocumentId,
-            baseFileVersionId: args.data.baseFileVersionId,
-            checkedOutById: args.data.checkedOutById,
-            checkedOutAt: new Date(),
-            note: null,
-          };
-          self.checkouts.push(row);
-          return self.#hydrate(row);
+          return self.#createCheckout(args.data);
         }) as unknown as CheckoutDb["cadCheckout"]["create"],
       },
+      $transaction: (async (
+        fn: (tx: unknown) => Promise<unknown>,
+        _opts?: unknown,
+      ) => {
+        self.transactionAttempts += 1;
+        const releases: Array<() => void> = [];
+        const tx = {
+          $queryRaw: (async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+            // Matches lockCadDocumentForVersionMutation's bind order:
+            // cadDocumentId then organizationId.
+            const cadDocumentId = values[0] as string;
+            const organizationId = values[1] as string;
+            const key = `${organizationId}:${cadDocumentId}`;
+            const release = await self.#lockFor(key).acquire();
+            releases.push(release);
+            const row = self.docs.find(
+              (d) => d.id === cadDocumentId && d.organizationId === organizationId,
+            );
+            if (!row) return [];
+            return [{ id: row.id, organizationId: row.organizationId }];
+          }) as unknown,
+          fileVersion: {
+            findMany: (async (args: {
+              where: { organizationId: string; cadDocumentId: string };
+            }) => {
+              return self.versions
+                .filter(
+                  (v) =>
+                    v.organizationId === args.where.organizationId &&
+                    v.cadDocumentId === args.where.cadDocumentId,
+                )
+                .sort((a, b) => b.versionNumber - a.versionNumber);
+            }) as unknown,
+          },
+          cadCheckout: {
+            findFirst: (async (args: {
+              where: { organizationId: string; cadDocumentId: string };
+            }) => {
+              const row = self.checkouts.find(
+                (c) =>
+                  c.organizationId === args.where.organizationId &&
+                  c.cadDocumentId === args.where.cadDocumentId,
+              );
+              return row ? self.#hydrate(row) : null;
+            }) as unknown,
+            create: (async (args: {
+              data: {
+                organizationId: string;
+                cadDocumentId: string;
+                baseFileVersionId: string;
+                checkedOutById: string;
+              };
+            }) => {
+              return self.#createCheckout(args.data);
+            }) as unknown,
+          },
+        };
+        try {
+          return await fn(tx);
+        } finally {
+          for (const release of releases) release();
+        }
+      }) as unknown as CheckoutDb["$transaction"],
     } as unknown as CheckoutDb;
   }
 }
@@ -341,7 +443,17 @@ test("concurrent two-user race on the same document: exactly one active checkout
     (rejected[0] as PromiseRejectedResult).reason instanceof CheckoutConflictError,
   );
   assert.equal(db.checkouts.length, 1, "only one CadCheckout row ever exists");
-  assert.equal(db.createAttempts, 2, "both racers attempted the insert - the constraint, not luck, decided");
+  // P3C-2: the CadDocument row lock (shared with direct upload) now
+  // serializes the two racers' entire "resolve base + create" critical
+  // sections against each other. The loser's in-lock re-check sees the
+  // winner's checkout BEFORE attempting any insert, so - unlike the P2C-1
+  // design, which let both racers reach cadCheckout.create() and relied on
+  // the unique constraint alone - only the winner ever attempts the insert.
+  // The unique constraint remains as defense-in-depth (see the P2002 catch
+  // in requestCheckoutForActor); it is just no longer the ONLY thing
+  // deciding the outcome here.
+  assert.equal(db.createAttempts, 1, "the lock resolves the race before a second insert is ever attempted");
+  assert.equal(db.transactionAttempts, 2, "both racers still entered the locked transaction");
 });
 
 test("many-way concurrent race on the same document still yields exactly one winner", async () => {

@@ -15,16 +15,34 @@
  * so a caller can never see, create, or conflict against another tenant's
  * checkout.
  *
- * CONCURRENCY: `CadCheckout` has a DATABASE-level unique constraint on
- * (organizationId, cadDocumentId) - see `prisma/schema.prisma`'s model
- * comment for the full reasoning. At most one checkout row can ever exist
- * per document. Two actors racing to check out the same document both
+ * CONCURRENCY (actor vs actor): `CadCheckout` has a DATABASE-level unique
+ * constraint on (organizationId, cadDocumentId) - see `prisma/schema.prisma`'s
+ * model comment for the full reasoning. At most one checkout row can ever
+ * exist per document. Two actors racing to check out the same document both
  * attempt `cadCheckout.create()`; Postgres's unique index lets exactly one
  * succeed. The loser's insert fails with a unique-constraint violation
  * (P2002), which this module turns into either an idempotent "you already
  * hold it" outcome (same actor) or a `CheckoutConflictError` naming the
- * other actor (different actor). No explicit row-locking transaction is used
- * or needed here - the unique index IS the serialization point.
+ * other actor (different actor). This reconciliation is now defense-in-depth
+ * (see below) rather than the primary mechanism.
+ *
+ * CONCURRENCY (checkout vs direct upload, P3C-2): the unique constraint above
+ * only serializes two checkout ATTEMPTS against each other - it says nothing
+ * about a concurrent direct FileVersion upload
+ * (`POST .../file-versions`, guarded by `app/lib/upload-guard-db.ts`), which
+ * writes to a completely different table. Without an additional shared mutex,
+ * a checkout could capture `baseFileVersionId = V1` while a concurrent direct
+ * upload independently creates V2, silently invalidating the checkout's
+ * exclusivity the instant it is created. So the "resolve base version, then
+ * create the checkout row" step below runs inside a SERIALIZABLE transaction
+ * that first takes `SELECT ... FOR UPDATE` on the CadDocument row via
+ * `lockCadDocumentForVersionMutation` (`app/lib/db-concurrency-db.ts`) - the
+ * SAME lock direct upload takes before deciding whether a checkout blocks it.
+ * Whichever side acquires the lock first fully commits its decision before
+ * the other's lock acquisition can even proceed, so the two operations can
+ * never interleave. Exhausting the bounded SERIALIZABLE retry under genuine
+ * concurrent load raises `CheckoutConcurrencyConflictError` (409) - never a
+ * raw Prisma/P2034 error.
  *
  * LIFECYCLE: this NEVER creates a FileVersion, and NEVER reads or writes
  * ItemRevision / lifecycle / CadDependency. A CadDocument's FileVersion
@@ -44,9 +62,15 @@
 import type { PrismaClient } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
 import { UserRole } from "../generated/prisma/enums.ts";
+import {
+  lockCadDocumentForVersionMutation,
+  runSerializableTransaction,
+  SerializableTransactionExhaustedError,
+} from "./db-concurrency-db.ts";
 import type { StorageProvider } from "./storage-core.ts";
 import {
   CadDocumentNotFoundError,
+  CheckoutConcurrencyConflictError,
   CheckoutConflictError,
   CheckoutRoleError,
   DEFAULT_MAX_VERSIONS_SCANNED,
@@ -59,6 +83,7 @@ import {
 
 export {
   CadDocumentNotFoundError,
+  CheckoutConcurrencyConflictError,
   CheckoutConflictError,
   CheckoutRoleError,
   NoValidFileVersionError,
@@ -66,10 +91,11 @@ export {
 export type { CheckoutRecord, CheckoutRequestOutcome, CheckoutStatus };
 
 /** The slice of PrismaClient this module needs. Narrowed so tests can inject
- *  a lightweight in-memory fake with the same shape. */
+ *  a lightweight in-memory fake with the same shape. Includes `$transaction`
+ *  (P3C-2) for the CadDocument row lock shared with direct upload. */
 export type CheckoutDb = Pick<
   PrismaClient,
-  "cadDocument" | "fileVersion" | "cadCheckout"
+  "cadDocument" | "fileVersion" | "cadCheckout" | "$transaction"
 >;
 
 /** Mirrors `app/lib/authz.ts`'s `PLM_WRITE_ROLES` / `assertCanMutate` (VIEWER
@@ -166,76 +192,119 @@ export async function requestCheckoutForActor(
     throw new CheckoutConflictError(existing);
   }
 
-  const resolution = await resolveLatestBinaryVersionForCheckout(
-    cadDocument.id,
-    {
-      maxVersionsScanned: DEFAULT_MAX_VERSIONS_SCANNED,
-      async loadVersionsNewestFirst(id) {
-        const rows = await db.fileVersion.findMany({
-          where: { organizationId: actor.organizationId, cadDocumentId: id },
-          orderBy: { versionNumber: "desc" },
-          take: DEFAULT_MAX_VERSIONS_SCANNED,
-          select: {
-            id: true,
-            versionNumber: true,
-            checksum: true,
-            fileSize: true,
-            storageKey: true,
-          },
-        });
-        return rows.map((row) => ({
-          id: row.id,
-          versionNumber: row.versionNumber,
-          checksum: row.checksum,
-          fileSize: row.fileSize == null ? null : Number(row.fileSize),
-          storageKey: row.storageKey,
-        }));
-      },
-      async objectExists(storageKey) {
-        return provider.exists(storageKey);
-      },
-    },
-  );
-
-  if (resolution.kind !== "ok") {
-    throw new NoValidFileVersionError();
-  }
-
+  // AUTHORITATIVE: resolve the base version and create the checkout row
+  // inside ONE CadDocument-row-locked SERIALIZABLE transaction - the shared
+  // mutex with direct upload (see the module doc comment above). The
+  // pre-check above is a fast path only; everything here is re-verified
+  // fresh, from inside the lock.
   try {
-    const created = await db.cadCheckout.create({
-      data: {
-        organizationId: actor.organizationId,
-        cadDocumentId: cadDocument.id,
-        baseFileVersionId: resolution.row.id,
-        checkedOutById: actor.userId,
-      },
-      select: {
-        id: true,
-        cadDocumentId: true,
-        baseFileVersionId: true,
-        checkedOutById: true,
-        checkedOutAt: true,
-        note: true,
-        baseFileVersion: { select: { versionNumber: true } },
-        checkedOutBy: { select: { name: true, email: true } },
-      },
+    return await runSerializableTransaction(db, async (tx) => {
+      const lockedDoc = await lockCadDocumentForVersionMutation(
+        tx,
+        actor.organizationId,
+        cadDocument.id,
+      );
+      if (!lockedDoc) {
+        // The document existed a moment ago (checked above); treat a
+        // vanished row the same way as never having found it.
+        throw new CadDocumentNotFoundError();
+      }
+
+      const insideExisting = await loadCheckoutRecord(
+        tx as unknown as CheckoutDb,
+        actor.organizationId,
+        cadDocument.id,
+      );
+      if (insideExisting) {
+        if (insideExisting.checkedOutById === actor.userId) {
+          return { status: "already-mine", checkout: insideExisting };
+        }
+        throw new CheckoutConflictError(insideExisting);
+      }
+
+      const resolution = await resolveLatestBinaryVersionForCheckout(
+        cadDocument.id,
+        {
+          maxVersionsScanned: DEFAULT_MAX_VERSIONS_SCANNED,
+          async loadVersionsNewestFirst(id) {
+            const rows = await tx.fileVersion.findMany({
+              where: {
+                organizationId: actor.organizationId,
+                cadDocumentId: id,
+              },
+              orderBy: { versionNumber: "desc" },
+              take: DEFAULT_MAX_VERSIONS_SCANNED,
+              select: {
+                id: true,
+                versionNumber: true,
+                checksum: true,
+                fileSize: true,
+                storageKey: true,
+              },
+            });
+            return rows.map((row) => ({
+              id: row.id,
+              versionNumber: row.versionNumber,
+              checksum: row.checksum,
+              fileSize: row.fileSize == null ? null : Number(row.fileSize),
+              storageKey: row.storageKey,
+            }));
+          },
+          async objectExists(storageKey) {
+            return provider.exists(storageKey);
+          },
+        },
+      );
+
+      if (resolution.kind !== "ok") {
+        throw new NoValidFileVersionError();
+      }
+
+      const created = await tx.cadCheckout.create({
+        data: {
+          organizationId: actor.organizationId,
+          cadDocumentId: cadDocument.id,
+          baseFileVersionId: resolution.row.id,
+          checkedOutById: actor.userId,
+        },
+        select: {
+          id: true,
+          cadDocumentId: true,
+          baseFileVersionId: true,
+          checkedOutById: true,
+          checkedOutAt: true,
+          note: true,
+          baseFileVersion: { select: { versionNumber: true } },
+          checkedOutBy: { select: { name: true, email: true } },
+        },
+      });
+      const record: CheckoutRecord = {
+        id: created.id,
+        cadDocumentId: created.cadDocumentId,
+        baseFileVersionId: created.baseFileVersionId,
+        baseVersionNumber: created.baseFileVersion.versionNumber,
+        checkedOutById: created.checkedOutById,
+        checkedOutByName: created.checkedOutBy.name,
+        checkedOutByEmail: created.checkedOutBy.email,
+        checkedOutAt: created.checkedOutAt.toISOString(),
+        note: created.note,
+      };
+      return { status: "created", checkout: record };
     });
-    const record: CheckoutRecord = {
-      id: created.id,
-      cadDocumentId: created.cadDocumentId,
-      baseFileVersionId: created.baseFileVersionId,
-      baseVersionNumber: created.baseFileVersion.versionNumber,
-      checkedOutById: created.checkedOutById,
-      checkedOutByName: created.checkedOutBy.name,
-      checkedOutByEmail: created.checkedOutBy.email,
-      checkedOutAt: created.checkedOutAt.toISOString(),
-      note: created.note,
-    };
-    return { status: "created", checkout: record };
   } catch (error) {
+    if (error instanceof SerializableTransactionExhaustedError) {
+      throw new CheckoutConcurrencyConflictError();
+    }
+    if (error instanceof CheckoutConflictError || error instanceof NoValidFileVersionError) {
+      throw error;
+    }
     if (!isUniqueConstraintViolation(error)) {
       throw error;
     }
+    // Defense-in-depth: the CadDocument row lock should make this
+    // unreachable in practice (the in-lock re-check above catches an
+    // existing checkout before any insert is attempted), but never mask a
+    // genuine unique-constraint violation if it somehow still occurs.
     // Lost the race: exactly one of the racing requests wins the insert;
     // reconcile against whoever that turned out to be.
     const afterRace = await loadCheckoutRecord(
@@ -372,6 +441,9 @@ export async function requestCheckoutHttpResult(
           checkout: publicCheckout(error.checkout),
         },
       };
+    }
+    if (error instanceof CheckoutConcurrencyConflictError) {
+      return { status: 409, body: { error: error.message } };
     }
     throw error;
   }

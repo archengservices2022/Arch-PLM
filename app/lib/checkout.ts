@@ -10,6 +10,7 @@ import {
   requestCheckoutHttpResult as requestCheckoutHttpResultWith,
   getCheckoutStatusHttpResult as getCheckoutStatusHttpResultWith,
   CadDocumentNotFoundError,
+  CheckoutConcurrencyConflictError,
   CheckoutConflictError,
   CheckoutRoleError,
   NoValidFileVersionError,
@@ -33,6 +34,7 @@ import {
 
 export {
   CadDocumentNotFoundError,
+  CheckoutConcurrencyConflictError,
   CheckoutConflictError,
   CheckoutRoleError,
   NoValidFileVersionError,
