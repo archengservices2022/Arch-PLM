@@ -585,6 +585,12 @@ export default async function Home() {
                             >
                               Get Latest manifest
                             </a>
+                            <a
+                              href={`/api/cad-documents/${cadDocument.id}/workspace-plan`}
+                              className="text-xs font-semibold text-slate-700 underline"
+                            >
+                              Workspace plan
+                            </a>
                           </div>
                         </div>
                       );
