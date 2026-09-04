@@ -579,6 +579,12 @@ export default async function Home() {
                                 Download V{latestVersion.versionNumber}
                               </a>
                             ) : null}
+                            <a
+                              href={`/api/cad-documents/${cadDocument.id}/get-latest`}
+                              className="text-xs font-semibold text-slate-700 underline"
+                            >
+                              Get Latest manifest
+                            </a>
                           </div>
                         </div>
                       );
