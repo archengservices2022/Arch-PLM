@@ -363,7 +363,10 @@ const SUPPORTED_CONTRACT_MAJOR = Number(
   WORKSPACE_PLAN_CONTRACT_VERSION.split(".")[0],
 );
 
-function isSupportedContractVersion(version: string): boolean {
+/** Exported so other trusted callers (e.g. the reference CLI client) can
+ *  apply the exact same "is this contract version usable" rule as this
+ *  materializer, without duplicating the check. */
+export function isSupportedWorkspaceContractVersion(version: string): boolean {
   const major = Number(String(version).split(".")[0]);
   return Number.isInteger(major) && major === SUPPORTED_CONTRACT_MAJOR;
 }
@@ -645,7 +648,7 @@ export async function materializeWorkspacePlan(
       `Unsupported workspace contract id: ${JSON.stringify(plan.contract.id)}`,
     );
   }
-  if (!isSupportedContractVersion(plan.contract.version)) {
+  if (!isSupportedWorkspaceContractVersion(plan.contract.version)) {
     throw new UnsupportedWorkspaceContractError(
       `Unsupported workspace contract version: ${JSON.stringify(plan.contract.version)} ` +
         `(this client supports major version ${SUPPORTED_CONTRACT_MAJOR})`,
