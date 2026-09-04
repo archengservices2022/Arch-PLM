@@ -117,6 +117,7 @@ class FakeDatabase {
   readonly versions: VersionRow[] = [];
   readonly users: UserRow[] = [];
   readonly checkouts: CheckoutRow[] = [];
+  readonly events: Array<Record<string, unknown>> = [];
   readonly #locks = new Map<string, RowLock>();
   transactionAttempts = 0;
 
@@ -274,6 +275,12 @@ class FakeDatabase {
           data: { organizationId: string; cadDocumentId: string; baseFileVersionId: string; checkedOutById: string };
         }) => {
           return self.#createCheckout(args.data);
+        }) as unknown,
+      },
+      cadCheckoutEvent: {
+        create: (async (args: { data: Record<string, unknown> }) => {
+          self.events.push({ ...args.data });
+          return { id: `ev-${randomBytes(6).toString("hex")}` };
         }) as unknown,
       },
     };

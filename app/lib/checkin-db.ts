@@ -23,26 +23,32 @@
  * `persistFileVersionRow` below (used as `uploadCadFileVersion`'s
  * `deps.persistFileVersionRow`) opens its OWN `SELECT ... FOR UPDATE` +
  * SERIALIZABLE transaction via the SHARED `runSerializableTransaction` /
- * `isSerializationError` primitives in `app/lib/db-concurrency-db.ts`
+ * `lockActiveCadCheckout` primitives in `app/lib/db-concurrency-db.ts`
  * (mirroring `lockItemRevisionForCadMutation` / `runSerializable` in
- * `app/actions.ts`):
+ * `app/actions.ts`). `lockActiveCadCheckout` locks the SAME CadCheckout row
+ * that P3C-3's Undo Checkout and Admin Unlock also lock - see that
+ * function's doc comment - so exactly one of Check-In / Undo / Admin Unlock
+ * can ever consume a given checkout, regardless of which two race:
  *
  *   1. `SELECT ... FOR UPDATE` the CadCheckout row for
  *      (organizationId, cadDocumentId). This IS the serialization point: a
- *      second, concurrent check-in for the SAME document blocks here until
- *      the first transaction commits or rolls back.
+ *      second, concurrent terminal operation for the SAME document blocks
+ *      here until the first transaction commits or rolls back.
  *   2. Re-verify (inside the lock, from a fresh read) that the checkout
  *      still exists, is still owned by `actor`, and that the document's
  *      current usable FileVersion (via the SHARED resolver in
  *      `file-version-resolution-core.ts` - see below) still equals the
  *      checkout's recorded base (stale-base defense in depth).
- *   3. Only then insert the FileVersion row and delete the CadCheckout row,
- *      in the SAME transaction.
+ *   3. Only then insert the FileVersion row, record a CHECKED_IN
+ *      `CadCheckoutEvent` (P3C-3 durable history - see
+ *      `prisma/schema.prisma`'s model comment), and delete the CadCheckout
+ *      row - all in the SAME transaction.
  *
  * When the winner commits, the checkout row is gone. The loser's blocked
  * `SELECT ... FOR UPDATE` unblocks against the post-commit snapshot, finds
  * zero rows, and fails cleanly with `NotCheckedOutError` - never a raw
- * Prisma error, never a second FileVersion, never an orphaned lock.
+ * Prisma error, never a second FileVersion, never an orphaned lock, never a
+ * CHECKED_IN event for a check-in that didn't actually happen.
  *
  * EXHAUSTED RETRIES (Codex HIGH finding, P3C-2 follow-up): if every attempt
  * of the bounded SERIALIZABLE retry fails with a genuine Postgres
@@ -89,8 +95,9 @@
 import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
 import type { Readable } from "node:stream";
-import { UserRole } from "../generated/prisma/enums.ts";
+import { UserRole, CadCheckoutEventType } from "../generated/prisma/enums.ts";
 import {
+  lockActiveCadCheckout,
   runSerializableTransaction,
   SerializableTransactionExhaustedError,
 } from "./db-concurrency-db.ts";
@@ -135,7 +142,7 @@ export type { CheckInResult };
  *  row-locked transaction, not a unique-constraint insert race. */
 export type CheckInDb = Pick<
   PrismaClient,
-  "cadDocument" | "fileVersion" | "cadCheckout" | "$transaction"
+  "cadDocument" | "fileVersion" | "cadCheckout" | "cadCheckoutEvent" | "$transaction"
 >;
 
 /** Mirrors checkout-db.ts's `actorCanCheckOut` (VIEWER is the only excluded
@@ -152,34 +159,6 @@ function isUniqueConstraintViolation(error: unknown): boolean {
     "code" in error &&
     (error as { code: unknown }).code === "P2002"
   );
-}
-
-interface LockedCheckoutRow {
-  id: string;
-  baseFileVersionId: string;
-  checkedOutById: string;
-}
-
-/** Raw `SELECT ... FOR UPDATE` inside an open transaction - the row lock IS
- *  the serialization point for check-in (see the module doc comment above).
- *  Parameterised raw SQL - the `${...}` values are Prisma bind parameters,
- *  not string interpolation. Returns null when no checkout exists for this
- *  (tenant-scoped) document. */
-async function lockCheckoutForCheckIn(
-  tx: Prisma.TransactionClient,
-  organizationId: string,
-  cadDocumentId: string,
-): Promise<LockedCheckoutRow | null> {
-  const rows = await tx.$queryRaw<
-    Array<{ id: string; baseFileVersionId: string; checkedOutById: string }>
-  >`
-    SELECT "id", "baseFileVersionId", "checkedOutById"
-    FROM "CadCheckout"
-    WHERE "cadDocumentId" = ${cadDocumentId}
-      AND "organizationId" = ${organizationId}
-    FOR UPDATE
-  `;
-  return rows[0] ?? null;
 }
 
 async function loadOwnershipConflict(
@@ -289,7 +268,7 @@ export async function checkInForActor(
       async persistFileVersionRow(input: PersistFileVersionInput) {
         try {
           return await runSerializableTransaction(db, async (tx) => {
-            const locked = await lockCheckoutForCheckIn(
+            const locked = await lockActiveCadCheckout(
               tx,
               actor.organizationId,
               cadDocument.id,
@@ -390,6 +369,24 @@ export async function checkInForActor(
                 checksum: input.checksum,
               },
               select: { id: true, versionNumber: true },
+            });
+
+            // Durable history (P3C-3): recorded in the SAME transaction as
+            // the FileVersion insert and the checkout delete - a failed
+            // check-in (this transaction rolling back) can never leave a
+            // CHECKED_IN event behind, and a successful one can never skip
+            // it.
+            await tx.cadCheckoutEvent.create({
+              data: {
+                organizationId: actor.organizationId,
+                cadDocumentId: cadDocument.id,
+                checkoutId: locked.id,
+                baseFileVersionId: locked.baseFileVersionId,
+                checkoutOwnerId: locked.checkedOutById,
+                actedById: actor.userId,
+                eventType: CadCheckoutEventType.CHECKED_IN,
+                checkedOutAt: locked.checkedOutAt,
+              },
             });
 
             await tx.cadCheckout.delete({ where: { id: locked.id } });

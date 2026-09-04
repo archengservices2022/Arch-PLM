@@ -101,6 +101,16 @@ class FakeDatabase {
   readonly versions: VersionRow[] = [];
   readonly users: UserRow[] = [];
   readonly checkouts: CheckoutRow[] = [];
+  readonly events: Array<{
+    organizationId: string;
+    cadDocumentId: string;
+    checkoutId: string;
+    baseFileVersionId: string;
+    checkoutOwnerId: string;
+    actedById: string;
+    eventType: string;
+    checkedOutAt: Date;
+  }> = [];
   readonly #locks = new Map<string, RowLock>();
   createAttempts = 0;
   transactionAttempts = 0;
@@ -281,6 +291,23 @@ class FakeDatabase {
               return self.#createCheckout(args.data);
             }) as unknown,
           },
+          cadCheckoutEvent: {
+            create: (async (args: {
+              data: {
+                organizationId: string;
+                cadDocumentId: string;
+                checkoutId: string;
+                baseFileVersionId: string;
+                checkoutOwnerId: string;
+                actedById: string;
+                eventType: string;
+                checkedOutAt: Date;
+              };
+            }) => {
+              self.events.push({ ...args.data });
+              return { id: `ev-${randomBytes(6).toString("hex")}` };
+            }) as unknown,
+          },
         };
         try {
           return await fn(tx);
@@ -368,6 +395,14 @@ test("successful checkout captures the exact current base FileVersion", async ()
   assert.equal(outcome.checkout.checkedOutByName, "Actor A");
   assert.ok(!Number.isNaN(Date.parse(outcome.checkout.checkedOutAt)));
   assert.equal(db.checkouts.length, 1);
+
+  // Exactly one CHECKED_OUT audit event, atomic with the CadCheckout insert
+  // (P3C-3).
+  assert.equal(db.events.length, 1);
+  assert.equal(db.events[0]!.eventType, "CHECKED_OUT");
+  assert.equal(db.events[0]!.checkoutOwnerId, actor.userId);
+  assert.equal(db.events[0]!.actedById, actor.userId);
+  assert.equal(db.events[0]!.baseFileVersionId, "fv-doc-1-2");
 });
 
 // ------------------------------------------------------------
@@ -388,6 +423,7 @@ test("same-user checkout is idempotent: returns the existing checkout, does not 
   assert.equal(second.status, "already-mine");
   assert.equal(second.checkout.id, first.checkout.id);
   assert.equal(db.checkouts.length, 1, "no second row was created");
+  assert.equal(db.events.length, 1, "the idempotent re-checkout must not create a duplicate CHECKED_OUT event");
 });
 
 test("different-user checkout attempt fails with a conflict carrying tenant-safe lock info", async () => {

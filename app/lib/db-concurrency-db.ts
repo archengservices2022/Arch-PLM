@@ -6,13 +6,18 @@
  * imports, erased at compile time), so it stays loadable by the plain Node
  * test runner - mirrors `checkout-db.ts` / `checkin-db.ts`.
  *
- * Extracted so `checkout-db.ts`, `checkin-db.ts` and the direct-upload guard
+ * Extracted so `checkout-db.ts`, `checkin-db.ts`, `checkout-release-db.ts`
+ * (P3C-3 Undo/Admin Unlock) and the direct-upload guard
  * (`upload-guard-db.ts`) share ONE implementation of:
  *   - `SELECT ... FOR UPDATE` on the CadDocument row (the cross-table mutex
  *     that serializes checkout acquisition against direct FileVersion
  *     upload - see `upload-guard-db.ts`'s module doc comment for why a
  *     CadDocument-row lock, not a CadCheckout-row lock, is the correct
  *     shared serialization point for THAT invariant);
+ *   - `SELECT ... FOR UPDATE` on the CadCheckout row (the SAME shared
+ *     serialization point between every operation that TERMINATES a
+ *     checkout - Check-In, Undo Checkout, Admin Unlock - so exactly one of
+ *     them can ever consume a given active checkout);
  *   - the bounded SERIALIZABLE-transaction retry loop, mirroring
  *     `runSerializable` / `isSerializationError` in `app/actions.ts`;
  *   - a SAFE way to signal "retries exhausted" that every caller converts
@@ -124,6 +129,53 @@ export async function lockCadDocumentForVersionMutation(
     SELECT "id", "organizationId"
     FROM "CadDocument"
     WHERE "id" = ${cadDocumentId}
+      AND "organizationId" = ${organizationId}
+    FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
+export interface LockedCadCheckout {
+  id: string;
+  baseFileVersionId: string;
+  checkedOutById: string;
+  checkedOutAt: Date;
+}
+
+/**
+ * `SELECT ... FOR UPDATE` on the CadCheckout row for (organizationId,
+ * cadDocumentId) inside an open transaction - the SHARED serialization
+ * point between every operation that TERMINATES an active checkout
+ * (P3C-2 Check-In, P3C-3 Undo Checkout, P3C-3 Admin Unlock).
+ *
+ * Exactly one of these can ever consume a given checkout: whichever
+ * transaction acquires this lock first re-verifies the row, deletes it (and
+ * records its own audit event), and commits; every other transaction
+ * blocked on this SAME lock unblocks against the POST-COMMIT snapshot, sees
+ * zero rows, and fails cleanly (never a raw Prisma error, never a second
+ * terminal operation on the same checkout). Returns null when no checkout
+ * exists for this (tenant-scoped) document - callers must treat this as
+ * "nothing to release", not retry it.
+ *
+ * Parameterised raw SQL - the `${...}` values are Prisma bind parameters,
+ * not string interpolation.
+ */
+export async function lockActiveCadCheckout(
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  cadDocumentId: string,
+): Promise<LockedCadCheckout | null> {
+  const rows = await tx.$queryRaw<
+    Array<{
+      id: string;
+      baseFileVersionId: string;
+      checkedOutById: string;
+      checkedOutAt: Date;
+    }>
+  >`
+    SELECT "id", "baseFileVersionId", "checkedOutById", "checkedOutAt"
+    FROM "CadCheckout"
+    WHERE "cadDocumentId" = ${cadDocumentId}
       AND "organizationId" = ${organizationId}
     FOR UPDATE
   `;

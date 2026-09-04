@@ -142,6 +142,18 @@ interface CheckoutRow {
   cadDocumentId: string;
   baseFileVersionId: string;
   checkedOutById: string;
+  checkedOutAt: Date;
+}
+interface EventRow {
+  organizationId: string;
+  cadDocumentId: string;
+  checkoutId: string;
+  baseFileVersionId: string;
+  checkoutOwnerId: string;
+  actedById: string;
+  eventType: string;
+  checkedOutAt: Date;
+  reason: string | null;
 }
 
 class RowLock {
@@ -163,6 +175,7 @@ class FakeDatabase {
   readonly versions: VersionRow[] = [];
   readonly users: UserRow[] = [];
   readonly checkouts: CheckoutRow[] = [];
+  readonly events: EventRow[] = [];
   readonly #locks = new Map<string, RowLock>();
   transactionAttempts = 0;
   /** When set, the NEXT tx.fileVersion.create() call throws this instead of
@@ -286,6 +299,7 @@ class FakeDatabase {
                 id: row.id,
                 baseFileVersionId: row.baseFileVersionId,
                 checkedOutById: row.checkedOutById,
+                checkedOutAt: row.checkedOutAt,
               },
             ];
           }) as unknown,
@@ -369,6 +383,12 @@ class FakeDatabase {
               if (idx >= 0) self.checkouts.splice(idx, 1);
             }) as unknown,
           },
+          cadCheckoutEvent: {
+            create: (async (args: { data: EventRow }) => {
+              self.events.push({ ...args.data });
+              return { id: `ev-${randomBytes(6).toString("hex")}` };
+            }) as unknown,
+          },
         };
         try {
           return await fn(tx);
@@ -426,6 +446,7 @@ async function seedCheckedOutDocument(
     cadDocumentId: "doc-1",
     baseFileVersionId: v1Id,
     checkedOutById: ownerId,
+    checkedOutAt: new Date(),
   });
   return { v1Id, checkoutId };
 }
@@ -470,6 +491,41 @@ test("successful check-in creates exactly one new FileVersion, removes the check
     const rehash = await storage.hashObject(result.storageKey);
     assert.equal(rehash.sha256, result.checksum);
     assert.equal(rehash.size, result.fileSize);
+
+    // Exactly one CHECKED_IN audit event, recorded atomically with the
+    // FileVersion and the checkout deletion (P3C-3).
+    assert.equal(db.events.length, 1);
+    const event = db.events[0]!;
+    assert.equal(event.eventType, "CHECKED_IN");
+    assert.equal(event.cadDocumentId, "doc-1");
+    assert.equal(event.checkoutOwnerId, actor.userId);
+    assert.equal(event.actedById, actor.userId);
+    assert.equal(event.baseFileVersionId, "fv-doc-1-1");
+  });
+});
+
+test("failed check-in (stale base) creates no CHECKED_IN event", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    await seedCheckedOutDocument(db, storage);
+    db.addVersion({
+      organizationId: "orgA",
+      cadDocumentId: "doc-1",
+      id: "fv-doc-1-2-outofband",
+      versionNumber: 2,
+      originalFileName: "part.ipt",
+      storageKey: "org/orgA/doc/doc-1/v2/never-written",
+      fileSize: 10,
+      checksum: "c-2",
+      createdById: "user-orgA",
+    });
+    const actor = actorIn("orgA");
+
+    await assert.rejects(() =>
+      checkInForActor(actor, "doc-1", textSource("x"), 1000, null, db.db, storage),
+    );
+    assert.equal(db.events.length, 0, "no audit event from a failed check-in");
   });
 });
 

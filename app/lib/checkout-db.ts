@@ -44,6 +44,15 @@
  * concurrent load raises `CheckoutConcurrencyConflictError` (409) - never a
  * raw Prisma/P2034 error.
  *
+ * HISTORY (P3C-3): a successful, NEW checkout also records a CHECKED_OUT
+ * `CadCheckoutEvent` in the SAME locked transaction as the CadCheckout
+ * insert (see `prisma/schema.prisma`'s model comment). The idempotent
+ * "already-mine" paths return before reaching that insert, so a same-user
+ * re-checkout never creates a duplicate acquisition event. Undo Checkout /
+ * Admin Unlock / Check-In each record their OWN terminal event when they
+ * later consume this checkout - see `app/lib/checkout-release-db.ts` /
+ * `app/lib/checkin-db.ts`.
+ *
  * LIFECYCLE: this NEVER creates a FileVersion, and NEVER reads or writes
  * ItemRevision / lifecycle / CadDependency. A CadDocument's FileVersion
  * history is already independent of ItemRevision lifecycle in this
@@ -61,7 +70,7 @@
  */
 import type { PrismaClient } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
-import { UserRole } from "../generated/prisma/enums.ts";
+import { UserRole, CadCheckoutEventType } from "../generated/prisma/enums.ts";
 import {
   lockCadDocumentForVersionMutation,
   runSerializableTransaction,
@@ -95,7 +104,7 @@ export type { CheckoutRecord, CheckoutRequestOutcome, CheckoutStatus };
  *  (P3C-2) for the CadDocument row lock shared with direct upload. */
 export type CheckoutDb = Pick<
   PrismaClient,
-  "cadDocument" | "fileVersion" | "cadCheckout" | "$transaction"
+  "cadDocument" | "fileVersion" | "cadCheckout" | "cadCheckoutEvent" | "$transaction"
 >;
 
 /** Mirrors `app/lib/authz.ts`'s `PLM_WRITE_ROLES` / `assertCanMutate` (VIEWER
@@ -278,6 +287,24 @@ export async function requestCheckoutForActor(
           checkedOutBy: { select: { name: true, email: true } },
         },
       });
+
+      // Durable history (P3C-3): recorded in the SAME transaction as the
+      // CadCheckout insert. The idempotent "already-mine" paths above
+      // return BEFORE reaching this line, so a same-user re-checkout never
+      // creates a duplicate CHECKED_OUT event.
+      await tx.cadCheckoutEvent.create({
+        data: {
+          organizationId: actor.organizationId,
+          cadDocumentId: cadDocument.id,
+          checkoutId: created.id,
+          baseFileVersionId: created.baseFileVersionId,
+          checkoutOwnerId: created.checkedOutById,
+          actedById: actor.userId,
+          eventType: CadCheckoutEventType.CHECKED_OUT,
+          checkedOutAt: created.checkedOutAt,
+        },
+      });
+
       const record: CheckoutRecord = {
         id: created.id,
         cadDocumentId: created.cadDocumentId,

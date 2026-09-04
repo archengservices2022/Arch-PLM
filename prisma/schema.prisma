@@ -67,6 +67,14 @@ enum CadDependencyType {
   OTHER
 }
 
+// Checkout lifecycle events recorded durably (P3C-3) - see CadCheckoutEvent.
+enum CadCheckoutEventType {
+  CHECKED_OUT
+  CHECKED_IN
+  UNDO_CHECKOUT
+  ADMIN_UNLOCK
+}
+
 // ============================================================
 // ORGANIZATION
 // ============================================================
@@ -89,6 +97,7 @@ model Organization {
   itemRevisionDocuments ItemRevisionDocument[]
   cadDependencies       CadDependency[]
   cadCheckouts          CadCheckout[]
+  cadCheckoutEvents     CadCheckoutEvent[]
 }
 
 // ============================================================
@@ -119,6 +128,12 @@ model User {
   // Documents this user currently holds a server-authoritative checkout on.
   // NOT a "created by" relation - see CadCheckout.
   cadCheckouts CadCheckout[]
+
+  // Checkout history (P3C-3): two DISTINCT relations since a
+  // CadCheckoutEvent names both who HELD the checkout and who PERFORMED the
+  // release (they differ for ADMIN_UNLOCK) - see CadCheckoutEvent.
+  checkoutEventsAsOwner CadCheckoutEvent[] @relation("CadCheckoutEventOwner")
+  checkoutEventsAsActor CadCheckoutEvent[] @relation("CadCheckoutEventActor")
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -317,6 +332,10 @@ model CadDocument {
   // optional relation (backed by a unique constraint) is sufficient.
   checkout CadCheckout?
 
+  // Durable checkout-lifecycle history (P3C-3) - survives after the live
+  // CadCheckout row above is deleted. See CadCheckoutEvent's doc comment.
+  checkoutEvents CadCheckoutEvent[]
+
   @@unique([organizationId, id])
   @@unique([organizationId, documentNumber])
   @@index([organizationId])
@@ -399,6 +418,9 @@ model FileVersion {
   // A FileVersion that has ever been captured as a checkout's base. Not
   // constrained to one - see CadCheckout's doc comment.
   baseForCheckouts CadCheckout[]
+  // Same, but recorded durably in checkout HISTORY (P3C-3) - see
+  // CadCheckoutEvent's doc comment.
+  baseForCheckoutEvents CadCheckoutEvent[]
 
   // Guarantees a CadDocument can never hold two rows with the same version.
   @@unique([cadDocumentId, versionNumber])
@@ -531,4 +553,93 @@ model CadCheckout {
   @@index([organizationId])
   @@index([baseFileVersionId])
   @@index([checkedOutById])
+}
+
+// ============================================================
+// CAD CHECKOUT EVENT  (P3C-3 - durable checkout lifecycle history)
+//
+// CadCheckout rows are DELETED the instant a checkout is consumed
+// (Check-In) or released (Undo Checkout, Admin Unlock) - see CadCheckout's
+// own doc comment. Without a separate durable record, that deletion would
+// silently erase who held a document, when, and why it was released. This
+// model is that minimal, forward-compatible, append-only history - NOT a
+// generic enterprise audit framework: it records exactly the four
+// checkout-lifecycle events (CHECKED_OUT, CHECKED_IN, UNDO_CHECKOUT,
+// ADMIN_UNLOCK) and nothing else.
+//
+// `checkoutId` is DELIBERATELY NOT a foreign key. The CadCheckout row it
+// names is deleted in the SAME transaction that inserts this event (for
+// every event type except CHECKED_OUT), so there is nothing durable left to
+// reference once the transaction commits - a Restrict FK would make that
+// delete impossible, and a Cascade FK would delete the very event meant to
+// survive it. It is recorded as a plain historical identifier only.
+//
+// IDENTITY, NOT DISPLAY DATA: `checkoutOwnerId` / `actedById` are User IDs,
+// never names or emails - a name is mutable display data, not a stable
+// historical identity. A caller that needs a display name joins it
+// separately, scoped to its own tenant, at read time.
+//
+// FK / DELETE STRATEGY (deliberate, not the schema-wide default): every
+// live FK below (cadDocumentId, baseFileVersionId, checkoutOwnerId,
+// actedById) uses onDelete: Restrict, NEVER Cascade - even though
+// CadCheckout's OWN cadDocumentId FK cascades. History must OUTLIVE the
+// records it is about: if a CadDocument or User were ever deleted (no such
+// path exists anywhere in this app today), Restrict means that delete is
+// refused while checkout history still names it, rather than silently
+// erasing the audit trail. FileVersion rows are immutable and never
+// deleted in this schema, so Restrict there is a safety net, not a live
+// constraint. Widening any of these to Cascade later must be a deliberate,
+// audited decision - not a side effect of an unrelated schema change.
+// ============================================================
+
+model CadCheckoutEvent {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Composite tenant-aware FK, Restrict (not Cascade) - see the model
+  // comment above.
+  cadDocumentId String
+  cadDocument   CadDocument @relation(fields: [organizationId, cadDocumentId], references: [organizationId, id], onDelete: Restrict)
+
+  // Historical identifier only - NOT a foreign key. See the model comment.
+  checkoutId String
+
+  // The FileVersion the checkout was based on. FileVersions are immutable
+  // and never deleted, so this stays resolvable in practice; Restrict
+  // regardless, matching CadCheckout.baseFileVersionId's own reasoning.
+  baseFileVersionId String
+  baseFileVersion   FileVersion @relation(fields: [organizationId, baseFileVersionId], references: [organizationId, id], onDelete: Restrict)
+
+  // Who HELD the checkout (copied from CadCheckout.checkedOutById at the
+  // moment of the event - the checkout row itself is about to be deleted).
+  checkoutOwnerId String
+  checkoutOwner   User   @relation("CadCheckoutEventOwner", fields: [organizationId, checkoutOwnerId], references: [organizationId, id], onDelete: Restrict)
+
+  // Who PERFORMED this event. Equal to checkoutOwnerId for CHECKED_OUT /
+  // CHECKED_IN / UNDO_CHECKOUT (an actor only ever consumes/releases their
+  // OWN checkout there); DIFFERS for ADMIN_UNLOCK (the acting admin, not
+  // the checkout's owner).
+  actedById String
+  actedBy   User   @relation("CadCheckoutEventActor", fields: [organizationId, actedById], references: [organizationId, id], onDelete: Restrict)
+
+  eventType CadCheckoutEventType
+
+  // When the ORIGINAL checkout began (copied from CadCheckout.checkedOutAt) -
+  // preserved because the live checkout row is gone.
+  checkedOutAt DateTime
+
+  // When THIS event happened.
+  occurredAt DateTime @default(now())
+
+  // Optional for UNDO_CHECKOUT, required by application logic (not a DB
+  // constraint - see app/lib/checkout-release-core.ts) for ADMIN_UNLOCK.
+  // Bounded length, trimmed, control characters stripped before storage -
+  // never a place for secrets or system data.
+  reason String?
+
+  @@index([organizationId, cadDocumentId, occurredAt])
+  @@index([organizationId, checkoutOwnerId])
+  @@index([organizationId, actedById])
 }
