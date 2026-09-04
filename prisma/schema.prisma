@@ -88,6 +88,7 @@ model Organization {
   fileVersions          FileVersion[]
   itemRevisionDocuments ItemRevisionDocument[]
   cadDependencies       CadDependency[]
+  cadCheckouts          CadCheckout[]
 }
 
 // ============================================================
@@ -115,6 +116,9 @@ model User {
   createdItemRevisionDocuments ItemRevisionDocument[]
   createdCadDependencies       CadDependency[]
   createdItemRevisions         ItemRevision[]
+  // Documents this user currently holds a server-authoritative checkout on.
+  // NOT a "created by" relation - see CadCheckout.
+  cadCheckouts CadCheckout[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -309,6 +313,10 @@ model CadDocument {
   outgoingDependencies CadDependency[] @relation("CadDependencyParent")
   incomingDependencies CadDependency[] @relation("CadDependencyChild")
 
+  // At most one row - see CadCheckout's own doc comment for why a plain
+  // optional relation (backed by a unique constraint) is sufficient.
+  checkout CadCheckout?
+
   @@unique([organizationId, id])
   @@unique([organizationId, documentNumber])
   @@index([organizationId])
@@ -388,6 +396,10 @@ model FileVersion {
 
   createdAt DateTime @default(now())
 
+  // A FileVersion that has ever been captured as a checkout's base. Not
+  // constrained to one - see CadCheckout's doc comment.
+  baseForCheckouts CadCheckout[]
+
   // Guarantees a CadDocument can never hold two rows with the same version.
   @@unique([cadDocumentId, versionNumber])
   @@unique([organizationId, id])
@@ -448,4 +460,75 @@ model CadDependency {
   @@index([parentDocumentId])
   @@index([childDocumentId])
   @@index([createdById])
+}
+
+// ============================================================
+// CAD CHECKOUT  (PDM P3C-1 - server-authoritative exclusive editing lock)
+//
+// Checkout belongs to the logical CadDocument, NOT to a single FileVersion.
+// It records the EXACT FileVersion that was the newest binary-backed version
+// at the moment checkout began ("the base"), so a future check-in can
+// compare against it - but checkout itself never creates a FileVersion,
+// never touches ItemRevision/lifecycle, and never touches CadDependency.
+//
+// THIS MILESTONE HAS NO CHECK-IN, undo, admin unlock, or expiration: a
+// CadCheckout row, once created, is never deleted, closed, or superseded.
+// Because of that, "this CadDocument has an active checkout" and "this
+// CadDocument has ANY CadCheckout row" are the EXACT SAME condition today, so
+// a single unique constraint on (organizationId, cadDocumentId) is
+// sufficient, DB-enforced exclusivity - at most one checkout can ever exist
+// per document, full stop. No explicit active/closed state, timeout, or
+// lease column is needed (or wanted) yet.
+//
+// This is also the whole concurrency strategy: two actors racing to check
+// out the same CadDocument both attempt `CadCheckout.create()`; the unique
+// index lets exactly one succeed, and the loser's insert fails with a
+// unique-constraint violation, which the application layer turns into
+// either an idempotent "you already hold it" response (same actor) or a 409
+// conflict naming the other actor (different actor). No row-locking
+// transaction is required - the unique index IS the serialization point.
+//
+// A future check-in milestone can DELETE this row on check-in (the
+// constraint keeps working unmodified), or, if checkout HISTORY must be
+// preserved, replace this with a closedAt column and a partial unique index
+// (WHERE "closedAt" IS NULL) instead - deliberately NOT decided here.
+// ============================================================
+
+model CadCheckout {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Composite tenant-aware FK: a checkout can only ever target a CadDocument
+  // in the SAME organization. Together with the unique constraint below, at
+  // most one checkout can ever exist for a given (organizationId,
+  // cadDocumentId) pair.
+  cadDocumentId String
+  cadDocument   CadDocument @relation(fields: [organizationId, cadDocumentId], references: [organizationId, id], onDelete: Cascade)
+
+  // The exact FileVersion that was the newest binary-backed version at the
+  // moment checkout began. Never re-resolved afterward - uploading a newer
+  // FileVersion does NOT change this row. Restrict (not cascade): a
+  // FileVersion is immutable and must not silently disappear out from under
+  // an active lock.
+  baseFileVersionId String
+  baseFileVersion   FileVersion @relation(fields: [organizationId, baseFileVersionId], references: [organizationId, id], onDelete: Restrict)
+
+  // Set from the authenticated actor on the server, never from the client.
+  checkedOutById String
+  checkedOutBy   User   @relation(fields: [organizationId, checkedOutById], references: [organizationId, id], onDelete: Restrict)
+
+  checkedOutAt DateTime @default(now())
+
+  // Optional free-text note from the actor at checkout time (e.g. "fixing
+  // the mount hole pattern"). Never required, never interpreted by the server.
+  note String?
+
+  @@unique([organizationId, id])
+  // At most one checkout per CadDocument - see the model comment above.
+  @@unique([organizationId, cadDocumentId])
+  @@index([organizationId])
+  @@index([baseFileVersionId])
+  @@index([checkedOutById])
 }
