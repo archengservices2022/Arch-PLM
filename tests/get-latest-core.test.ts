@@ -166,6 +166,122 @@ test("assertSafeWorkspacePath rejects unsafe paths", () => {
 });
 
 // ------------------------------------------------------------
+// Windows hardening: reserved device names, extension variants, mixed case,
+// trailing dot/space, alternate-data-stream syntax, invalid characters
+// ------------------------------------------------------------
+
+test("assertSafeWorkspacePath rejects every Windows reserved device name, bare and case-insensitively", () => {
+  const names = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+  ];
+  for (const name of names) {
+    for (const variant of [name, name.toLowerCase(), name[0] + name.slice(1).toLowerCase()]) {
+      assert.throws(
+        () => assertSafeWorkspacePath(variant),
+        UnsafeWorkspacePathError,
+        `expected bare device name ${JSON.stringify(variant)} to be rejected`,
+      );
+    }
+  }
+});
+
+test("assertSafeWorkspacePath rejects device names with any extension, case-insensitively", () => {
+  for (const bad of [
+    "CON.txt",
+    "com1.ipt",
+    "nul.idw",
+    "Nul.Idw",
+    "COM1.iam.bak",
+    "LPT9.IPT",
+    "AUX.dwg",
+    "PRN.PDF",
+  ]) {
+    assert.throws(
+      () => assertSafeWorkspacePath(bad),
+      UnsafeWorkspacePathError,
+      `expected ${JSON.stringify(bad)} to be rejected`,
+    );
+  }
+  // Only an EXACT (pre-extension) match is reserved - a device name as a
+  // mere substring/prefix of a longer, otherwise-safe name is fine.
+  assert.doesNotThrow(() => assertSafeWorkspacePath("MyCOM1.ipt"));
+  assert.doesNotThrow(() => assertSafeWorkspacePath("CONSOLE.ipt"));
+  assert.doesNotThrow(() => assertSafeWorkspacePath("NULLABLE.iam"));
+});
+
+test("assertSafeWorkspacePath rejects a trailing dot or trailing space in any segment", () => {
+  for (const bad of ["Part.ipt.", "Part.ipt ", "Trailing.", "Trailing ", "a/Trailing./b"]) {
+    assert.throws(
+      () => assertSafeWorkspacePath(bad),
+      UnsafeWorkspacePathError,
+      `expected ${JSON.stringify(bad)} to be rejected`,
+    );
+  }
+});
+
+test("assertSafeWorkspacePath rejects ':' / alternate-data-stream syntax and Windows-invalid characters", () => {
+  for (const bad of [
+    "Part.ipt:hidden-stream",
+    "Part:$DATA",
+    'Part"quote.ipt',
+    "Part<1>.ipt",
+    "Part|pipe.ipt",
+    "Part?query.ipt",
+    "Part*star.ipt",
+  ]) {
+    assert.throws(
+      () => assertSafeWorkspacePath(bad),
+      UnsafeWorkspacePathError,
+      `expected ${JSON.stringify(bad)} to be rejected`,
+    );
+  }
+});
+
+test("assertSafeWorkspacePath still accepts ordinary safe filenames", () => {
+  for (const ok of ["Part.ipt", "Bracket_1.iam", "10073-MFD-AS210.iam", "a.b-c_D"]) {
+    assert.doesNotThrow(() => assertSafeWorkspacePath(ok));
+  }
+});
+
+test("workspaceRelativePath falls back to documentNumber when the filename is a reserved device name", () => {
+  assert.equal(workspaceRelativePath("CON.ipt", "DOC-1"), "DOC-1");
+  assert.equal(workspaceRelativePath("com1.iam", "DOC-2"), "DOC-2");
+  assert.equal(workspaceRelativePath("NUL", "DOC-3"), "DOC-3");
+  // And falls all the way through to the constant if documentNumber is ALSO
+  // reserved.
+  assert.equal(workspaceRelativePath("CON.ipt", "PRN"), "document");
+  // The result is always independently safe.
+  for (const [fileName, docNumber] of [
+    ["CON.ipt", "DOC-1"],
+    ["Part.ipt.", "DOC-2"],
+    ["Part:stream.ipt", "DOC-3"],
+  ] as const) {
+    assert.doesNotThrow(() => assertSafeWorkspacePath(workspaceRelativePath(fileName, docNumber)));
+  }
+});
+
+// ------------------------------------------------------------
 // traversal: nested assemblies + shared dependency dedup
 // ------------------------------------------------------------
 

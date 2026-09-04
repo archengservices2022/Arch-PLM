@@ -383,6 +383,17 @@ test("an absolute workspace path is also caught by re-validation", () => {
   assert.equal(plan.safe, false);
 });
 
+test("a Windows-reserved device name path is caught by the same shared re-validation", () => {
+  // Proves the Windows hardening added to assertSafeWorkspacePath propagates
+  // here too, since this layer re-validates against the same shared rule.
+  const manifest = makeManifest({
+    entries: [makeEntry({ cadDocumentId: "doc-a", workspacePath: "COM1.ipt" })],
+  });
+  const plan = buildWorkspacePlanFromManifest(manifest);
+  assert.deepEqual(entryById(plan, "doc-a").blockedReasons, ["unsafe-path"]);
+  assert.equal(plan.safe, false);
+});
+
 // ------------------------------------------------------------
 // No client-supplied input surface
 // ------------------------------------------------------------

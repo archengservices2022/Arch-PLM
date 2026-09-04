@@ -26,6 +26,46 @@ const ALL_CONTROL_CHARS = new RegExp(CONTROL_CHAR_CLASS, "g");
 const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DISALLOWED_PATH_CHARS = /[^A-Za-z0-9._-]+/g;
 
+/** Characters Windows forbids in a filename (plus ':', the drive / alternate
+ *  data stream separator). `SAFE_PATH_SEGMENT` already excludes all of these
+ *  via its character whitelist; this is named separately purely so a
+ *  violation gets a specific, readable error instead of a generic "bad
+ *  segment" one. */
+const WINDOWS_INVALID_FILENAME_CHARS = /[<>:"|?*]/;
+
+/**
+ * Windows reserved device names (case-insensitive), matched against the
+ * segment's basename BEFORE its first dot - so "CON", "con.txt", "COM1.ipt"
+ * and "Nul.idw" are all reserved, but "MyCOM1.ipt" is not. A path segment
+ * that is - or "is" one of these once its extension is stripped - refers to
+ * a physical device on Windows, not a normal file, and must never be used as
+ * a generated workspace filename.
+ */
+const WINDOWS_RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  "COM1",
+  "COM2",
+  "COM3",
+  "COM4",
+  "COM5",
+  "COM6",
+  "COM7",
+  "COM8",
+  "COM9",
+  "LPT1",
+  "LPT2",
+  "LPT3",
+  "LPT4",
+  "LPT5",
+  "LPT6",
+  "LPT7",
+  "LPT8",
+  "LPT9",
+]);
+
 // ------------------------------------------------------------
 // Limits (keep traversal bounded and deterministic)
 // ------------------------------------------------------------
@@ -190,9 +230,18 @@ export interface GetLatestManifest {
 // ------------------------------------------------------------
 
 /**
- * Throws unless `value` is a safe relative POSIX-style path: no backslash, no
- * control chars, no absolute / home / drive prefix, no `.` or `..` segments,
- * every segment matching SAFE_PATH_SEGMENT.
+ * Throws unless `value` is a safe relative path usable on both POSIX and
+ * Windows: no backslash, no control chars, no absolute / home / drive /
+ * UNC prefix, no `.` or `..` segments, no Windows-invalid filename
+ * characters, no trailing dot or trailing space in any segment, no segment
+ * that is (or reduces to, before its first dot) a reserved Windows device
+ * name (CON, PRN, AUX, NUL, COM1-9, LPT1-9 - case-insensitive), and every
+ * segment matching SAFE_PATH_SEGMENT.
+ *
+ * This is the SHARED validator: Get Latest (via `workspaceRelativePath`),
+ * the WorkspacePlan contract and the workspace-materialization core all
+ * re-validate against these exact rules, so hardening it here protects all
+ * three call sites at once.
  */
 export function assertSafeWorkspacePath(value: string): void {
   if (typeof value !== "string" || value.length === 0) {
@@ -208,7 +257,7 @@ export function assertSafeWorkspacePath(value: string): void {
     throw new UnsafeWorkspacePathError(value, "control character");
   }
   if (value.startsWith("/") || value.startsWith("~")) {
-    throw new UnsafeWorkspacePathError(value, "absolute / home");
+    throw new UnsafeWorkspacePathError(value, "absolute / home / UNC");
   }
   if (/^[A-Za-z]:/.test(value)) {
     throw new UnsafeWorkspacePathError(value, "drive prefix");
@@ -219,6 +268,25 @@ export function assertSafeWorkspacePath(value: string): void {
     }
     if (segment === "." || segment === "..") {
       throw new UnsafeWorkspacePathError(value, "dot segment");
+    }
+    if (WINDOWS_INVALID_FILENAME_CHARS.test(segment)) {
+      throw new UnsafeWorkspacePathError(
+        value,
+        `Windows-invalid character (or alternate-data-stream ':') in segment ${JSON.stringify(segment)}`,
+      );
+    }
+    if (segment.endsWith(".") || segment.endsWith(" ")) {
+      throw new UnsafeWorkspacePathError(
+        value,
+        `trailing dot/space in segment ${JSON.stringify(segment)}`,
+      );
+    }
+    const deviceBaseName = segment.split(".")[0].toUpperCase();
+    if (WINDOWS_RESERVED_DEVICE_NAMES.has(deviceBaseName)) {
+      throw new UnsafeWorkspacePathError(
+        value,
+        `reserved Windows device name in segment ${JSON.stringify(segment)}`,
+      );
     }
     if (!SAFE_PATH_SEGMENT.test(segment)) {
       throw new UnsafeWorkspacePathError(
@@ -254,13 +322,22 @@ export function workspaceRelativePath(
       .replace(/^[._]+/, "")
       .replace(/\.+$/, "")
       .slice(0, 200);
-    if (cleaned.length > 0 && SAFE_PATH_SEGMENT.test(cleaned)) {
+    if (cleaned.length === 0) {
+      continue;
+    }
+    // A candidate can pass the character-level sanitization above yet still
+    // be unsafe (e.g. "CON.ipt" - a reserved Windows device name once its
+    // extension is considered). Try the next deterministic fallback instead
+    // of letting the exception escape.
+    try {
       assertSafeWorkspacePath(cleaned);
       return cleaned;
+    } catch {
+      continue;
     }
   }
 
-  // Unreachable: "document" always satisfies SAFE_PATH_SEGMENT.
+  // Unreachable: "document" always satisfies assertSafeWorkspacePath.
   return "document";
 }
 
