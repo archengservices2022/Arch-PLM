@@ -110,6 +110,7 @@ model Organization {
   cadCheckoutEvents     CadCheckoutEvent[]
   releaseBaselines      ReleaseBaseline[]
   releaseBaselineEntries ReleaseBaselineEntry[]
+  desktopSessions       DesktopSession[]
 }
 
 // ============================================================
@@ -149,6 +150,9 @@ model User {
 
   // Frozen release baselines this user created (P3D-1).
   createdReleaseBaselines ReleaseBaseline[]
+
+  // Bearer sessions issued to this user's desktop CAD Connect clients (P4A).
+  desktopSessions DesktopSession[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -824,4 +828,59 @@ model ReleaseBaselineEntry {
   @@index([releaseBaselineId])
   @@index([cadDocumentId])
   @@index([fileVersionId])
+}
+
+// ============================================================
+// DESKTOP SESSION  (P4A - Inventor CAD Connect foundation)
+//
+// A server-issued bearer session for a NON-browser client (the Autodesk
+// Inventor "Arch Engineering" CAD Connect add-in). The browser dashboard
+// keeps using NextAuth cookies unchanged; this table exists ONLY so a
+// desktop client has a first-class, server-revocable session that does not
+// depend on NextAuth's CSRF/cookie internals.
+//
+// SECURITY MODEL
+//   - The raw token is a 256-bit random string returned to the client ONCE,
+//     at creation. Only its SHA-256 hash is stored here - a database leak
+//     never yields a usable token.
+//   - organizationId / userId are derived on the server from verified
+//     credentials at creation and are the ONLY tenant source of truth for
+//     any request this session authenticates. A desktop client can never
+//     supply or influence them.
+//   - `expiresAt` is enforced on every request. `revokedAt` is set by an
+//     explicit sign-out (or future admin action) and makes the token
+//     immediately unusable - this is what "logout invalidates the session"
+//     means server-side.
+//   - No password is stored here or anywhere on the client.
+// ============================================================
+
+model DesktopSession {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Tenant-aware composite FK: a session can only ever name a user in its
+  // own organization.
+  userId String
+  user   User   @relation(fields: [organizationId, userId], references: [organizationId, id], onDelete: Cascade)
+
+  // SHA-256 (lowercase hex) of the opaque bearer token. Unique so a lookup
+  // by token hash is a single indexed point read. The raw token is never
+  // persisted.
+  tokenHash String @unique
+
+  // Free-text, client-supplied, NON-authoritative label shown back to the
+  // user when listing their sessions ("Inventor 2025 on WORKSTATION-01").
+  // Never used for any security decision.
+  clientLabel String?
+
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  lastUsedAt DateTime  @default(now())
+  revokedAt  DateTime?
+
+  @@index([organizationId])
+  @@index([userId])
+  @@index([expiresAt])
 }
