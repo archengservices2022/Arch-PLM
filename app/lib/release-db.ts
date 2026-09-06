@@ -1,6 +1,6 @@
 /**
  * Arch PDM - Engineering revision lifecycle transitions + frozen release
- * baseline capture (P3D-1).
+ * baseline capture (P3D-1, dependency-complete in P3D-3).
  *
  * Deliberately does NOT import "server-only" and takes `db` / `provider` as
  * required parameters, mirroring `checkout-db.ts` / `checkin-db.ts` /
@@ -13,60 +13,90 @@
  * lifecycle/supersession behavior is unchanged for every target other than
  * RELEASED.
  *
- * RELEASE BASELINE (new in P3D-1): when the target is RELEASED and the
- * optimistic conditional update actually applies, this ALSO builds a frozen
- * `ReleaseBaseline` (+ one `ReleaseBaselineEntry` per DIRECTLY associated
- * CadDocument) INSIDE THE SAME transaction, before it commits. If baseline
- * construction throws for ANY reason, the whole transaction rolls back:
- * the conditional update that already ran is undone, so the revision does
- * NOT become RELEASED, its predecessor is NOT superseded, and no partial
- * baseline row survives - there is no code path where a raw Prisma error,
- * a lock timeout, or a missing binary can leave RELEASED-with-no-baseline
- * or a half-written baseline.
+ * RELEASE BASELINE: when the target is RELEASED and the optimistic
+ * conditional update actually applies, this ALSO builds a frozen
+ * `ReleaseBaseline` INSIDE THE SAME transaction, before it commits. If
+ * baseline construction throws for ANY reason the whole transaction rolls
+ * back: the revision does NOT become RELEASED, its predecessor is NOT
+ * superseded, and no partial baseline / partial entry set survives - there
+ * is no code path where a raw Prisma error, a lock timeout, a missing binary
+ * or a torn dependency graph can leave RELEASED-with-no-baseline or a
+ * half-written baseline.
  *
- * CONCURRENCY (P3D-1's core design problem): a release must pin a COHERENT
- * set of FileVersions - not resolve them non-transactionally and write the
- * snapshot later. Every directly associated CadDocument is locked with the
- * SAME `SELECT ... FOR UPDATE` (`lockCadDocumentForVersionMutation`,
- * `app/lib/db-concurrency-db.ts`) that Checkout acquisition and direct
- * FileVersion upload already use as their shared mutex (see those modules'
- * doc comments) - so a release deterministically serializes against BOTH:
- *   - a concurrent direct upload (guarded by `upload-guard-db.ts`, which
- *     locks the SAME CadDocument row before inserting a FileVersion);
- *   - a concurrent checkout acquisition (`checkout-db.ts`, same lock).
- * Check-In does NOT take this same lock (it locks the CadCheckout row
- * instead - see `checkin-db.ts`), so it is not blocked by this lock
- * directly; but because BOTH the release transaction and Check-In's
- * transaction run under Postgres SERIALIZABLE isolation, and the release
- * transaction's FileVersion reads and Check-In's FileVersion write on the
- * SAME CadDocument row form a genuine read-write dependency, Postgres's
- * serializable-snapshot-isolation machinery still guarantees the two
- * commits correspond to SOME valid serial order (release-then-checkin or
- * checkin-then-release) - never a torn/incoherent result - aborting one
- * side with a serialization failure if a genuine anomaly would otherwise
- * occur. `runSerializableTransaction`'s bounded retry (shared with every
- * other P3C/P3D mutation) absorbs that abort transparently.
+ * DEPENDENCY-COMPLETE CLOSURE (P3D-3): the baseline now freezes one entry per
+ * CadDocument in the release's COMPLETE known closure -
+ *   - every CadDocument DIRECTLY associated with the ItemRevision via
+ *     ItemRevisionDocument (`inclusionKind = DIRECT`), AND
+ *   - every CadDocument reachable from those through the outgoing
+ *     CadDependency graph, `parentDocumentId -> childDocumentId`, recursively
+ *     (`inclusionKind = DEPENDENCY`).
+ * The graph math (dedup, cycle-safety, DIRECT-wins provenance, node cap,
+ * deterministic ordering) lives in `release-closure-core.ts`. Dependencies
+ * are read ONLY from the authoritative CadDependency rows - never inferred
+ * from filenames, storage paths or file contents. P3D-1 baselines predate
+ * this walk and are never re-expanded (see BACKWARD COMPATIBILITY in
+ * `released-workspace-db.ts`).
  *
- * LOCK ORDER (deadlock avoidance): when a revision is associated with
- * MULTIPLE CadDocuments, their ids are sorted (stable string sort) BEFORE
- * acquiring any lock, and locks are then acquired strictly in that order.
- * Two operations that both need to lock an overlapping set of documents
- * (e.g. two concurrent multi-document releases, or a release racing a
- * direct upload that also touches several documents indirectly) always
- * request their locks in the SAME relative order, so a classic AB/BA
- * deadlock cannot occur - the second locker always waits behind the first
- * rather than each waiting on the other.
+ * EXACT VERSION FREEZE: every closure document is resolved to its current
+ * usable FileVersion via the SAME shared resolver Get Latest / Checkout /
+ * Check-In use (`file-version-resolution-core.ts`) - never a second "latest"
+ * definition, never a fallback to an older binary. That exact FileVersion id
+ * is what lands in ReleaseBaselineEntry. Once the baseline row set commits,
+ * later FileVersions / CadDependency edits / ItemRevisionDocument edits have
+ * ZERO effect on it, and released retrieval never recomputes the closure.
+ *
+ * STORAGE INTEGRITY (P3D-3, narrowly-scoped change from P3D-1): before a
+ * version is frozen, release verifies the pinned object's ACTUAL bytes -
+ * `provider.hashObject()` streams it through SHA-256 (never buffering it
+ * whole) and both the digest AND the byte size must equal the FileVersion's
+ * own `checksum` / `fileSize`. P3D-1 only checked that SOME object existed at
+ * the key; a corrupted or silently-replaced object would have passed. This
+ * is the SAME primitive and verify-then-trust pattern
+ * `readCadFileVersionForActor` (`storage.ts`) and P3D-2 released retrieval
+ * already use. Cost: release I/O is now proportional to the total byte size
+ * of the frozen package (one streamed read per closure document). This is
+ * intentional - release evidence that has silently rotted must not be
+ * frozen as if intact.
+ *
+ * CONCURRENCY (the core design problem): a release must pin a COHERENT set of
+ * FileVersions across the WHOLE closure - not resolve them non-transactionally
+ * and write the snapshot later, and not observe a dependency graph that is
+ * half before-a-mutation and half after.
+ *
+ *   1. Every closure CadDocument (direct AND dependency) is locked with the
+ *      SAME `SELECT ... FOR UPDATE` (`lockCadDocumentForVersionMutation`,
+ *      `db-concurrency-db.ts`) that Checkout acquisition, direct FileVersion
+ *      upload, and (P3D-3) CadDependency creation already take. Locks are
+ *      acquired in a single global lexicographic CadDocument-id order, so an
+ *      AB/BA deadlock against any other operation that locks an overlapping
+ *      set (another release, a direct upload, a dependency mutation) cannot
+ *      occur.
+ *   2. The closure is resolved, then locked, then RE-resolved under the
+ *      locks; if it grew (an edge was added out of a closure node between the
+ *      first read and the lock), the new nodes are locked too and it is
+ *      re-resolved again, until stable. Because CadDependency creation now
+ *      takes the SAME CadDocument lock on its parent+child, once this
+ *      transaction holds every closure-node lock no concurrent edge out of a
+ *      closure node can commit - so the loop converges in at most two passes
+ *      in practice (a hard pass cap guards an adversarial graph).
+ *   3. Both this transaction and every racing mutation
+ *      (Check-In, direct upload, dependency creation, another release) run
+ *      under Postgres SERIALIZABLE isolation. Even for the one operation that
+ *      does NOT take the CadDocument lock (Check-In locks the CadCheckout row
+ *      instead), SSI's read-write-dependency tracking still guarantees the
+ *      two commits correspond to SOME valid serial order - release-then-X or
+ *      X-then-release, never a torn result - aborting one side with a
+ *      serialization failure if a genuine anomaly would otherwise occur.
+ *      `runSerializableTransaction`'s bounded retry absorbs that abort.
  *
  * RELEASE VS ASSOCIATION MUTATION: `linkExistingCadDocumentToRevision` /
- * createCadDocument already lock the ItemRevision row itself (via
+ * createCadDocument lock the ItemRevision row itself (via
  * `lockItemRevisionForCadMutation` in app/actions.ts) before writing an
  * ItemRevisionDocument link, and this module's conditional lifecycle UPDATE
- * takes an equivalent row lock on the SAME ItemRevision row. That existing
- * protection is untouched by P3D-1: by the time this transaction reads
- * ItemRevisionDocument rows (after its own successful conditional update,
- * which holds the ItemRevision row lock for the rest of the transaction),
- * no concurrent association mutation can be in flight or start until this
- * transaction commits or rolls back.
+ * takes an equivalent row lock on the SAME ItemRevision row. So by the time
+ * this transaction reads ItemRevisionDocument (after its successful
+ * conditional update, which holds that row lock for the rest of the
+ * transaction) no concurrent association mutation can be in flight.
  */
 import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
@@ -85,12 +115,24 @@ import {
   resolveCurrentFileVersion,
 } from "./file-version-resolution-core.ts";
 import {
+  computeReleaseClosure,
+  DEFAULT_MAX_RELEASE_CLOSURE_NODES,
+  MAX_CLOSURE_STABILIZATION_PASSES,
+  ReleaseClosureInvalidError,
+  ReleaseClosureTooLargeError,
+  type ReleaseClosureResult,
+} from "./release-closure-core.ts";
+import {
   ReleaseBaselineIncompleteError,
   type ReleaseBaselineResult,
 } from "./release-baseline-core.ts";
 import type { StorageProvider } from "./storage-core.ts";
 
-export { ReleaseBaselineIncompleteError };
+export {
+  ReleaseBaselineIncompleteError,
+  ReleaseClosureInvalidError,
+  ReleaseClosureTooLargeError,
+};
 export type { ReleaseBaselineResult };
 
 /** The slice of PrismaClient this module needs. */
@@ -98,6 +140,8 @@ export type ReleaseDb = Pick<
   PrismaClient,
   | "itemRevision"
   | "itemRevisionDocument"
+  | "cadDocument"
+  | "cadDependency"
   | "fileVersion"
   | "releaseBaseline"
   | "releaseBaselineEntry"
@@ -105,21 +149,93 @@ export type ReleaseDb = Pick<
 >;
 
 /**
- * Build the frozen release baseline for `itemRevisionId` INSIDE an already-
- * open transaction. Locks every directly associated CadDocument (sorted by
- * id, for a deterministic cross-operation lock order) before resolving its
- * current FileVersion via the SAME shared resolver Get Latest / Checkout /
- * Check-In use - never a second "latest" definition.
+ * Resolve the release closure AND hold a `FOR UPDATE` lock on every
+ * CadDocument in it, in one global lexicographic id order, converging on a
+ * stable set (see the module doc comment, CONCURRENCY point 2).
+ */
+async function resolveStableLockedClosure(
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  itemRevisionId: string,
+  maxNodes: number,
+): Promise<ReleaseClosureResult> {
+  const deps = {
+    maxNodes,
+    async loadDirectDocumentIds() {
+      const links = await tx.itemRevisionDocument.findMany({
+        where: { organizationId, itemRevisionId },
+        select: { cadDocumentId: true },
+      });
+      return links.map((l) => l.cadDocumentId);
+    },
+    async loadChildEdges(parentIds: string[]) {
+      if (parentIds.length === 0) return [];
+      const rows = await tx.cadDependency.findMany({
+        where: { organizationId, parentDocumentId: { in: parentIds } },
+        select: { parentDocumentId: true, childDocumentId: true },
+      });
+      return rows.map((r) => ({
+        parentCadDocumentId: r.parentDocumentId,
+        childCadDocumentId: r.childDocumentId,
+      }));
+    },
+    async loadExistingDocumentIds(ids: string[]) {
+      if (ids.length === 0) return [];
+      const rows = await tx.cadDocument.findMany({
+        where: { organizationId, id: { in: ids } },
+        select: { id: true },
+      });
+      return rows.map((r) => r.id);
+    },
+  };
+
+  const locked = new Set<string>();
+  let closure = await computeReleaseClosure(deps);
+
+  for (let pass = 0; pass < MAX_CLOSURE_STABILIZATION_PASSES; pass += 1) {
+    const toLock = closure.cadDocumentIds.filter((id) => !locked.has(id));
+    if (toLock.length === 0) {
+      // Every id in the current closure is already locked and the last
+      // re-scan produced nothing new: the graph is stable under our locks.
+      return closure;
+    }
+    // Acquire the still-missing locks, walking the full closure in global
+    // ascending-id order so acquisitions stay in a consistent order across
+    // operations. The closure only ever grows (monotonic), so in practice
+    // this loop runs once. If a concurrent edge write still manages to
+    // interleave and produce a lock-order inversion, Postgres's own
+    // deadlock detector aborts one side with a serialization error and
+    // `runSerializableTransaction` retries the whole release from a clean
+    // snapshot - correctness never depends on getting the order perfect
+    // mid-growth.
+    for (const id of closure.cadDocumentIds) {
+      if (locked.has(id)) continue;
+      await lockCadDocumentForVersionMutation(tx, organizationId, id);
+      locked.add(id);
+    }
+    closure = await computeReleaseClosure(deps);
+  }
+
+  // The closure never stopped growing under its own locks - only possible
+  // for an adversarial/corrupt graph. Fail the release rather than loop.
+  throw new ReleaseClosureTooLargeError(maxNodes);
+}
+
+/**
+ * Build the dependency-complete frozen release baseline for `itemRevisionId`
+ * INSIDE an already-open transaction.
  *
  * A revision with ZERO ItemRevisionDocument associations still produces a
- * baseline - just with zero entries (P3D-1's explicit design decision: not
- * every Item is CAD-backed, and a revision must not be blocked from
- * releasing purely for lacking CAD documents).
+ * baseline - just with zero entries (not every Item is CAD-backed).
  *
- * @throws ReleaseBaselineIncompleteError if any directly associated
- *   CadDocument has no valid current binary-backed FileVersion (missing
- *   entirely, or the expected newest one's binary is absent from storage).
- *   Never falls back to an older FileVersion.
+ * @throws ReleaseBaselineIncompleteError if any closure CadDocument (direct
+ *   or dependency) has no valid current binary-backed FileVersion, or the
+ *   resolved object is missing/unreadable, or its actual bytes fail
+ *   checksum/size verification. Never falls back to another FileVersion.
+ * @throws ReleaseClosureTooLargeError if the dependency closure exceeds the
+ *   node cap.
+ * @throws ReleaseClosureInvalidError if a dependency edge in the closure
+ *   points at a document not available in the organization.
  */
 export async function buildReleaseBaselineInTransaction(
   tx: Prisma.TransactionClient,
@@ -127,22 +243,25 @@ export async function buildReleaseBaselineInTransaction(
   itemRevisionId: string,
   actorUserId: string,
   provider: StorageProvider,
+  maxClosureNodes: number = DEFAULT_MAX_RELEASE_CLOSURE_NODES,
 ): Promise<ReleaseBaselineResult> {
-  const links = await tx.itemRevisionDocument.findMany({
-    where: { organizationId, itemRevisionId },
-    select: { cadDocumentId: true },
-  });
-  const cadDocumentIds = [...new Set(links.map((l) => l.cadDocumentId))].sort();
+  const closure = await resolveStableLockedClosure(
+    tx,
+    organizationId,
+    itemRevisionId,
+    maxClosureNodes,
+  );
 
-  const entries: Array<{ cadDocumentId: string; fileVersionId: string; versionNumber: number }> = [];
+  const entries: Array<{
+    cadDocumentId: string;
+    fileVersionId: string;
+    versionNumber: number;
+    inclusionKind: "DIRECT" | "DEPENDENCY";
+  }> = [];
 
-  for (const cadDocumentId of cadDocumentIds) {
-    // Deterministic lock order avoids AB/BA deadlocks against any other
-    // operation (another release, a direct upload, a checkout acquisition)
-    // that also locks multiple CadDocuments in sorted order.
-    await lockCadDocumentForVersionMutation(tx, organizationId, cadDocumentId);
-
-    const resolution = await resolveCurrentFileVersion(cadDocumentId, {
+  // Deterministic: closure.nodes is cadDocumentId-ascending.
+  for (const node of closure.nodes) {
+    const resolution = await resolveCurrentFileVersion(node.cadDocumentId, {
       maxVersionsScanned: DEFAULT_MAX_VERSIONS_SCANNED,
       async loadVersionsNewestFirst(id) {
         const rows = await tx.fileVersion.findMany({
@@ -171,23 +290,39 @@ export async function buildReleaseBaselineInTransaction(
     });
 
     if (resolution.kind !== "ok") {
-      throw new ReleaseBaselineIncompleteError(cadDocumentId, resolution.kind);
+      throw new ReleaseBaselineIncompleteError(node.cadDocumentId, resolution.kind);
+    }
+
+    // P3D-3 byte-level integrity: the resolver only proved an object EXISTS
+    // at the key. Verify its ACTUAL bytes match the immutable metadata -
+    // one streamed pass, both digest and size, never buffering the file. A
+    // storage failure of any kind folds into `missing-binary`; a real
+    // mismatch is `corrupt`. The error never restates the expected/actual
+    // digest or size.
+    const fv = resolution.row;
+    let verified: { sha256: string; size: number };
+    try {
+      verified = await provider.hashObject(fv.storageKey);
+    } catch {
+      throw new ReleaseBaselineIncompleteError(node.cadDocumentId, "missing-binary");
+    }
+    if (verified.sha256 !== fv.checksum || verified.size !== fv.fileSize) {
+      throw new ReleaseBaselineIncompleteError(node.cadDocumentId, "corrupt");
     }
 
     entries.push({
-      cadDocumentId,
-      fileVersionId: resolution.row.id,
-      versionNumber: resolution.row.versionNumber,
+      cadDocumentId: node.cadDocumentId,
+      fileVersionId: fv.id,
+      versionNumber: fv.versionNumber,
+      inclusionKind: node.inclusionKind,
     });
   }
 
-  // Two flat writes rather than one nested `releaseBaseline.create({data:
-  // {entries: {create: [...]}}})`: Prisma's nested-create input for a
-  // relation that is itself part of ANOTHER composite FK (here,
-  // organizationId is shared by the entry's link to its OWN baseline, to
-  // its CadDocument, and to its FileVersion) does not accept the scalar
-  // explicitly in that shape. A plain `createMany` has no such restriction
-  // and is one round trip for however many documents are involved.
+  // Two flat writes rather than one nested create: Prisma's nested-create
+  // input for a relation that is itself part of ANOTHER composite FK (here,
+  // organizationId is shared by the entry's link to its OWN baseline, to its
+  // CadDocument, and to its FileVersion) does not accept the scalar
+  // explicitly in that shape. A plain `createMany` has no such restriction.
   const baseline = await tx.releaseBaseline.create({
     data: { organizationId, itemRevisionId, createdById: actorUserId },
     select: { id: true, itemRevisionId: true, createdById: true, createdAt: true },
@@ -200,6 +335,7 @@ export async function buildReleaseBaselineInTransaction(
         releaseBaselineId: baseline.id,
         cadDocumentId: entry.cadDocumentId,
         fileVersionId: entry.fileVersionId,
+        inclusionKind: entry.inclusionKind,
       })),
     });
   }
@@ -224,9 +360,10 @@ export async function buildReleaseBaselineInTransaction(
  *   transition is not allowed, or a concurrent update won the race after
  *   the bounded SERIALIZABLE retry is exhausted (exact messages preserved
  *   from the original implementation).
- * @throws ReleaseBaselineIncompleteError if `target === RELEASED` and any
- *   directly associated CadDocument has no valid current FileVersion - the
- *   revision does NOT become RELEASED (the whole transaction rolls back).
+ * @throws ReleaseBaselineIncompleteError / ReleaseClosureTooLargeError /
+ *   ReleaseClosureInvalidError if `target === RELEASED` and the frozen
+ *   package cannot be captured - the revision does NOT become RELEASED (the
+ *   whole transaction rolls back).
  */
 export async function advanceRevisionForActor(
   actor: Actor,
@@ -296,11 +433,10 @@ export async function advanceRevisionForActor(
         });
       }
 
-      // P3D-1: frozen release baseline, atomic with the transition above.
-      // Any failure here rolls back EVERYTHING in this transaction,
-      // including the conditional update and the supersession just above -
-      // the revision does not become RELEASED, and the predecessor is not
-      // superseded.
+      // Frozen release baseline, atomic with the transition above. Any
+      // failure here rolls back EVERYTHING in this transaction, including the
+      // conditional update and the supersession just above - the revision
+      // does not become RELEASED, and the predecessor is not superseded.
       if (target === LifecycleState.RELEASED) {
         await buildReleaseBaselineInTransaction(
           tx,

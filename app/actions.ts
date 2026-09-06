@@ -12,6 +12,7 @@ import { prisma } from "@/app/lib/prisma";
 import { assertCanMutate, requireActor } from "@/app/lib/authz";
 import { getStorageProvider } from "@/app/lib/storage";
 import { advanceRevisionForActor } from "@/app/lib/release-db";
+import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
 import {
   canCreateSuccessorFrom,
   isCarryForwardMode,
@@ -754,6 +755,22 @@ export async function createCadDependency(formData: FormData) {
           ) {
             throw new Error(
               "Both CAD documents must exist in your organization",
+            );
+          }
+
+          // P3D-3: serialize this edge write against a release freezing its
+          // dependency closure. A release locks EVERY closure CadDocument
+          // row (`lockCadDocumentForVersionMutation`) in ascending-id order;
+          // taking the SAME lock on this edge's endpoints, in the SAME
+          // order, means a release either sees this edge fully (it committed
+          // first) or cannot start freezing until this commits - never a
+          // torn graph. Sorted order also prevents an AB/BA deadlock against
+          // a release or another concurrent dependency write.
+          for (const id of [parentDocumentId, childDocumentId].sort()) {
+            await lockCadDocumentForVersionMutation(
+              tx,
+              actor.organizationId,
+              id,
             );
           }
 

@@ -29,6 +29,14 @@
  */
 import type { WorkspacePlanEntry } from "./workspace-plan-core.ts";
 
+/** Provenance of a pinned entry in a P3D-3 dependency-complete baseline:
+ *  DIRECT = the CadDocument was associated with the ItemRevision at release
+ *  time; DEPENDENCY = it was pulled in through the CadDependency closure.
+ *  P3D-1 baselines predate the closure walk - every entry reads back DIRECT.
+ *  A future client that does not know this field can safely ignore it (it is
+ *  purely additive - no contract version bump). */
+export type ReleaseBaselineInclusionKind = "DIRECT" | "DEPENDENCY";
+
 export const RELEASED_WORKSPACE_CONTRACT_ID = "arch-plm.released-workspace-plan";
 export const RELEASED_WORKSPACE_CONTRACT_VERSION = "1.0.0";
 
@@ -120,6 +128,13 @@ export class ReleasedBinaryIntegrityError extends Error {
 // Contract shape
 // ------------------------------------------------------------
 
+/** A released-plan entry: the EXACT `WorkspacePlanEntry` shape the existing
+ *  materializer consumes, plus this baseline's own provenance tag. The extra
+ *  field is inert for the materializer and the CLI adapter. */
+export type ReleasedWorkspacePlanEntry = WorkspacePlanEntry & {
+  inclusionKind: ReleaseBaselineInclusionKind;
+};
+
 export interface ReleasedWorkspacePlan {
   contract: { id: string; version: string };
   itemRevision: { id: string };
@@ -132,8 +147,10 @@ export interface ReleasedWorkspacePlan {
    *  structural consistency with WorkspacePlan, not because it can vary. */
   safe: true;
   /** Deterministic order: CadDocument ID ascending (ties broken by entry id -
-   *  see `released-workspace-db.ts`), never database natural order. */
-  entries: WorkspacePlanEntry[];
+   *  see `released-workspace-db.ts`), never database natural order. Includes
+   *  BOTH DIRECT and DEPENDENCY entries - a released package is the whole
+   *  frozen closure. */
+  entries: ReleasedWorkspacePlanEntry[];
   /** Always empty - see `safe`'s doc comment. Present for structural
    *  consistency with WorkspacePlan. */
   problems: [];

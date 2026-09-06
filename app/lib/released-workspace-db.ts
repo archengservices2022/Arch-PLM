@@ -30,6 +30,20 @@
  * FileVersion` would otherwise have performed for a DIFFERENT purpose
  * (resolving "current", not verifying "the pinned one is intact").
  *
+ * DEPENDENCY-COMPLETE PACKAGE (P3D-3): retrieval returns EVERY
+ * ReleaseBaselineEntry for the baseline - both `inclusionKind = DIRECT` and
+ * `inclusionKind = DEPENDENCY` - because a released package is the whole
+ * frozen dependency closure that `release-db.ts` captured at release time.
+ * The provenance tag is passed straight through onto each entry. This module
+ * NEVER walks CadDependency, never recomputes the closure, never re-pins:
+ * the closure math happened once, at release, and is now immutable history.
+ *
+ * BACKWARD COMPATIBILITY: a P3D-1 / P3D-2 baseline predates the closure walk;
+ * its entries were all direct and the `inclusionKind` column defaults to
+ * DIRECT, so such a baseline reads back unchanged - same entries, all tagged
+ * DIRECT - and is NEVER expanded using today's CadDependency graph. "What
+ * was frozen then" is exactly what comes back now.
+ *
  * INTEGRITY IS ALL-OR-NOTHING: unlike Get Latest (which tolerates a partial/
  * unsafe manifest and reports `safe: false` with per-entry problems), a
  * released retrieval that finds ANY pinned entry unusable (FileVersion
@@ -72,7 +86,6 @@ import type { Actor } from "@/app/lib/authz";
 import { LifecycleState } from "../generated/prisma/enums.ts";
 import { workspaceRelativePath } from "./get-latest-core.ts";
 import type { StorageProvider } from "./storage-core.ts";
-import type { WorkspacePlanEntry } from "./workspace-plan-core.ts";
 import {
   ItemRevisionNotFoundError,
   RELEASED_WORKSPACE_CONTRACT_ID,
@@ -81,6 +94,7 @@ import {
   ReleasedBinaryIntegrityError,
   RevisionNotReleasedError,
   type ReleasedWorkspacePlan,
+  type ReleasedWorkspacePlanEntry,
 } from "./released-workspace-core.ts";
 
 export {
@@ -149,6 +163,7 @@ export async function getReleasedWorkspacePlanForActor(
     select: {
       cadDocumentId: true,
       fileVersionId: true,
+      inclusionKind: true,
       cadDocument: {
         select: { documentNumber: true, fileName: true, documentType: true },
       },
@@ -166,7 +181,7 @@ export async function getReleasedWorkspacePlanForActor(
     },
   });
 
-  const entries: WorkspacePlanEntry[] = [];
+  const entries: ReleasedWorkspacePlanEntry[] = [];
   for (const row of rows) {
     const fv = row.fileVersion;
     // Defense in depth: the composite FK already guarantees fv.cadDocumentId
@@ -215,17 +230,23 @@ export async function getReleasedWorkspacePlanForActor(
       documentNumber: row.cadDocument.documentNumber,
       fileName: row.cadDocument.fileName,
       cadType: String(row.cadDocument.documentType),
-      // No graph traversal in P3D-2 (direct baseline entries only), so
-      // there is no meaningful single "root" the way Get Latest has one.
+      // A released package identifies itself by ItemRevision + baseline, not
+      // by a single graph "root" - so no entry is marked isRoot (see the
+      // adapter and released-workspace-core doc comments).
       isRoot: false,
+      // P3D-3 provenance: DIRECT (associated with the revision) vs DEPENDENCY
+      // (reached through the frozen CadDependency closure). Read straight
+      // from the immutable baseline row - never recomputed.
+      inclusionKind: row.inclusionKind,
       placement: {
         generatedRelativePath: workspaceRelativePath(
           row.cadDocument.fileName,
           row.cadDocument.documentNumber,
         ),
       },
-      // No dependency-closure snapshot in P3D-2 - see the module doc
-      // comment and prisma/schema.prisma's ReleaseBaselineEntry comment.
+      // The baseline pins (document, version) pairs, not edges - the frozen
+      // closure's edge structure is not stored and is never recomputed at
+      // read time, so per-entry dependsOn is intentionally empty.
       dependsOn: [],
       canMaterialize: true,
       blockedReasons: [],

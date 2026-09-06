@@ -45,6 +45,9 @@ interface EntryRow {
   releaseBaselineId: string;
   cadDocumentId: string;
   fileVersionId: string;
+  /** P3D-3; defaults to DIRECT (matches the DB column default for rows
+   *  written before the closure walk existed). */
+  inclusionKind?: "DIRECT" | "DEPENDENCY";
 }
 interface DocRow {
   organizationId: string;
@@ -178,6 +181,7 @@ class FakeDatabase {
             return {
               cadDocumentId: e.cadDocumentId,
               fileVersionId: e.fileVersionId,
+              inclusionKind: e.inclusionKind ?? "DIRECT",
               cadDocument: doc
                 ? { documentNumber: doc.documentNumber, fileName: doc.fileName, documentType: doc.documentType }
                 : null,
@@ -650,6 +654,100 @@ test("zero-entry baseline stays valid without any storage hashing (no hashObject
   assert.equal(plan.entries.length, 0);
   assert.equal(plan.safe, true);
   assert.equal(hashCalls, 0, "an empty baseline must not touch storage at all");
+});
+
+// ------------------------------------------------------------
+// P3D-3: dependency-complete retrieval (DIRECT + DEPENDENCY)
+// ------------------------------------------------------------
+
+/** Seeds a RELEASED revision whose baseline froze a 3-doc closure:
+ *  root (DIRECT) -> mid (DEPENDENCY) -> leaf (DEPENDENCY). */
+function seedReleasedClosure(db: FakeDatabase): void {
+  db.addRevision({ organizationId: "orgA", id: "rev-1", lifecycle: LifecycleState.RELEASED });
+  db.addBaseline({ organizationId: "orgA", id: "rb-1", itemRevisionId: "rev-1", createdById: "user-orgA" });
+  for (const [doc, num] of [["z-root", "ASM-1"], ["m-mid", "SUB-1"], ["a-leaf", "PRT-1"]] as const) {
+    db.addDoc({ organizationId: "orgA", id: doc, documentNumber: num, fileName: `${doc}.dat`, documentType: "IPT" });
+    db.addVersion({
+      organizationId: "orgA", id: `fv-${doc}`, cadDocumentId: doc, versionNumber: 1,
+      checksum: `ck-${doc}`, fileSize: 10, storageKey: `org/orgA/doc/${doc}/v1/x`, originalFileName: `${doc}.dat`,
+    });
+  }
+  db.addEntry({ organizationId: "orgA", id: "rbe-root", releaseBaselineId: "rb-1", cadDocumentId: "z-root", fileVersionId: "fv-z-root", inclusionKind: "DIRECT" });
+  db.addEntry({ organizationId: "orgA", id: "rbe-mid", releaseBaselineId: "rb-1", cadDocumentId: "m-mid", fileVersionId: "fv-m-mid", inclusionKind: "DEPENDENCY" });
+  db.addEntry({ organizationId: "orgA", id: "rbe-leaf", releaseBaselineId: "rb-1", cadDocumentId: "a-leaf", fileVersionId: "fv-a-leaf", inclusionKind: "DEPENDENCY" });
+}
+
+test("retrieval returns the WHOLE frozen closure - DIRECT and DEPENDENCY entries - with provenance passed through", async () => {
+  const db = new FakeDatabase();
+  seedReleasedClosure(db);
+  const plan = await getReleasedWorkspacePlanForActor(actorIn("orgA"), "rev-1", db.db, db.provider);
+
+  assert.equal(plan.entries.length, 3);
+  // Deterministic: cadDocumentId ascending regardless of insertion order.
+  assert.deepEqual(plan.entries.map((e) => e.cadDocumentId), ["a-leaf", "m-mid", "z-root"]);
+  assert.deepEqual(
+    Object.fromEntries(plan.entries.map((e) => [e.cadDocumentId, e.inclusionKind])),
+    { "z-root": "DIRECT", "m-mid": "DEPENDENCY", "a-leaf": "DEPENDENCY" },
+  );
+
+  const httpResult = await getReleasedWorkspaceHttpResult(actorIn("orgA"), "rev-1", db.db, db.provider);
+  assert.equal(httpResult.status, 200);
+});
+
+// J. a later FileVersion on a pinned DEPENDENCY document must not change retrieval
+test("J. a later V2 on a pinned DEPENDENCY document: retrieval still returns the pinned V1", async () => {
+  const db = new FakeDatabase();
+  seedReleasedClosure(db);
+  // A brand-new V2 appears for the dependency leaf, with a present binary.
+  db.addVersion({
+    organizationId: "orgA", id: "fv-a-leaf-v2", cadDocumentId: "a-leaf", versionNumber: 2,
+    checksum: "ck-a-leaf-v2", fileSize: 999, storageKey: "org/orgA/doc/a-leaf/v2/y", originalFileName: "a-leaf.dat",
+  });
+
+  const plan = await getReleasedWorkspacePlanForActor(actorIn("orgA"), "rev-1", db.db, db.provider);
+  const leaf = plan.entries.find((e) => e.cadDocumentId === "a-leaf")!;
+  assert.equal(leaf.version!.fileVersionId, "fv-a-leaf", "pinned V1, never the newer V2");
+  assert.equal(leaf.version!.versionNumber, 1);
+});
+
+// K. the dependency graph is never consulted by retrieval at all
+test("K. retrieval never reads CadDependency - structurally cannot, and its output is graph-independent", async () => {
+  const db = new FakeDatabase();
+  seedReleasedClosure(db);
+  const entriesOf = async () =>
+    JSON.stringify(
+      (await getReleasedWorkspacePlanForActor(actorIn("orgA"), "rev-1", db.db, db.provider)).entries,
+    );
+  const before = await entriesOf();
+
+  const src = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../app/lib/released-workspace-db.ts", import.meta.url), "utf8"),
+  );
+  assert.ok(!/\.cadDependency\b/.test(src), "released-workspace-db.ts must never query CadDependency");
+  assert.ok(!/computeReleaseClosure|release-closure-core/.test(src), "retrieval must never recompute the closure");
+  assert.ok(
+    /"itemRevision" \| "releaseBaseline" \| "releaseBaselineEntry"/.test(src),
+    "ReleasedWorkspaceDb must expose ONLY the baseline tables - no cadDependency access is even possible",
+  );
+
+  // Same baseline rows => identical entries, no matter what the live graph is now.
+  assert.equal(before, await entriesOf());
+});
+
+// R. an old P3D-1 DIRECT-only baseline (no inclusionKind persisted) still reads back
+test("R. a pre-P3D-3 baseline (entries with no persisted inclusionKind): reads back as all-DIRECT, never expanded", async () => {
+  const db = new FakeDatabase();
+  seedReleasedRevisionPinningV1(db); // addEntry WITHOUT inclusionKind - like a column-default row
+  db.addDoc({ organizationId: "orgA", id: "doc-2", documentNumber: "DOC-2", fileName: "b.ipt", documentType: "IPT" });
+  db.addVersion({
+    organizationId: "orgA", id: "fv-2-v1", cadDocumentId: "doc-2", versionNumber: 1,
+    checksum: "checksum-2", fileSize: 50, storageKey: "org/orgA/doc/doc-2/v1/z", originalFileName: "b.ipt",
+  });
+  db.addEntry({ organizationId: "orgA", id: "rbe-2", releaseBaselineId: "rb-1", cadDocumentId: "doc-2", fileVersionId: "fv-2-v1" });
+
+  const plan = await getReleasedWorkspacePlanForActor(actorIn("orgA"), "rev-1", db.db, db.provider);
+  assert.equal(plan.entries.length, 2, "exactly the two frozen entries - not expanded with today's graph");
+  assert.ok(plan.entries.every((e) => e.inclusionKind === "DIRECT"));
 });
 
 // ------------------------------------------------------------

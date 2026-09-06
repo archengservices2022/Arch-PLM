@@ -28,6 +28,8 @@ import type { Actor } from "../app/lib/authz.ts";
 import type { UserRole } from "../app/generated/prisma/enums.ts";
 import {
   ReleaseBaselineIncompleteError,
+  ReleaseClosureInvalidError,
+  ReleaseClosureTooLargeError,
   advanceRevisionForActor,
   buildReleaseBaselineInTransaction,
   type ReleaseDb,
@@ -82,12 +84,22 @@ interface VersionRow {
   fileSize: bigint | null;
   storageKey: string;
 }
+interface DocRow {
+  organizationId: string;
+  id: string;
+}
+interface DependencyRow {
+  organizationId: string;
+  parentDocumentId: string;
+  childDocumentId: string;
+}
 interface EntryRow {
   id: string;
   organizationId: string;
   releaseBaselineId: string;
   cadDocumentId: string;
   fileVersionId: string;
+  inclusionKind: "DIRECT" | "DEPENDENCY";
 }
 interface BaselineRow {
   organizationId: string;
@@ -101,12 +113,22 @@ class FakeDatabase {
   readonly revisions: RevisionRow[] = [];
   readonly links: LinkRow[] = [];
   readonly versions: VersionRow[] = [];
+  readonly docs: DocRow[] = [];
+  readonly dependencies: DependencyRow[] = [];
   readonly baselines: BaselineRow[] = [];
   readonly entries: EntryRow[] = [];
   readonly storageObjects = new Set<string>();
+  /** storageKey -> the bytes the storage layer would report (defaults to the
+   *  FileVersion row's own checksum/size; corruption tests override). */
+  readonly storedBytes = new Map<string, { sha256: string; size: number }>();
   readonly #locks = new Map<string, RowLock>();
   transactionAttempts = 0;
   forceSerializationFailures = 0;
+  /** Invoked at the start of every in-transaction CadDependency scan, with a
+   *  1-based scan counter - lets a test simulate a concurrent edge insert
+   *  landing between the release's closure passes. */
+  dependencyScanHook: ((scanCount: number) => void) | null = null;
+  #dependencyScans = 0;
 
   addRevision(row: RevisionRow): this {
     this.revisions.push(row);
@@ -116,8 +138,29 @@ class FakeDatabase {
     this.links.push({ organizationId, itemRevisionId, cadDocumentId });
     return this;
   }
-  addVersion(row: Omit<VersionRow, "fileSize"> & { fileSize: number | null }): this {
+  addDoc(organizationId: string, id: string): this {
+    if (!this.docs.some((d) => d.organizationId === organizationId && d.id === id)) {
+      this.docs.push({ organizationId, id });
+    }
+    return this;
+  }
+  addDependency(organizationId: string, parentDocumentId: string, childDocumentId: string): this {
+    this.dependencies.push({ organizationId, parentDocumentId, childDocumentId });
+    return this;
+  }
+  addVersion(
+    row: Omit<VersionRow, "fileSize"> & { fileSize: number | null },
+    opts: { present?: boolean; storedAs?: { sha256?: string; size?: number } } = {},
+  ): this {
     this.versions.push({ ...row, fileSize: row.fileSize == null ? null : BigInt(row.fileSize) });
+    this.addDoc(row.organizationId, row.cadDocumentId);
+    if (opts.present !== false) {
+      this.storageObjects.add(row.storageKey);
+      this.storedBytes.set(row.storageKey, {
+        sha256: opts.storedAs?.sha256 ?? row.checksum ?? "",
+        size: opts.storedAs?.size ?? (row.fileSize == null ? 0 : row.fileSize),
+      });
+    }
     return this;
   }
 
@@ -141,6 +184,13 @@ class FakeDatabase {
     return {
       async exists(key: string): Promise<boolean> {
         return self.storageObjects.has(key);
+      },
+      async hashObject(key: string): Promise<{ sha256: string; size: number }> {
+        const bytes = self.storedBytes.get(key);
+        if (!bytes) {
+          throw new Error("storage object not found");
+        }
+        return { sha256: bytes.sha256, size: bytes.size };
       },
     };
   }
@@ -246,6 +296,33 @@ class FakeDatabase {
                 .map((l) => ({ cadDocumentId: l.cadDocumentId }));
             }) as unknown,
           },
+          cadDocument: {
+            findMany: (async (args: { where: { organizationId: string; id: { in: string[] } } }) => {
+              const ids = new Set(args.where.id.in);
+              return self.docs
+                .filter((d) => d.organizationId === args.where.organizationId && ids.has(d.id))
+                .map((d) => ({ id: d.id }));
+            }) as unknown,
+          },
+          cadDependency: {
+            findMany: (async (args: {
+              where: { organizationId: string; parentDocumentId: { in: string[] } };
+            }) => {
+              self.#dependencyScans += 1;
+              self.dependencyScanHook?.(self.#dependencyScans);
+              const parents = new Set(args.where.parentDocumentId.in);
+              return self.dependencies
+                .filter(
+                  (e) =>
+                    e.organizationId === args.where.organizationId &&
+                    parents.has(e.parentDocumentId),
+                )
+                .map((e) => ({
+                  parentDocumentId: e.parentDocumentId,
+                  childDocumentId: e.childDocumentId,
+                }));
+            }) as unknown,
+          },
           fileVersion: {
             findMany: (async (args: { where: { organizationId: string; cadDocumentId: string } }) => {
               return self.#latestVersionsFor(args.where.organizationId, args.where.cadDocumentId).map((v) => ({
@@ -296,6 +373,7 @@ class FakeDatabase {
                 releaseBaselineId: string;
                 cadDocumentId: string;
                 fileVersionId: string;
+                inclusionKind: "DIRECT" | "DEPENDENCY";
               }>;
             }) => {
               for (const e of args.data) {
@@ -305,6 +383,7 @@ class FakeDatabase {
                   releaseBaselineId: e.releaseBaselineId,
                   cadDocumentId: e.cadDocumentId,
                   fileVersionId: e.fileVersionId,
+                  inclusionKind: e.inclusionKind,
                 };
                 self.entries.push(entry);
                 undo.push(() => {
@@ -363,21 +442,27 @@ function seedDocumentWithVersion(
   cadDocumentId: string,
   fileVersionId: string,
   versionNumber: number,
-  overrides: Partial<{ checksum: string | null; fileSize: number | null; storageKey: string; present: boolean }> = {},
+  overrides: Partial<{
+    checksum: string | null;
+    fileSize: number | null;
+    storageKey: string;
+    present: boolean;
+    storedAs: { sha256?: string; size?: number };
+  }> = {},
 ): void {
   const storageKey = overrides.storageKey ?? `org/orgA/doc/${cadDocumentId}/v${versionNumber}/${fileVersionId}`;
-  db.addVersion({
-    organizationId: "orgA",
-    cadDocumentId,
-    id: fileVersionId,
-    versionNumber,
-    checksum: overrides.checksum === undefined ? `checksum-${fileVersionId}` : overrides.checksum,
-    fileSize: overrides.fileSize === undefined ? 100 : overrides.fileSize,
-    storageKey,
-  });
-  if (overrides.present !== false) {
-    db.storageObjects.add(storageKey);
-  }
+  db.addVersion(
+    {
+      organizationId: "orgA",
+      cadDocumentId,
+      id: fileVersionId,
+      versionNumber,
+      checksum: overrides.checksum === undefined ? `checksum-${fileVersionId}` : overrides.checksum,
+      fileSize: overrides.fileSize === undefined ? 100 : overrides.fileSize,
+      storageKey,
+    },
+    { present: overrides.present, storedAs: overrides.storedAs },
+  );
 }
 
 // ------------------------------------------------------------
@@ -730,5 +815,304 @@ test("buildReleaseBaselineInTransaction directly: returns the exact pinned entri
     assert.equal(result.entries[0]!.cadDocumentId, "doc-1");
     assert.equal(result.entries[0]!.fileVersionId, "fv-1-v3");
     assert.equal(result.entries[0]!.versionNumber, 3);
+    assert.equal(result.entries[0]!.inclusionKind, "DIRECT");
   });
+});
+
+// ============================================================
+// P3D-3: dependency-complete release closure
+// ============================================================
+
+function kindByDoc(db: FakeDatabase): Record<string, string> {
+  return Object.fromEntries(db.entries.map((e) => [e.cadDocumentId, e.inclusionKind]));
+}
+function versionByDoc(db: FakeDatabase): Record<string, string> {
+  return Object.fromEntries(db.entries.map((e) => [e.cadDocumentId, e.fileVersionId]));
+}
+
+// B. A -> B  =>  A DIRECT, B DEPENDENCY
+test("B. direct A depends on B: baseline freezes A (DIRECT) and B (DEPENDENCY)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA1", 1);
+  seedDocumentWithVersion(db, "B", "fvB1", 1);
+  db.addDependency("orgA", "A", "B");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.entries.length, 2);
+  assert.deepEqual(kindByDoc(db), { A: "DIRECT", B: "DEPENDENCY" });
+});
+
+// C. A -> B -> C  =>  complete recursive closure frozen
+test("C. A -> B -> C: the whole recursive closure is frozen", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA1", 1);
+  seedDocumentWithVersion(db, "B", "fvB1", 1);
+  seedDocumentWithVersion(db, "C", "fvC1", 1);
+  db.addDependency("orgA", "A", "B");
+  db.addDependency("orgA", "B", "C");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.deepEqual(kindByDoc(db), { A: "DIRECT", B: "DEPENDENCY", C: "DEPENDENCY" });
+  assert.deepEqual(versionByDoc(db), { A: "fvA1", B: "fvB1", C: "fvC1" });
+});
+
+// D. diamond  =>  shared leaf frozen once
+test("D. diamond A->B, A->C, B->D, C->D: D is frozen exactly once", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  for (const [d, fv] of [["A", "fvA"], ["B", "fvB"], ["C", "fvC"], ["D", "fvD"]] as const) {
+    seedDocumentWithVersion(db, d, fv, 1);
+  }
+  db.addDependency("orgA", "A", "B");
+  db.addDependency("orgA", "A", "C");
+  db.addDependency("orgA", "B", "D");
+  db.addDependency("orgA", "C", "D");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.entries.length, 4);
+  assert.equal(db.entries.filter((e) => e.cadDocumentId === "D").length, 1);
+  assert.equal(kindByDoc(db).D, "DEPENDENCY");
+});
+
+// E. a document both direct and reachable as a dependency  =>  one entry, DIRECT wins
+test("E. a document that is both directly associated and a dependency child: one entry, DIRECT wins", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  db.addLink("orgA", "rev-1", "B"); // B is ALSO direct
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1);
+  db.addDependency("orgA", "A", "B");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.entries.length, 2);
+  assert.equal(db.entries.filter((e) => e.cadDocumentId === "B").length, 1);
+  assert.deepEqual(kindByDoc(db), { A: "DIRECT", B: "DIRECT" });
+});
+
+// F. cycle in the dependency graph  =>  release still terminates and freezes each node once
+test("F. a pre-existing dependency cycle: release terminates and freezes each closure node once", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1);
+  db.addDependency("orgA", "A", "B");
+  db.addDependency("orgA", "B", "A"); // cycle
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.entries.length, 2);
+  assert.deepEqual(kindByDoc(db), { A: "DIRECT", B: "DEPENDENCY" });
+});
+
+// G. dependency missing a valid FileVersion  =>  release fails atomically
+test("G. a dependency document with no usable FileVersion: release fails, revision not RELEASED, no partial baseline", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  db.addDoc("orgA", "B"); // B exists but has no FileVersion
+  db.addDependency("orgA", "A", "B");
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseBaselineIncompleteError);
+      assert.equal(error.cadDocumentId, "B");
+      assert.equal(error.reason, "missing-version");
+      return true;
+    },
+  );
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  assert.equal(db.baselines.length, 0);
+  assert.equal(db.entries.length, 0);
+});
+
+// H. dependency expected binary missing  =>  release fails atomically
+test("H. a dependency document whose current FileVersion has no stored binary: release fails atomically", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1, { present: false });
+  db.addDependency("orgA", "A", "B");
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseBaselineIncompleteError);
+      assert.equal(error.cadDocumentId, "B");
+      assert.equal(error.reason, "missing-binary");
+      return true;
+    },
+  );
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  assert.equal(db.baselines.length, 0);
+});
+
+// I. dependency binary checksum/size mismatch  =>  release fails atomically
+test("I. a dependency document whose stored bytes fail checksum verification: release fails atomically (corrupt)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1, { storedAs: { sha256: "not-the-recorded-digest" } });
+  db.addDependency("orgA", "A", "B");
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseBaselineIncompleteError);
+      assert.equal(error.cadDocumentId, "B");
+      assert.equal(error.reason, "corrupt");
+      assert.ok(!error.message.includes("not-the-recorded-digest"));
+      return true;
+    },
+  );
+  assert.equal(db.baselines.length, 0);
+});
+
+test("I2. a same-size corrupted DIRECT binary also fails release (byte-level check, not just size)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1, { fileSize: 100, storedAs: { sha256: "wrong", size: 100 } });
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseBaselineIncompleteError);
+      assert.equal(error.reason, "corrupt");
+      return true;
+    },
+  );
+});
+
+// Closure exceeding the node cap  =>  release fails atomically
+test("dependency closure exceeding the node cap: release fails atomically (ReleaseClosureTooLargeError)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  for (const d of ["A", "B", "C", "D"]) seedDocumentWithVersion(db, d, `fv${d}`, 1);
+  db.addDependency("orgA", "A", "B");
+  db.addDependency("orgA", "A", "C");
+  db.addDependency("orgA", "A", "D");
+
+  await assert.rejects(
+    () =>
+      db.db.$transaction((tx) =>
+        buildReleaseBaselineInTransaction(tx as never, "orgA", "rev-1", "user-orgA", db.provider, 2),
+      ),
+    ReleaseClosureTooLargeError,
+  );
+  assert.equal(db.baselines.length, 0);
+});
+
+// A dependency edge pointing at a document not in the tenant  =>  release fails
+test("a dependency edge to a document absent from the organization: release fails atomically (ReleaseClosureInvalidError)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  // Edge A -> ghost, but no CadDocument row for "ghost".
+  db.addDependency("orgA", "A", "ghost");
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseClosureInvalidError);
+      assert.equal(error.cadDocumentId, "ghost");
+      return true;
+    },
+  );
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  assert.equal(db.baselines.length, 0);
+});
+
+// O (mechanism). An edge inserted between the release's closure passes is
+// picked up by the stabilization re-scan; the frozen package is coherent
+// with the AFTER-insert graph, never a torn subset.
+test("O. a dependency edge that lands between closure passes is absorbed; the package is coherent, never torn", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1);
+  seedDocumentWithVersion(db, "C", "fvC", 1);
+  db.addDependency("orgA", "A", "B");
+  // After the FIRST in-transaction dependency scan, a concurrent writer adds
+  // B -> C (as if createCadDependency had just committed).
+  db.dependencyScanHook = (scan) => {
+    if (scan === 1) db.addDependency("orgA", "B", "C");
+  };
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.deepEqual(kindByDoc(db), { A: "DIRECT", B: "DEPENDENCY", C: "DEPENDENCY" },
+    "the late B->C edge is absorbed - C is frozen, not silently dropped");
+});
+
+// P. simultaneous release attempts on the same revision  =>  exactly one baseline
+test("P. simultaneous releases of a revision with a dependency closure: exactly one immutable baseline", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "A");
+  seedDocumentWithVersion(db, "A", "fvA", 1);
+  seedDocumentWithVersion(db, "B", "fvB", 1);
+  db.addDependency("orgA", "A", "B");
+  const actor = actorIn("orgA");
+
+  const results = await Promise.allSettled([
+    advanceRevisionForActor(actor, "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    advanceRevisionForActor(actor, "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+  ]);
+
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(db.baselines.length, 1);
+  assert.equal(db.entries.length, 2, "one coherent 2-doc closure, no duplicate entries");
+});
+
+// Deterministic lock order across the WHOLE closure (direct + dependency).
+test("locks every closure document (direct AND dependency) in one ascending-id order", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "m-root");
+  seedDocumentWithVersion(db, "m-root", "fv-root", 1);
+  seedDocumentWithVersion(db, "z-dep", "fv-z", 1);
+  seedDocumentWithVersion(db, "a-dep", "fv-a", 1);
+  db.addDependency("orgA", "m-root", "z-dep");
+  db.addDependency("orgA", "m-root", "a-dep");
+
+  const lockOrder: string[] = [];
+  const base = db.db;
+  const wrapped = {
+    ...base,
+    $transaction: ((fn: (tx: unknown) => Promise<unknown>, opts?: unknown) =>
+      base.$transaction(async (tx) => {
+        const raw = (tx as { $queryRaw: (...a: unknown[]) => Promise<unknown> }).$queryRaw;
+        (tx as { $queryRaw: unknown }).$queryRaw = async (
+          strings: TemplateStringsArray,
+          ...values: unknown[]
+        ) => {
+          if (String(strings.join("")).includes("CadDocument")) lockOrder.push(values[0] as string);
+          return raw(strings, ...values);
+        };
+        return fn(tx);
+      }, opts as never)) as typeof base.$transaction,
+  } as typeof base;
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, wrapped, db.provider);
+
+  assert.deepEqual(lockOrder, ["a-dep", "m-root", "z-dep"], "closure locked in one global ascending-id order");
+  assert.equal(db.entries.length, 3);
 });

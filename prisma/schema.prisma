@@ -75,6 +75,16 @@ enum CadCheckoutEventType {
   ADMIN_UNLOCK
 }
 
+// How a CadDocument came to be pinned into a ReleaseBaseline (P3D-3) - see
+// ReleaseBaselineEntry. DIRECT = associated with the ItemRevision via
+// ItemRevisionDocument at release time; DEPENDENCY = reached only through the
+// outgoing CadDependency closure of a direct document. If a document is both,
+// DIRECT wins (there is still exactly one entry per document per baseline).
+enum ReleaseBaselineInclusionKind {
+  DIRECT
+  DEPENDENCY
+}
+
 // ============================================================
 // ORGANIZATION
 // ============================================================
@@ -741,14 +751,20 @@ model ReleaseBaseline {
 }
 
 // ============================================================
-// RELEASE BASELINE ENTRY  (P3D-1)
+// RELEASE BASELINE ENTRY  (P3D-1, extended P3D-3)
 //
-// One pinned (CadDocument, FileVersion) pair per DIRECTLY associated
-// CadDocument (via ItemRevisionDocument) at the moment of release. Scope is
-// deliberately limited to direct associations only - NOT the transitive
-// CadDependency closure (Assembly.iam's referenced Part.ipt is not
-// automatically pinned just because Assembly.iam is). Dependency-closure
-// snapshot/reproducibility validation is explicitly future P3D work.
+// One pinned (CadDocument, FileVersion) pair per CadDocument in the release's
+// dependency-complete closure at the moment of release:
+//   - every CadDocument DIRECTLY associated with the ItemRevision via
+//     ItemRevisionDocument (inclusionKind = DIRECT), AND
+//   - every CadDocument reachable from those via the outgoing CadDependency
+//     closure - parentDocumentId -> childDocumentId, recursively
+//     (inclusionKind = DEPENDENCY).
+// Exactly one entry per CadDocument per baseline (a document reached both
+// ways is stored once, as DIRECT). P3D-1 baselines predate the closure walk
+// and contain DIRECT entries only; `inclusionKind` defaults to DIRECT so
+// those historical rows read back truthfully and are never re-expanded using
+// today's graph.
 //
 // KEY CONSTRAINT - proving fileVersionId actually belongs to cadDocumentId:
 // a naive `fileVersionId -> FileVersion(organizationId, id)` FK only proves
@@ -793,6 +809,11 @@ model ReleaseBaselineEntry {
   // model comment above. NOT a plain (organizationId, id) reference.
   fileVersionId String
   fileVersion   FileVersion @relation(fields: [organizationId, cadDocumentId, fileVersionId], references: [organizationId, cadDocumentId, id], onDelete: Restrict)
+
+  // P3D-3: whether this document was directly associated with the revision or
+  // pulled in through the CadDependency closure. Additive; DIRECT default
+  // backfills existing P3D-1 entries, which were all direct.
+  inclusionKind ReleaseBaselineInclusionKind @default(DIRECT)
 
   createdAt DateTime @default(now())
 

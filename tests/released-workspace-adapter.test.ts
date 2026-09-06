@@ -27,11 +27,12 @@ import {
   materializeWorkspacePlan,
   type ContentDownloader,
 } from "../app/lib/workspace-materialize-core.ts";
-import type { WorkspacePlanEntry, WorkspacePlanVersion } from "../app/lib/workspace-plan-core.ts";
+import type { WorkspacePlanVersion } from "../app/lib/workspace-plan-core.ts";
 import {
   RELEASED_WORKSPACE_CONTRACT_ID,
   RELEASED_WORKSPACE_CONTRACT_VERSION,
   type ReleasedWorkspacePlan,
+  type ReleasedWorkspacePlanEntry,
 } from "../app/lib/released-workspace-core.ts";
 import { toMaterializableWorkspacePlan } from "../cli/released-workspace-adapter.ts";
 
@@ -61,13 +62,14 @@ function makeVersion(overrides: Partial<WorkspacePlanVersion> = {}): WorkspacePl
   };
 }
 
-function makeEntry(overrides: Partial<WorkspacePlanEntry> = {}): WorkspacePlanEntry {
+function makeEntry(overrides: Partial<ReleasedWorkspacePlanEntry> = {}): ReleasedWorkspacePlanEntry {
   return {
     cadDocumentId: "doc-a",
     documentNumber: "DOC-A",
     fileName: "Part.ipt",
     cadType: "IPT",
     isRoot: false,
+    inclusionKind: "DIRECT",
     placement: { generatedRelativePath: "Part.ipt" },
     dependsOn: [],
     canMaterialize: true,
@@ -77,7 +79,7 @@ function makeEntry(overrides: Partial<WorkspacePlanEntry> = {}): WorkspacePlanEn
   };
 }
 
-function makeReleasedPlan(entries: WorkspacePlanEntry[]): ReleasedWorkspacePlan {
+function makeReleasedPlan(entries: ReleasedWorkspacePlanEntry[]): ReleasedWorkspacePlan {
   return {
     contract: { id: RELEASED_WORKSPACE_CONTRACT_ID, version: RELEASED_WORKSPACE_CONTRACT_VERSION },
     itemRevision: { id: "rev-1" },
