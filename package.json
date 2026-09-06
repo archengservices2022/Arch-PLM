@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
-    "workspace:get": "node --experimental-strip-types cli/workspace-get.ts"
+    "workspace:get": "node --experimental-strip-types cli/workspace-get.ts",
+    "workspace:get-released": "node --experimental-strip-types cli/workspace-get-released.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
