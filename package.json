@@ -9,7 +9,12 @@
     "lint": "eslint",
     "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
     "workspace:get": "node --experimental-strip-types cli/workspace-get.ts",
-    "workspace:get-released": "node --experimental-strip-types cli/workspace-get-released.ts"
+    "workspace:get-released": "node --experimental-strip-types cli/workspace-get-released.ts",
+    "itest:p4b-get-latest": "node --experimental-strip-types --env-file=.env scripts/itest-p4b-get-latest.ts",
+    "fixture:p4b-manual": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts",
+    "fixture:p4b-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --cleanup",
+    "fixture:p4b-real": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --real",
+    "fixture:p4b-real:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --real --cleanup"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

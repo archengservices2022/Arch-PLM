@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 
-import { getActor } from "@/app/lib/authz";
+import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
 import {
   FileVersionNotFoundError,
   StoredFileCorruptError,
@@ -20,12 +20,25 @@ export const dynamic = "force-dynamic";
  * streamed through SHA-256 and checked against the recorded checksum before
  * any bytes are served (a corrupt object -> 500, never served); the file is
  * never loaded into memory whole.
+ *
+ * AUTH (P4B): accepts EITHER the browser NextAuth cookie (unchanged) OR a
+ * P4A desktop bearer token; a bearer request must also satisfy the transport
+ * policy. Tenant + role are re-derived server-side; reads are
+ * VIEWER-compatible.
  */
 export async function GET(
   request: Request,
   ctx: { params: Promise<{ fileVersionId: string }> },
 ): Promise<Response> {
-  const actor = await getActor();
+  let actor;
+  try {
+    actor = await resolveApiActor(request);
+  } catch (error) {
+    if (error instanceof DesktopAuthError) {
+      return Response.json({ error: error.publicMessage }, { status: error.status });
+    }
+    throw error;
+  }
   if (!actor) {
     return Response.json({ error: "Authentication required" }, { status: 401 });
   }
