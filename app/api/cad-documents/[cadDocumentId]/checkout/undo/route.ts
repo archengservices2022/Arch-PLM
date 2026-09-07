@@ -1,4 +1,4 @@
-import { getActor } from "@/app/lib/authz";
+import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
 import { undoCheckoutHttpResult } from "@/app/lib/checkout-release";
 
 export const runtime = "nodejs";
@@ -38,15 +38,29 @@ async function readOptionalReason(request: Request): Promise<unknown> {
  * audit event atomically with the checkout removal - see
  * `app/lib/checkout-release-db.ts`.
  *
- * Status codes: 401 unauthenticated, 403 role/ownership forbidden,
- * 404 cross-tenant/nonexistent document, 409 no active checkout / lost a
- * concurrent race, 200 success.
+ * AUTH (P4C): accepts EITHER the browser NextAuth cookie (unchanged) OR a
+ * P4A desktop bearer token; a bearer request must also satisfy the transport
+ * policy. Tenant + role/ownership are re-derived server-side. No change to
+ * the P3C release concurrency or audit model; admin-unlock / history stay
+ * cookie-only.
+ *
+ * Status codes: 400 disallowed transport (bearer only), 401 unauthenticated,
+ * 403 role/ownership forbidden, 404 cross-tenant/nonexistent document,
+ * 409 no active checkout / lost a concurrent race, 200 success.
  */
 export async function POST(
   request: Request,
   ctx: { params: Promise<{ cadDocumentId: string }> },
 ): Promise<Response> {
-  const actor = await getActor();
+  let actor;
+  try {
+    actor = await resolveApiActor(request);
+  } catch (error) {
+    if (error instanceof DesktopAuthError) {
+      return Response.json({ error: error.publicMessage }, { status: error.status });
+    }
+    throw error;
+  }
   const { cadDocumentId } = await ctx.params;
   const reason = await readOptionalReason(request);
 

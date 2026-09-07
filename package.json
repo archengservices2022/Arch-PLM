@@ -14,7 +14,10 @@
     "fixture:p4b-manual": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts",
     "fixture:p4b-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --cleanup",
     "fixture:p4b-real": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --real",
-    "fixture:p4b-real:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --real --cleanup"
+    "fixture:p4b-real:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --real --cleanup",
+    "fixture:p4c-real": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --p4c",
+    "fixture:p4c-real:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p4b-manual.ts --p4c --cleanup",
+    "itest:p4c-checkout": "node --experimental-strip-types --env-file=.env scripts/itest-p4c-checkout.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

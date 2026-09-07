@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 
-import { getActor } from "@/app/lib/authz";
+import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
 import { checkInHttpResult } from "@/app/lib/checkin";
 
 export const runtime = "nodejs";
@@ -24,16 +24,31 @@ export const dynamic = "force-dynamic";
  * failed check-in (any reason) never touches the active checkout or creates
  * a FileVersion.
  *
- * Status codes: 401 unauthenticated, 403 role cannot check in (VIEWER),
- * 404 cross-tenant/nonexistent document, 409 not checked out / checked out
- * by another actor / stale base / lost a concurrent check-in race,
- * 413 upload too large, 400 empty upload, 201 created.
+ * AUTH (P4C): accepts EITHER the browser NextAuth cookie (unchanged) OR a
+ * P4A desktop bearer token; a bearer request must also satisfy the transport
+ * policy. Tenant + role are re-derived server-side; VIEWER is 403. No change
+ * to the P3C check-in concurrency model, storage, FileVersion, or audit
+ * behaviour.
+ *
+ * Status codes: 400 disallowed transport (bearer only), 401 unauthenticated,
+ * 403 role cannot check in (VIEWER), 404 cross-tenant/nonexistent document,
+ * 409 not checked out / checked out by another actor / stale base / lost a
+ * concurrent check-in race, 413 upload too large, 400 empty upload,
+ * 201 created.
  */
 export async function POST(
   request: Request,
   ctx: { params: Promise<{ cadDocumentId: string }> },
 ): Promise<Response> {
-  const actor = await getActor();
+  let actor;
+  try {
+    actor = await resolveApiActor(request);
+  } catch (error) {
+    if (error instanceof DesktopAuthError) {
+      return Response.json({ error: error.publicMessage }, { status: error.status });
+    }
+    throw error;
+  }
   const { cadDocumentId } = await ctx.params;
 
   const contentType = request.headers.get("content-type") ?? "";

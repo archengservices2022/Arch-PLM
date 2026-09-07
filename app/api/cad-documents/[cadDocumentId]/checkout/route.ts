@@ -1,4 +1,5 @@
-import { getActor } from "@/app/lib/authz";
+import type { Actor } from "@/app/lib/authz";
+import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
 import {
   getCheckoutStatusHttpResult,
   requestCheckoutHttpResult,
@@ -6,6 +7,32 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/**
+ * AUTH (P4C): accepts EITHER the browser NextAuth cookie (unchanged) OR a P4A
+ * desktop bearer token (`Authorization: Bearer arch_dt_...`). A bearer request
+ * must also satisfy the transport policy (HTTPS unless loopback). Tenant +
+ * role are always re-derived server-side; VIEWER is rejected (403) and
+ * cross-tenant is 404 exactly as before. No change to the P3C checkout
+ * concurrency model, storage, FileVersion, or audit behaviour.
+ */
+async function resolveActorOrError(
+  request: Request,
+): Promise<{ actor: Actor | null } | { response: Response }> {
+  try {
+    return { actor: await resolveApiActor(request) };
+  } catch (error) {
+    if (error instanceof DesktopAuthError) {
+      return {
+        response: Response.json(
+          { error: error.publicMessage },
+          { status: error.status },
+        ),
+      };
+    }
+    throw error;
+  }
+}
 
 /**
  * GET /api/cad-documents/:cadDocumentId/checkout
@@ -17,14 +44,15 @@ export const dynamic = "force-dynamic";
  * Status codes: 401 unauthenticated, 404 cross-tenant/nonexistent document.
  */
 export async function GET(
-  _request: Request,
+  request: Request,
   ctx: { params: Promise<{ cadDocumentId: string }> },
 ): Promise<Response> {
-  const actor = await getActor();
+  const resolved = await resolveActorOrError(request);
+  if ("response" in resolved) return resolved.response;
   const { cadDocumentId } = await ctx.params;
 
   const { status, body } = await getCheckoutStatusHttpResult(
-    actor,
+    resolved.actor,
     cadDocumentId,
   );
 
@@ -56,14 +84,15 @@ export async function GET(
  * 201 created, 200 idempotent (already held by this actor).
  */
 export async function POST(
-  _request: Request,
+  request: Request,
   ctx: { params: Promise<{ cadDocumentId: string }> },
 ): Promise<Response> {
-  const actor = await getActor();
+  const resolved = await resolveActorOrError(request);
+  if ("response" in resolved) return resolved.response;
   const { cadDocumentId } = await ctx.params;
 
   const { status, body } = await requestCheckoutHttpResult(
-    actor,
+    resolved.actor,
     cadDocumentId,
   );
 

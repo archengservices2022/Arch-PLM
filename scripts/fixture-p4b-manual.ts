@@ -7,18 +7,19 @@
  * storage/plan helpers as the P4B live integration gate
  * (`scripts/itest-p4b-get-latest.ts`).
  *
- * Two disposable sets, each with its own document-number prefix so they are
- * fully independent and neither touches the other (or production data):
+ * Disposable sets, each with its own document-number prefix so they are fully
+ * independent and neither touches the other (or production data):
  *
  *   default        P4B-MANUAL-*   synthetic random binaries
- *   --real         P4B-REAL-*     the EXACT bytes of genuine Inventor 2025
- *                                 files under C:\Users\skota\ArchPLM\P4B-Real-Source
+ *   --real         P4B-REAL-*     EXACT bytes of genuine Inventor files under
+ *                                 C:\Users\skota\ArchPLM\P4B-Real-Source
+ *   --p4c          P4C-REAL-*     EXACT bytes of genuine Inventor files under
+ *                                 C:\Users\skota\ArchPLM\P4C-Real-Source
  *
  * Run from `web/`:
- *   npm run fixture:p4b-manual                 # create P4B-MANUAL-* (+verify)
- *   npm run fixture:p4b-manual:cleanup         # remove P4B-MANUAL-*
- *   npm run fixture:p4b-real                   # create P4B-REAL-*   (+verify)
- *   npm run fixture:p4b-real:cleanup           # remove P4B-REAL-*
+ *   npm run fixture:p4b-manual / :cleanup      # P4B-MANUAL-*
+ *   npm run fixture:p4b-real   / :cleanup      # P4B-REAL-*
+ *   npm run fixture:p4c-real   / :cleanup      # P4C-REAL-*
  *
  * GUARANTEES
  *   - Only rows whose CadDocument.documentNumber starts with the ACTIVE
@@ -49,6 +50,7 @@ import { getWorkspacePlanForActor } from "../app/lib/workspace-plan-db.ts";
 
 const ORG_CODE = "ARCH";
 const REAL_SOURCE_DIR = "C:\\Users\\skota\\ArchPLM\\P4B-Real-Source";
+const P4C_SOURCE_DIR = "C:\\Users\\skota\\ArchPLM\\P4C-Real-Source";
 
 type CadType = "IAM" | "IPT";
 
@@ -91,65 +93,108 @@ const REAL_SET: FixtureSet = {
   ],
 };
 
+const P4C_REAL_SET: FixtureSet = {
+  name: "P4C-REAL",
+  prefix: "P4C-REAL-",
+  cleanupCommand: "npm run fixture:p4c-real:cleanup",
+  docs: [
+    { key: "root", documentNumber: "P4C-REAL-ROOT", fileName: "P4C-REAL-ROOT.iam", documentType: "IAM", isRoot: true, sourcePath: path.join(P4C_SOURCE_DIR, "P4C-REAL-ROOT.iam") },
+    { key: "partA", documentNumber: "P4C-REAL-PART-A", fileName: "P4C-REAL-PART-A.ipt", documentType: "IPT", isRoot: false, sourcePath: path.join(P4C_SOURCE_DIR, "P4C-REAL-PART-A.ipt") },
+    { key: "partB", documentNumber: "P4C-REAL-PART-B", fileName: "P4C-REAL-PART-B.ipt", documentType: "IPT", isRoot: false, sourcePath: path.join(P4C_SOURCE_DIR, "P4C-REAL-PART-B.ipt") },
+  ],
+};
+
 const jsonStable = (value: unknown): string =>
   JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? `${v}n` : v));
 
 const sha256Hex = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
 
-/** Hash of every CadDocument / FileVersion / CadDependency row that is NOT
- *  part of THIS fixture set - the ARCH baseline this run must not disturb
- *  (production data and the other fixture set are both inside it). */
+/** Hash of every CadDocument / FileVersion / CadDependency / CadCheckout /
+ *  CadCheckoutEvent row that is NOT part of THIS fixture set - the ARCH
+ *  baseline this run must not disturb (production data and the other fixture
+ *  set are both inside it). Checkout + audit rows are included so a
+ *  too-broad cleanup would be caught. */
 async function baselineRowHash(prisma: PrismaClient, prefix: string): Promise<string> {
-  const docs = await prisma.cadDocument.findMany({
-    where: { NOT: { documentNumber: { startsWith: prefix } } },
-    orderBy: { id: "asc" },
-  });
-  const fvs = await prisma.fileVersion.findMany({
-    where: { cadDocument: { is: { NOT: { documentNumber: { startsWith: prefix } } } } },
-    orderBy: { id: "asc" },
-  });
-  const deps = await prisma.cadDependency.findMany({
-    where: {
-      AND: [
-        { parentDocument: { is: { NOT: { documentNumber: { startsWith: prefix } } } } },
-        { childDocument: { is: { NOT: { documentNumber: { startsWith: prefix } } } } },
-      ],
-    },
-    orderBy: { id: "asc" },
-  });
-  return createHash("sha256").update(jsonStable({ docs, fvs, deps })).digest("hex");
+  const notFixtureDoc = { is: { NOT: { documentNumber: { startsWith: prefix } } } };
+  const [docs, fvs, deps, checkouts, events] = await Promise.all([
+    prisma.cadDocument.findMany({ where: { NOT: { documentNumber: { startsWith: prefix } } }, orderBy: { id: "asc" } }),
+    prisma.fileVersion.findMany({ where: { cadDocument: notFixtureDoc }, orderBy: { id: "asc" } }),
+    prisma.cadDependency.findMany({
+      where: { AND: [{ parentDocument: notFixtureDoc }, { childDocument: notFixtureDoc }] },
+      orderBy: { id: "asc" },
+    }),
+    prisma.cadCheckout.findMany({ where: { cadDocument: notFixtureDoc }, orderBy: { id: "asc" } }),
+    prisma.cadCheckoutEvent.findMany({ where: { cadDocument: notFixtureDoc }, orderBy: { id: "asc" } }),
+  ]);
+  return createHash("sha256").update(jsonStable({ docs, fvs, deps, checkouts, events })).digest("hex");
 }
 
+/**
+ * Remove EVERY row + storage object that belongs to this disposable fixture
+ * set, in FK-dependency order (children before parents; every "onDelete:
+ * Restrict" parent is emptied of references first). Scoped strictly to the
+ * fixture's own CadDocument ids - unrelated ARCH checkout history is never
+ * touched. Idempotent: every step is a `deleteMany` that no-ops when nothing
+ * matches, so a partially-completed run finishes cleanly on the next call.
+ */
 async function cleanup(
   prisma: PrismaClient,
   provider: LocalFilesystemStorage,
   organizationId: string,
   prefix: string,
 ): Promise<number> {
-  const rows = await prisma.cadDocument.findMany({
+  // fixture-owned scope: the fixture's own CadDocument ids...
+  const docRows = await prisma.cadDocument.findMany({
     where: { organizationId, documentNumber: { startsWith: prefix } },
     select: { id: true },
   });
-  const ids = rows.map((r) => r.id);
-  if (ids.length === 0) return 0;
+  const docIds = docRows.map((r) => r.id);
 
-  const fvs = await prisma.fileVersion.findMany({
-    where: { organizationId, cadDocumentId: { in: ids } },
-    select: { storageKey: true },
+  // ...and its FileVersion ids (ALL of them - P4C added V2 for PART-A) +
+  // their storage keys, captured before any delete.
+  const fvRows = docIds.length === 0
+    ? []
+    : await prisma.fileVersion.findMany({
+        where: { organizationId, cadDocumentId: { in: docIds } },
+        select: { id: true, storageKey: true },
+      });
+  const fvIds = fvRows.map((r) => r.id);
+
+  // A `{ id: { in: [] } }` filter matches nothing, so every step below is a
+  // safe no-op when the fixture is already (partly) gone.
+  const inDocs = { in: docIds };
+  const inFvs = { in: fvIds };
+
+  // 1. active checkout rows for fixture documents (baseFileVersion FK Restrict).
+  await prisma.cadCheckout.deleteMany({ where: { organizationId, cadDocumentId: inDocs } });
+
+  // 2. checkout AUDIT events - scoped to fixture documents / fixture
+  //    FileVersions ONLY (cadDocumentId + baseFileVersionId are both
+  //    onDelete: Restrict). Every fixture event's cadDocumentId is a fixture
+  //    doc; the baseFileVersionId OR is belt-and-suspenders.
+  await prisma.cadCheckoutEvent.deleteMany({
+    where: { organizationId, OR: [{ cadDocumentId: inDocs }, { baseFileVersionId: inFvs }] },
   });
 
+  // 3. other fixture-owned dependents of CadDocument.
   await prisma.cadDependency.deleteMany({
-    where: { organizationId, OR: [{ parentDocumentId: { in: ids } }, { childDocumentId: { in: ids } }] },
+    where: { organizationId, OR: [{ parentDocumentId: inDocs }, { childDocumentId: inDocs }] },
   });
-  await prisma.itemRevisionDocument.deleteMany({ where: { organizationId, cadDocumentId: { in: ids } } });
-  await prisma.fileVersion.deleteMany({ where: { organizationId, cadDocumentId: { in: ids } } });
-  await prisma.cadDocument.deleteMany({ where: { organizationId, id: { in: ids } } });
+  await prisma.itemRevisionDocument.deleteMany({ where: { organizationId, cadDocumentId: inDocs } });
 
-  for (const { storageKey } of fvs) {
+  // 4. fixture FileVersions (V1 + V2 + any later) - now unreferenced.
+  await prisma.fileVersion.deleteMany({ where: { organizationId, cadDocumentId: inDocs } });
+
+  // 5. fixture CadDocuments.
+  await prisma.cadDocument.deleteMany({ where: { organizationId, id: inDocs } });
+
+  // 6. fixture storage objects + empty dirs (best effort, already-gone is fine).
+  for (const { storageKey } of fvRows) {
     try { await provider.delete(storageKey); } catch { /* best effort */ }
   }
   await pruneEmptyStorageDirs();
-  return ids.length;
+
+  return docIds.length;
 }
 
 async function pruneEmptyStorageDirs(): Promise<void> {
@@ -179,7 +224,11 @@ async function loadBytes(spec: DocSpec): Promise<Buffer> {
 
 async function main(): Promise<void> {
   const isCleanup = process.argv.includes("--cleanup");
-  const set = process.argv.includes("--real") ? REAL_SET : MANUAL_SET;
+  const set = process.argv.includes("--p4c")
+    ? P4C_REAL_SET
+    : process.argv.includes("--real")
+      ? REAL_SET
+      : MANUAL_SET;
 
   const prisma = new PrismaClient();
   const provider = new LocalFilesystemStorage(resolveStorageRoot());
@@ -259,11 +308,17 @@ async function main(): Promise<void> {
 
     // ---- verification ------------------------------------------------
     const plan = await getWorkspacePlanForActor(actor, created.root.id, prisma, provider);
+    const expectedClosure = new Set(Object.values(created).map((c) => c.id));
+    const planClosure = new Set(plan.entries.map((e) => e.cadDocumentId));
+    const closureOk =
+      planClosure.size === expectedClosure.size &&
+      [...expectedClosure].every((id) => planClosure.has(id));
     const planOk =
       plan.contract.id === "arch-plm.cad-workspace-plan" &&
       plan.contract.version === "1.0.0" &&
       plan.safe === true &&
       plan.entries.length === set.docs.length &&
+      closureOk &&
       plan.entries.every((e) => e.canMaterialize && e.version !== null) &&
       plan.entries.find((e) => e.isRoot)?.cadDocumentId === created.root.id &&
       plan.entries.every((e) => e.version!.contentPath === `/api/file-versions/${e.version!.fileVersionId}/content`);
@@ -292,21 +347,29 @@ async function main(): Promise<void> {
 
     const line = (label: string, value: string) => { console.log(""); console.log(label); console.log(value); };
     console.log("");
-    console.log(set === REAL_SET ? "REAL INVENTOR FIXTURE READY" : "MANUAL FIXTURE READY");
+    console.log(set === MANUAL_SET ? "MANUAL FIXTURE READY" : "REAL INVENTOR FIXTURE READY");
     line("Organization:", `${org.name} (${ORG_CODE})`);
     line("Root document number:", set.docs[0].documentNumber);
     line("Root cadDocumentId:", created.root.id);
     console.log("");
-    console.log("Files:");
-    for (const spec of set.docs) console.log(spec.fileName);
+    console.log("Per-document detail (documentNumber | cadDocumentId | v1 fileVersionId | sha256 | bytes):");
+    for (const spec of set.docs) {
+      const c = created[spec.key];
+      console.log(`  ${spec.documentNumber}  ${c.id}  ${c.fileVersionId}  ${c.checksum}  ${c.fileSize}`);
+    }
+    console.log("");
+    console.log("Dependency edges:");
+    console.log(`  ${set.docs[0].documentNumber} -> ${set.docs[1].documentNumber} (COMPONENT)`);
+    console.log(`  ${set.docs[0].documentNumber} -> ${set.docs[2].documentNumber} (COMPONENT)`);
     line("Exact source byte match:", sourceMatchOk ? "PASS" : "FAIL");
     line("Workspace-plan package count:", String(plan.entries.length));
+    line("Dependency closure = ROOT + PART-A + PART-B:", closureOk ? "PASS" : "FAIL");
     line("Workspace-plan check:", planOk ? "PASS" : "FAIL");
     line("Binary retrieval check:", binaryOk ? "PASS" : "FAIL");
     line("Baseline preservation:", baselineOk ? "PASS" : "FAIL");
     line("Cleanup command:", set.cleanupCommand);
 
-    if (!planOk || !binaryOk || !baselineOk || !sourceMatchOk) process.exit(1);
+    if (!planOk || !binaryOk || !baselineOk || !sourceMatchOk || !closureOk) process.exit(1);
   } finally {
     await prisma.$disconnect();
   }
