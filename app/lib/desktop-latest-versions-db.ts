@@ -24,6 +24,7 @@ import {
   DESKTOP_LATEST_VERSIONS_CONTRACT,
   DesktopLatestVersionError,
   parseLatestVersionIds,
+  toSafeFileSize,
   type AuthoritativeLatest,
   type LatestVersionsResponseDto,
 } from "./desktop-latest-versions-core.ts";
@@ -72,12 +73,26 @@ export async function latestVersionsForActor(
       },
       orderBy: [{ cadDocumentId: "asc" }, { versionNumber: "desc" }],
       distinct: ["cadDocumentId"],
-      select: { cadDocumentId: true, id: true, versionNumber: true },
+      select: {
+        cadDocumentId: true,
+        id: true,
+        versionNumber: true,
+        // Canonical immutable integrity metadata, straight from the
+        // authoritative row. `fileSize` is Prisma `BigInt?` (PostgreSQL
+        // BIGINT); `toSafeFileSize` range-checks the RAW bigint before any
+        // `Number(...)` conversion so an out-of-safe-range value is failed
+        // closed, not silently rounded. `checksum` is passed through verbatim
+        // and format-validated in the core layer.
+        fileSize: true,
+        checksum: true,
+      },
     });
     for (const row of rows) {
       latestByDoc.set(row.cadDocumentId, {
         latestFileVersionId: row.id,
         latestVersionNumber: row.versionNumber,
+        fileSize: toSafeFileSize(row.fileSize),
+        checksum: row.checksum,
       });
     }
   }

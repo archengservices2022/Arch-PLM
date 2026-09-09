@@ -57,9 +57,14 @@ export type FileVersionResolution<T extends FileVersionResolutionRow> =
 
 /** A version row is a real, immutable binary version iff it carries a
  *  server-computed checksum and byte size (the metadata-only creation path
- *  that produced neither was removed in P3A-1). */
+ *  that produced neither was removed in P3A-1).
+ *
+ *  Only the integrity fields are inspected, so any row-shaped value that
+ *  carries them is accepted - the desktop authoritative-latest-version lookup
+ *  reuses this exact predicate to decide whether a recognised latest
+ *  FileVersion has usable integrity metadata. */
 export function isBinaryBackedFileVersion(
-  row: FileVersionResolutionRow,
+  row: Pick<FileVersionResolutionRow, "checksum" | "fileSize">,
 ): boolean {
   return (
     typeof row.checksum === "string" &&

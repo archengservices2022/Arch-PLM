@@ -14,7 +14,12 @@ export const dynamic = "force-dynamic";
  * of EXACT stable `cadDocumentId`s it already holds (from its verified
  * workspace manifest), report - within the authenticated actor's organization
  * ONLY - whether each id is recognised and, if so, its authoritative latest
- * `FileVersion` id + number.
+ * `FileVersion` id + number + that FileVersion's canonical immutable integrity
+ * metadata (`checksum`: 64-char lowercase-hex SHA-256; `fileSize`: non-negative
+ * safe-integer byte count; from the selected DB row only), so the client can
+ * cryptographically verify a local binary is exactly that version. A recognised
+ * latest `FileVersion` whose stored integrity metadata is missing, non-canonical,
+ * or out of safe range fails closed to `recognized: false` (P5C-B).
  *
  * Bearer-authenticated (P4A desktop session), tenant-scoped, VIEWER-ok,
  * strictly READ-ONLY (no mutation, no checkout, no FileVersion creation, no
