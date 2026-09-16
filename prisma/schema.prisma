@@ -85,6 +85,13 @@ enum ReleaseBaselineInclusionKind {
   DEPENDENCY
 }
 
+// What a P6B CopyDesignOperationEntry decided for one plan entry - see that
+// model's own doc comment.
+enum CopyDesignEntryAction {
+  COPY
+  REUSE
+}
+
 // ============================================================
 // ORGANIZATION
 // ============================================================
@@ -97,20 +104,23 @@ model Organization {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  users                 User[]
-  customers             Customer[]
-  projects              Project[]
-  items                 Item[]
-  itemRevisions         ItemRevision[]
-  cadDocuments          CadDocument[]
-  fileVersions          FileVersion[]
-  itemRevisionDocuments ItemRevisionDocument[]
-  cadDependencies       CadDependency[]
-  cadCheckouts          CadCheckout[]
-  cadCheckoutEvents     CadCheckoutEvent[]
-  releaseBaselines      ReleaseBaseline[]
-  releaseBaselineEntries ReleaseBaselineEntry[]
-  desktopSessions       DesktopSession[]
+  users                      User[]
+  customers                  Customer[]
+  projects                   Project[]
+  items                      Item[]
+  itemRevisions              ItemRevision[]
+  cadDocuments               CadDocument[]
+  fileVersions               FileVersion[]
+  itemRevisionDocuments      ItemRevisionDocument[]
+  cadDependencies            CadDependency[]
+  cadCheckouts               CadCheckout[]
+  cadCheckoutEvents          CadCheckoutEvent[]
+  releaseBaselines           ReleaseBaseline[]
+  releaseBaselineEntries     ReleaseBaselineEntry[]
+  desktopSessions            DesktopSession[]
+  copyDesignOperations       CopyDesignOperation[]
+  cadCopyLineages            CadCopyLineage[]
+  copyDesignOperationEntries CopyDesignOperationEntry[]
 }
 
 // ============================================================
@@ -140,7 +150,7 @@ model User {
   createdItemRevisions         ItemRevision[]
   // Documents this user currently holds a server-authoritative checkout on.
   // NOT a "created by" relation - see CadCheckout.
-  cadCheckouts CadCheckout[]
+  cadCheckouts                 CadCheckout[]
 
   // Checkout history (P3C-3): two DISTINCT relations since a
   // CadCheckoutEvent names both who HELD the checkout and who PERFORMED the
@@ -153,6 +163,12 @@ model User {
 
   // Bearer sessions issued to this user's desktop CAD Connect clients (P4A).
   desktopSessions DesktopSession[]
+
+  // Copy Design operations this user performed, and the individual copy
+  // lineage rows they created (P6B) - see CopyDesignOperation /
+  // CadCopyLineage.
+  performedCopyDesignOperations CopyDesignOperation[]
+  copiedCadLineages             CadCopyLineage[]
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -364,6 +380,28 @@ model CadDocument {
   // ReleaseBaselineEntry's doc comment.
   releaseBaselineEntries ReleaseBaselineEntry[]
 
+  // P6B Copy Design lineage. At most one row - see CadCopyLineage's own doc
+  // comment for why a plain optional relation (backed by a unique
+  // constraint) is sufficient, exactly like CadDocument.checkout: a
+  // CadDocument was either created BY a copy (exactly one lineage row naming
+  // it as the new identity) or it was not (zero rows) - it can never be
+  // reassigned to a different source through any API.
+  copyLineageAsNew    CadCopyLineage?  @relation("CadCopyLineageNew")
+  // Copy Design lineage rows naming this document as a COPY SOURCE (a
+  // document can be copied from any number of times).
+  copyLineageAsSource CadCopyLineage[] @relation("CadCopyLineageSource")
+
+  // P6B Round 2 immutable operation/replay records (see
+  // CopyDesignOperationEntry's own doc comment). A document can appear as
+  // the named COPY source of any number of entries. It can also appear as
+  // the RESULT of more than one entry across separate operations - a COPY
+  // creates a document exactly once, but a REUSE entry names an EXISTING
+  // document as its result, and that same document can legitimately be
+  // reused again by a later, unrelated operation - so this is a to-many
+  // relation, not a to-one.
+  operationEntriesAsSource CopyDesignOperationEntry[] @relation("CopyDesignOperationEntrySource")
+  operationEntriesAsResult CopyDesignOperationEntry[] @relation("CopyDesignOperationEntryResult")
+
   @@unique([organizationId, id])
   @@unique([organizationId, documentNumber])
   @@index([organizationId])
@@ -445,13 +483,22 @@ model FileVersion {
 
   // A FileVersion that has ever been captured as a checkout's base. Not
   // constrained to one - see CadCheckout's doc comment.
-  baseForCheckouts CadCheckout[]
+  baseForCheckouts      CadCheckout[]
   // Same, but recorded durably in checkout HISTORY (P3C-3) - see
   // CadCheckoutEvent's doc comment.
   baseForCheckoutEvents CadCheckoutEvent[]
   // Pinned into a frozen engineering release baseline (P3D-1) - see
   // ReleaseBaselineEntry's doc comment.
-  baselineEntries ReleaseBaselineEntry[]
+  baselineEntries       ReleaseBaselineEntry[]
+
+  // Named as the EXACT source of a Copy Design copy (P6B) - see
+  // CadCopyLineage.sourceFileVersion's doc comment for the composite-FK
+  // proof that ties this to its own cadDocumentId.
+  copyLineagesAsSource CadCopyLineage[]
+
+  // Same, but in the P6B Round 2 immutable operation/replay record - see
+  // CopyDesignOperationEntry.sourceFileVersion's doc comment.
+  operationEntriesAsSource CopyDesignOperationEntry[]
 
   // Guarantees a CadDocument can never hold two rows with the same version.
   @@unique([cadDocumentId, versionNumber])
@@ -883,4 +930,276 @@ model DesktopSession {
   @@index([organizationId])
   @@index([userId])
   @@index([expiresAt])
+}
+
+// ============================================================
+// COPY DESIGN OPERATION + LINEAGE  (P6B - PLM identity reservation)
+//
+// Establishes the server-side stable identities and immutable lineage a
+// confirmed Arch CAD Connect P6A "Copy Design" plan needs BEFORE any
+// physical Inventor file operation (P6C). This is IDENTITY-ONLY:
+//   - creates NO binary data, NO FileVersion, NO ItemRevision;
+//   - never touches Inventor, never SaveAs, never replaces a reference;
+//   - never copies a source document's FileVersion history, engineering
+//     revisions, checkout/check-in history, audit history, or release
+//     baselines - the new CadDocument simply starts with none of its own,
+//     and every row belonging to the source is completely untouched.
+//
+// COPY vs REUSE (enforced in app/lib/copy-design-lineage-db.ts, not here):
+//   - COPY creates a brand-new CadDocument (a fresh cuid - NEVER the source's
+//     id) plus EXACTLY ONE CadCopyLineage row naming its exact source
+//     CadDocument + source FileVersion.
+//   - REUSE creates NOTHING: the existing CadDocument identity is validated
+//     (tenant-scoped) and returned as-is. A REUSE entry never produces a
+//     CadCopyLineage row - a lineage row existing at all always means "this
+//     identity IS a copy"; there is deliberately no other reason for one to
+//     exist.
+//
+// RESERVED IDENTITY STATE - NO NEW COLUMN: a COPY's new CadDocument is a
+// real, live identity the instant it is created, but has not yet been
+// physically materialized by P6C (no FileVersion exists for it yet).
+// Distinguishing "reserved, awaiting P6C" from "physically materialized"
+// needs NO new state column or workflow: it is simply
+//   materialized  <=>  CadDocument.fileVersions is non-empty
+// A CadDocument created through the ordinary (non-copy) createCadDocument
+// action already starts with zero FileVersions too, so "has no FileVersion
+// yet" is not unique to Copy Design - what IS unique to a copy is the
+// existence of a `copyLineageAsNew` row. The two facts are independent and
+// both already directly queryable, so "a Copy Design identity reserved for
+// later materialization" is simply the conjunction
+//   copyLineageAsNew IS NOT NULL  AND  fileVersions IS EMPTY
+// The moment P6C creates that CadDocument's first FileVersion - which it
+// must do anyway to perform its job - this conjunction becomes false
+// automatically. There is no separate "mark as materialized" step to run,
+// forget, or get out of sync: the transition is implicit in P6C's own normal
+// FileVersion-creation write, using the EXACT SAME code path
+// (`storeCadFileVersionForActor`) every other FileVersion creation already
+// uses.
+// ============================================================
+
+model CopyDesignOperation {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // Client-generated OPAQUE idempotency token (e.g. a UUID minted by CAD
+  // Connect when the engineer confirms the plan). NEVER derived from a
+  // filename, path, source/destination rename token, or document number -
+  // those are plan CONTENT, not operation identity. Retrying the apply call
+  // with the SAME key and an equivalent request resolves to this SAME row
+  // and creates nothing new; the SAME key with a materially different
+  // request is rejected (see copy-design-lineage-core.ts).
+  idempotencyKey String
+
+  // Set from the authenticated actor on the server, never from the client.
+  performedById String
+  performedBy   User   @relation(fields: [organizationId, performedById], references: [organizationId, id], onDelete: Restrict)
+
+  performedAt DateTime @default(now())
+
+  // Optional, display-only, client-supplied label (e.g. "10073 -> 10137").
+  // Never identity, never interpreted by any lineage/idempotency logic.
+  label String?
+
+  // The EXACT normalized request this operation was applied for. Used ONLY
+  // to detect and reject a retry that reuses this SAME idempotencyKey with a
+  // materially different request (see copyDesignPayloadsEqual in
+  // copy-design-lineage-core.ts) - NEVER used to reconstruct the response
+  // (see CopyDesignOperationEntry below for that).
+  requestPayload Json
+
+  // CadCopyLineage evidence rows this operation produced (COPY entries
+  // only - see CadCopyLineage's own doc comment). NOT consulted for replay.
+  lineageEntries CadCopyLineage[]
+
+  // ROUND 2, HIGH: the COMPLETE, ordered, IMMUTABLE record of every entry
+  // (COPY *and* REUSE) this operation decided, one row per request entry,
+  // in stable `ordinal` order. This - and ONLY this - is what an idempotent
+  // retry's response is reconstructed from; see CopyDesignOperationEntry's
+  // own doc comment for why.
+  entries CopyDesignOperationEntry[]
+
+  @@unique([organizationId, id])
+  // The entire idempotency mechanism: retrying the SAME operation must
+  // resolve to the SAME row, never create a second one.
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId])
+  @@index([performedById])
+}
+
+model CadCopyLineage {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // REQUIRED - every lineage row belongs to exactly one Copy Design
+  // operation; operation association is never optional. Restrict (not
+  // Cascade) - the same "evidence must outlive the record it names" rule
+  // used throughout this schema (CadCheckoutEvent, ReleaseBaseline, etc.) -
+  // even though no delete path for CopyDesignOperation exists today.
+  copyDesignOperationId String
+  copyDesignOperation   CopyDesignOperation @relation(fields: [organizationId, copyDesignOperationId], references: [organizationId, id], onDelete: Restrict)
+
+  // The NEW identity this row is about. UNIQUE (see @@unique below): a
+  // CadDocument can be "a copy" at most once, and - because no update/delete
+  // API is ever exposed for this row - can never be reassigned to a
+  // different source through any API once created.
+  newCadDocumentId String
+  newCadDocument   CadDocument @relation("CadCopyLineageNew", fields: [organizationId, newCadDocumentId], references: [organizationId, id], onDelete: Restrict)
+
+  // The source identity copied FROM. Restrict - lineage must outlive the
+  // source document even if it were ever deletable in the future (no such
+  // path exists today).
+  sourceCadDocumentId String
+  sourceCadDocument   CadDocument @relation("CadCopyLineageSource", fields: [organizationId, sourceCadDocumentId], references: [organizationId, id], onDelete: Restrict)
+
+  // KEY CONSTRAINT - proving sourceFileVersionId actually belongs to
+  // sourceCadDocumentId: the SAME technique as ReleaseBaselineEntry.fileVersion
+  // (see that model's own doc comment for the full reasoning). This FK is
+  // the COMPOSITE (organizationId, sourceCadDocumentId, sourceFileVersionId),
+  // referencing FileVersion's (organizationId, cadDocumentId, id) unique
+  // constraint - because FileVersion's OWN cadDocumentId is part of that
+  // referenced key, the database itself proves the pinned FileVersion
+  // belongs to the pinned source CadDocument; a mismatched pair is a
+  // foreign-key violation, not just an application-level bug that could
+  // slip through. Restrict - the exact version copied from must remain
+  // resolvable for as long as this lineage row exists (FileVersions are
+  // immutable and never deleted in this schema regardless).
+  sourceFileVersionId String
+  sourceFileVersion   FileVersion @relation(fields: [organizationId, sourceCadDocumentId, sourceFileVersionId], references: [organizationId, cadDocumentId, id], onDelete: Restrict)
+
+  // Set from the authenticated actor on the server, never from the client.
+  copiedById String
+  copiedBy   User   @relation(fields: [organizationId, copiedById], references: [organizationId, id], onDelete: Restrict)
+
+  copiedAt DateTime @default(now())
+
+  @@unique([organizationId, id])
+  // Backs the composite FK above (Prisma requires the referenced side of a
+  // to-one relation to be a unique key) - equivalent to the plain
+  // `newCadDocumentId @unique` already declared: no CadDocument can be named
+  // as "new" by more than one lineage row.
+  @@unique([organizationId, newCadDocumentId])
+  @@index([organizationId])
+  @@index([copyDesignOperationId])
+  @@index([sourceCadDocumentId])
+  @@index([copiedById])
+}
+
+// ============================================================
+// COPY DESIGN OPERATION ENTRY  (P6B Round 2, HIGH - immutable replay record)
+//
+// PROBLEM THIS FIXES: an idempotent retry must reconstruct the EXACT
+// original response. The first P6B cut correlated a retry's COPY entries
+// against the CURRENT `CadDocument.documentNumber` - but `documentNumber` is
+// MUTABLE (nothing prevents a later rename). If two documents created by the
+// SAME operation are later renamed (independently, or swapped with each
+// other), that correlation could return the WRONG resultingCadDocumentId, a
+// spurious 404, or a mismatched entry set - silently breaking the promise
+// that a replay reflects what THIS operation actually did.
+//
+// FIX: one row per REQUEST ENTRY (COPY *and* REUSE), written in the SAME
+// transaction as the operation itself, carrying:
+//   - a stable `ordinal` (the entry's position in the ORIGINAL request array
+//     - assigned once, at creation, NEVER recomputed) - the sole correlation
+//     key between a stored entry and the response position it belongs to;
+//   - `resultingCadDocumentId` - the ACTUAL identity this entry resolved to
+//     (the new CadDocument for COPY, the existing one for REUSE) - a stable
+//     id, immutable once written;
+//   - an immutable SNAPSHOT of the display fields (`originalDocumentNumber`
+//     / `originalFileName` / `originalDocumentType` / `originalDescription`)
+//     AS THEY WERE the moment this entry was decided - NEVER re-read from
+//     CURRENT (mutable) CadDocument state on replay, for COPY OR REUSE.
+//
+// A replay reads ONLY this table (ordered by `ordinal`) plus the stable ids
+// it names - it never queries CadDocument's current fields, and never
+// depends on documentNumber, fileName, or any other mutable property to
+// figure out which stored row corresponds to which original request entry.
+//
+// RELATIONSHIP TO CadCopyLineage: CadCopyLineage remains the append-only
+// COPY-specific lineage/audit evidence (source CadDocument + exact source
+// FileVersion a new identity came from) - unchanged by this addition. This
+// table is a SEPARATE concern: complete operation/result REPLAY, covering
+// REUSE entries too (which CadCopyLineage deliberately never records - see
+// its own doc comment). No update/delete API is ever exposed for either.
+// ============================================================
+
+model CopyDesignOperationEntry {
+  id String @id @default(cuid())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  // REQUIRED - every entry belongs to exactly one operation. Restrict - the
+  // same "evidence must outlive the record it names" rule used throughout.
+  copyDesignOperationId String
+  copyDesignOperation   CopyDesignOperation @relation(fields: [organizationId, copyDesignOperationId], references: [organizationId, id], onDelete: Restrict)
+
+  // This entry's position in the ORIGINAL request's `entries` array.
+  // Assigned once, at creation, from array index - NEVER recomputed, NEVER
+  // reordered. The sole stable correlation key for replay.
+  ordinal Int
+
+  action CopyDesignEntryAction
+
+  // COPY only: the source identity copied FROM. Null for REUSE (a REUSE
+  // entry has no "copied from" relationship at all - its only identity IS
+  // resultingCadDocumentId). Restrict - evidence must outlive the document
+  // it names.
+  sourceCadDocumentId String?
+  sourceCadDocument   CadDocument? @relation("CopyDesignOperationEntrySource", fields: [organizationId, sourceCadDocumentId], references: [organizationId, id], onDelete: Restrict, map: "CopyDesignOperationEntry_sourceCadDocument_fkey")
+
+  // COPY only: the EXACT source FileVersion, proven (via the composite FK
+  // below) to belong to sourceCadDocumentId - the SAME technique as
+  // CadCopyLineage.sourceFileVersion. Null for REUSE. A composite FK with a
+  // nullable member is satisfied (never checked) whenever either column is
+  // NULL, so this stays valid for REUSE rows while still being fully
+  // enforced whenever a COPY row supplies both.
+  //
+  // NOTE: explicit `map` names on this and sourceCadDocument's FK above -
+  // without them Prisma's auto-generated (truncated) constraint names
+  // collide for this model (its name is long enough that both FKs' names
+  // truncate to the same prefix).
+  sourceFileVersionId String?
+  sourceFileVersion   FileVersion? @relation(fields: [organizationId, sourceCadDocumentId, sourceFileVersionId], references: [organizationId, cadDocumentId, id], onDelete: Restrict, map: "CopyDesignOperationEntry_sourceFileVersion_fkey")
+
+  // P6B Round 3: a PostgreSQL CHECK constraint
+  // ("CopyDesignOperationEntry_source_shape_matches_action", added by hand
+  // in migration 20260916200612_add_copy_design_operation_entry_source_shape_check
+  // - Prisma's schema DSL cannot express CHECK constraints, exactly like
+  // CadDependency_no_self_reference) additionally enforces that
+  // sourceCadDocumentId/sourceFileVersionId are BOTH non-null for action =
+  // COPY and BOTH null for action = REUSE. The composite FK above only
+  // proves a *non-null* pair belongs together - it does not by itself
+  // forbid a null/non-null mismatch, which is exactly the invalid state
+  // this CHECK closes off at the database level.
+
+  // ALWAYS required: COPY -> the newly-created CadDocument; REUSE -> the
+  // existing reused CadDocument. Restrict - evidence must outlive the
+  // document it names.
+  resultingCadDocumentId String
+  resultingCadDocument   CadDocument @relation("CopyDesignOperationEntryResult", fields: [organizationId, resultingCadDocumentId], references: [organizationId, id], onDelete: Restrict)
+
+  // IMMUTABLE SNAPSHOT of resultingCadDocument's display fields AT THE TIME
+  // this entry was decided - NEVER re-read from CURRENT CadDocument state.
+  // This is what makes replay safe against a later rename of either the
+  // source or the resulting document.
+  originalDocumentNumber String
+  originalFileName       String
+  originalDocumentType   CadDocumentType
+  originalDescription    String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, id])
+  // One entry per position per operation - and the ordinal-uniqueness
+  // backstop that makes "two entries claiming the same position" a
+  // foreign-key-adjacent impossibility, not just an application convention.
+  @@unique([organizationId, copyDesignOperationId, ordinal])
+  @@index([organizationId])
+  @@index([copyDesignOperationId])
+  @@index([sourceCadDocumentId])
+  @@index([resultingCadDocumentId])
 }
