@@ -32,6 +32,7 @@ import { LocalFilesystemStorage } from "../app/lib/storage-core.ts";
 import {
   ActiveCheckoutBlocksUploadError,
   CadDocumentNotFoundError,
+  ReservedCopyDesignTargetError,
   UploadConcurrencyConflictError,
   storeCadFileVersionForActor,
   type UploadGuardDb,
@@ -112,12 +113,21 @@ interface CheckoutRow {
   checkedOutById: string;
 }
 
+interface LineageRow {
+  organizationId: string;
+  newCadDocumentId: string;
+}
+
 class FakeDatabase {
   readonly docs: DocRow[] = [];
   readonly versions: VersionRow[] = [];
   readonly users: UserRow[] = [];
   readonly checkouts: CheckoutRow[] = [];
   readonly events: Array<Record<string, unknown>> = [];
+  // P6C Round 2, HIGH 1: empty by default for every existing test in this
+  // file (none of them are Copy Design reserved targets) - populated only by
+  // the new reserved-target tests below.
+  readonly lineages: LineageRow[] = [];
   readonly #locks = new Map<string, RowLock>();
   transactionAttempts = 0;
 
@@ -135,6 +145,10 @@ class FakeDatabase {
   }
   addCheckout(row: CheckoutRow): this {
     this.checkouts.push(row);
+    return this;
+  }
+  addLineage(organizationId: string, newCadDocumentId: string): this {
+    this.lineages.push({ organizationId, newCadDocumentId });
     return this;
   }
 
@@ -283,6 +297,14 @@ class FakeDatabase {
           return { id: `ev-${randomBytes(6).toString("hex")}` };
         }) as unknown,
       },
+      cadCopyLineage: {
+        findFirst: (async (args: { where: { organizationId: string; newCadDocumentId: string } }) => {
+          const row = self.lineages.find(
+            (l) => l.organizationId === args.where.organizationId && l.newCadDocumentId === args.where.newCadDocumentId,
+          );
+          return row ? { id: `lin-${row.newCadDocumentId}` } : null;
+        }) as unknown,
+      },
     };
   }
 
@@ -308,6 +330,14 @@ class FakeDatabase {
           return row ? self.#hydrateCheckout(row) : null;
         }) as unknown as UploadGuardDb["cadCheckout"]["findFirst"],
       } as unknown as UploadGuardDb["cadCheckout"],
+      cadCopyLineage: {
+        findFirst: (async (args: { where: { organizationId: string; newCadDocumentId: string } }) => {
+          const row = self.lineages.find(
+            (l) => l.organizationId === args.where.organizationId && l.newCadDocumentId === args.where.newCadDocumentId,
+          );
+          return row ? { id: `lin-${row.newCadDocumentId}` } : null;
+        }) as unknown as UploadGuardDb["cadCopyLineage"]["findFirst"],
+      } as unknown as UploadGuardDb["cadCopyLineage"],
       $transaction: (async (fn: (tx: unknown) => Promise<unknown>) => {
         self.transactionAttempts += 1;
         const releases: Array<() => void> = [];
@@ -601,5 +631,110 @@ test("many-way concurrent race between direct uploads and a checkout attempt nev
         "whenever a checkout exists, it must be based on the document's actual current version",
       );
     }
+  });
+});
+
+// ------------------------------------------------------------
+// P6C Round 2, HIGH 1: generic upload must not bypass P6C materialization
+// authority for a P6B-reserved Copy Design target.
+// ------------------------------------------------------------
+
+test("an ORDINARY zero-version CadDocument (no lineage) can still use generic bootstrap upload", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    db.addDoc("orgA", "doc-ordinary");
+    const actor = actorIn("orgA");
+
+    const result = await storeCadFileVersionForActor(actor, "doc-ordinary", textSource("hello"), null, 10_000, db.asUploadGuardDb, storage);
+
+    assert.equal(result.versionNumber, 1);
+    assert.equal(db.versions.length, 1);
+  });
+});
+
+test("a P6B-reserved zero-version Copy Design target CANNOT use generic upload for its first version", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    db.addDoc("orgA", "doc-reserved");
+    db.addLineage("orgA", "doc-reserved");
+    const actor = actorIn("orgA");
+
+    await assert.rejects(
+      () => storeCadFileVersionForActor(actor, "doc-reserved", textSource("hello"), null, 10_000, db.asUploadGuardDb, storage),
+      (err: unknown) => err instanceof ReservedCopyDesignTargetError,
+    );
+    // no FileVersion is created on rejection
+    assert.equal(db.versions.length, 0);
+  });
+});
+
+test("a cross-tenant reserved target is hidden as a normal 404, never leaking the reservation guard", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    db.addDoc("orgA", "doc-reserved");
+    db.addLineage("orgA", "doc-reserved");
+    const actor = actorIn("orgB");
+
+    await assert.rejects(
+      () => storeCadFileVersionForActor(actor, "doc-reserved", textSource("hello"), null, 10_000, db.asUploadGuardDb, storage),
+      (err: unknown) => err instanceof CadDocumentNotFoundError,
+    );
+  });
+});
+
+test("after a valid materialization creates FileVersion 1, normal subsequent generic-upload version behavior resumes (no active checkout)", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    db.addDoc("orgA", "doc-reserved");
+    db.addLineage("orgA", "doc-reserved");
+    // Simulate P6C having already materialized FileVersion 1 (by whatever
+    // path - this test does not care how, only that the guard is gone once
+    // >= 1 FileVersion exists).
+    const storageKey = "org/orgA/doc/doc-reserved/v1/materialized0001";
+    await storage.put(storageKey, Buffer.from("materialized v1 bytes"));
+    db.addVersion({
+      organizationId: "orgA", cadDocumentId: "doc-reserved", id: "fv-materialized-1", versionNumber: 1,
+      originalFileName: "materialized.ipt", storageKey, fileSize: 22, checksum: "irrelevant", createdById: "someone",
+    });
+    const actor = actorIn("orgA");
+
+    const result = await storeCadFileVersionForActor(actor, "doc-reserved", textSource("v2 content"), null, 10_000, db.asUploadGuardDb, storage);
+
+    assert.equal(result.versionNumber, 2);
+    assert.equal(db.versions.length, 2);
+  });
+});
+
+test("concurrent generic upload cannot race P6C first materialization and bypass the guard - whichever locks first, only ONE version 1 (via materialize) ever exists and generic upload never wins the reserved race", async () => {
+  await withTmpDir(async (dir) => {
+    const storage = new LocalFilesystemStorage(dir);
+    const db = new FakeDatabase();
+    db.addDoc("orgA", "doc-reserved");
+    db.addLineage("orgA", "doc-reserved");
+    const actor = actorIn("orgA");
+
+    // Two CONCURRENT generic-upload attempts against the SAME reserved,
+    // zero-version target - simulates a generic upload racing an in-flight
+    // P6C materialization attempt for the same document (P6C's own
+    // materialize-db.ts takes the SAME CadDocument row lock, so from this
+    // guard's point of view a concurrent materializer looks exactly like a
+    // concurrent lock contender that will authoritatively see the SAME
+    // "reserved, zero versions" state once it acquires the lock).
+    const results = await Promise.allSettled([
+      storeCadFileVersionForActor(actor, "doc-reserved", textSource("a"), null, 10_000, db.asUploadGuardDb, storage),
+      storeCadFileVersionForActor(actor, "doc-reserved", textSource("b"), null, 10_000, db.asUploadGuardDb, storage),
+    ]);
+
+    // BOTH must be rejected - the reserved-target guard is authoritative
+    // under the lock and does not depend on which one wins the race.
+    assert.ok(results.every((r) => r.status === "rejected"));
+    assert.ok(
+      results.every((r) => r.status === "rejected" && r.reason instanceof ReservedCopyDesignTargetError),
+    );
+    assert.equal(db.versions.length, 0, "no FileVersion was ever created by either racing generic upload");
   });
 });

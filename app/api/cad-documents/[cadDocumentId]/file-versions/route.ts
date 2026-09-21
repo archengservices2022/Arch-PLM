@@ -4,6 +4,7 @@ import { getActor, assertCanMutate } from "@/app/lib/authz";
 import {
   ActiveCheckoutBlocksUploadError,
   CadDocumentNotFoundError,
+  ReservedCopyDesignTargetError,
   UploadConcurrencyConflictError,
   storeCadFileVersion,
 } from "@/app/lib/storage";
@@ -79,6 +80,9 @@ export async function POST(
       return jsonError(404, error.message);
     }
     if (error instanceof ActiveCheckoutBlocksUploadError) {
+      return jsonError(409, error.message);
+    }
+    if (error instanceof ReservedCopyDesignTargetError) {
       return jsonError(409, error.message);
     }
     if (error instanceof UploadConcurrencyConflictError) {

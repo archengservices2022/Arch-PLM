@@ -15,6 +15,7 @@ import {
   storeCadFileVersionForActor,
   ActiveCheckoutBlocksUploadError,
   CadDocumentNotFoundError,
+  ReservedCopyDesignTargetError,
   UploadConcurrencyConflictError,
   type UploadGuardDb,
 } from "@/app/lib/upload-guard-db";
@@ -46,7 +47,12 @@ export function getStorageProvider(): StorageProvider {
 // Domain errors (mapped to HTTP status in the route handlers)
 // ------------------------------------------------------------
 
-export { ActiveCheckoutBlocksUploadError, CadDocumentNotFoundError, UploadConcurrencyConflictError };
+export {
+  ActiveCheckoutBlocksUploadError,
+  CadDocumentNotFoundError,
+  ReservedCopyDesignTargetError,
+  UploadConcurrencyConflictError,
+};
 
 export class FileVersionNotFoundError extends Error {
   constructor() {

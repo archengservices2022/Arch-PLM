@@ -2,6 +2,39 @@
  * Arch PDM - direct FileVersion upload vs. exclusive checkout guard
  * (P3C-2, Codex HIGH follow-up).
  *
+ * P6C ROUND 2, HIGH 1: this endpoint predates P6B/P6C Copy Design and has no
+ * knowledge of CadCopyLineage - left unguarded, it could create FileVersion 1
+ * for a P6B-RESERVED Copy Design target directly, bypassing every
+ * materialization authority check `copy-design-materialize-db.ts` enforces
+ * (matching CopyDesignOperationId, matching sourceCadDocumentId, matching
+ * documentType, stored-object integrity). The rule added here, enforced
+ * AUTHORITATIVELY inside the SAME CadDocument-row-locked transaction that
+ * already exists for the checkout guard (never merely a route/preflight
+ * check):
+ *
+ *   - a CadDocument that is the NEW target of ANY CadCopyLineage row AND
+ *     currently has ZERO FileVersions is a RESERVED Copy Design target - its
+ *     first FileVersion may be created ONLY through
+ *     `POST /api/desktop/copy-design/materialize/:cadDocumentId`. Direct
+ *     upload is REJECTED (`ReservedCopyDesignTargetError`, 409) for this
+ *     exact state.
+ *   - an ORDINARY CadDocument (no lineage row at all) is COMPLETELY
+ *     UNAFFECTED - direct upload behaves exactly as before.
+ *   - once a Copy Design target has been materialized (it now has >= 1
+ *     FileVersion, by whatever path), it is NO LONGER "zero FileVersions" -
+ *     the guard no longer applies and normal subsequent-version upload
+ *     behavior (still subject to the pre-existing checkout guard) resumes
+ *     unchanged.
+ *
+ * This mirrors the checkout-vs-upload race design one level up: the SAME
+ * `SELECT ... FOR UPDATE` on the CadDocument row that serializes checkout
+ * acquisition against direct upload also serializes this new check against a
+ * concurrent P6C materialization attempt for the SAME document - whichever
+ * transaction commits (or definitively fails) first is authoritative before
+ * the other's lock acquisition can even proceed, so a generic upload can
+ * never slip in and create "version 1" for a reserved target concurrently
+ * with - or racing ahead of - its proper P6C materialization.
+ *
  * Deliberately does NOT import "server-only" and takes `db` / `provider` as
  * required parameters (no singleton defaults), mirroring `checkout-db.ts` /
  * `checkin-db.ts`, so this module stays loadable by the plain Node test
@@ -96,13 +129,26 @@ export class UploadConcurrencyConflictError extends Error {
   }
 }
 
+/** P6C Round 2, HIGH 1: this CadDocument is the NEW target of a
+ *  CadCopyLineage row AND currently has zero FileVersions - a P6B-reserved
+ *  Copy Design target. Its first FileVersion may be created ONLY through
+ *  `POST /api/desktop/copy-design/materialize/:cadDocumentId`. */
+export class ReservedCopyDesignTargetError extends Error {
+  constructor() {
+    super(
+      "This CAD document is a reserved Copy Design target; use Copy Design materialization to create its first FileVersion",
+    );
+    this.name = "ReservedCopyDesignTargetError";
+  }
+}
+
 export { EmptyUploadError, UploadTooLargeError };
 
 /** The slice of PrismaClient this module needs. Narrowed so tests can inject
  *  a lightweight in-memory fake with the same shape. */
 export type UploadGuardDb = Pick<
   PrismaClient,
-  "cadDocument" | "fileVersion" | "cadCheckout" | "$transaction"
+  "cadDocument" | "fileVersion" | "cadCheckout" | "cadCopyLineage" | "$transaction"
 >;
 
 function isUniqueConstraintViolation(error: unknown): boolean {
@@ -122,6 +168,10 @@ function isUniqueConstraintViolation(error: unknown): boolean {
  *   actor's organization (also how cross-tenant access surfaces).
  * @throws ActiveCheckoutBlocksUploadError if any active checkout exists for
  *   the document - including one held by `actor` themself.
+ * @throws ReservedCopyDesignTargetError if this CadDocument is a P6B-reserved
+ *   Copy Design target (CadCopyLineage names it as the new document) that
+ *   still has zero FileVersions - its first FileVersion may only be created
+ *   through P6C's `POST /api/desktop/copy-design/materialize/:cadDocumentId`.
  * @throws UploadConcurrencyConflictError if the bounded SERIALIZABLE retry
  *   under the shared CadDocument lock is exhausted.
  * @throws UploadTooLargeError / EmptyUploadError from the storage layer.
@@ -153,6 +203,27 @@ export async function storeCadFileVersionForActor(
   });
   if (precheck) {
     throw new ActiveCheckoutBlocksUploadError();
+  }
+
+  // P6C Round 2, HIGH 1: same cheap, NON-authoritative pre-check shape -
+  // fail fast, before consuming a potentially large upload, when this is
+  // obviously a P6B-reserved Copy Design target still awaiting its P6C
+  // materialization. The AUTHORITATIVE decision is always the locked
+  // re-check inside persistFileVersionRow below. An ORDINARY CadDocument (no
+  // lineage row) or an ALREADY-materialized one (>= 1 FileVersion already)
+  // is completely unaffected.
+  const anyVersionPrecheck = await db.fileVersion.findFirst({
+    where: { organizationId: actor.organizationId, cadDocumentId: cadDocument.id },
+    select: { id: true },
+  });
+  if (!anyVersionPrecheck) {
+    const lineagePrecheck = await db.cadCopyLineage.findFirst({
+      where: { organizationId: actor.organizationId, newCadDocumentId: cadDocument.id },
+      select: { id: true },
+    });
+    if (lineagePrecheck) {
+      throw new ReservedCopyDesignTargetError();
+    }
   }
 
   const originalFileName = normalizeOriginalFileName(
@@ -204,6 +275,29 @@ export async function storeCadFileVersionForActor(
               throw new ActiveCheckoutBlocksUploadError();
             }
 
+            // P6C Round 2, HIGH 1: the AUTHORITATIVE re-check, under the SAME
+            // CadDocument row lock - never merely a route/preflight check.
+            // Re-reads FRESH inside the lock so a concurrent P6C
+            // materialization racing this exact request is decided
+            // correctly regardless of which transaction's lock acquisition
+            // wins first (see the module doc comment).
+            const currentlyHasAnyVersion = await tx.fileVersion.findFirst({
+              where: {
+                organizationId: actor.organizationId,
+                cadDocumentId: cadDocument.id,
+              },
+              select: { id: true },
+            });
+            if (!currentlyHasAnyVersion) {
+              const lineage = await tx.cadCopyLineage.findFirst({
+                where: { organizationId: actor.organizationId, newCadDocumentId: cadDocument.id },
+                select: { id: true },
+              });
+              if (lineage) {
+                throw new ReservedCopyDesignTargetError();
+              }
+            }
+
             return tx.fileVersion.create({
               data: {
                 organizationId: input.organizationId,
@@ -226,10 +320,10 @@ export async function storeCadFileVersionForActor(
         }
       },
       isVersionNumberConflict(error: unknown) {
-        // ActiveCheckoutBlocksUploadError / UploadConcurrencyConflictError /
-        // CadDocumentNotFoundError are NOT version conflicts - they
-        // propagate straight out; uploadCadFileVersion compensates the
-        // just-promoted object and rethrows without retrying.
+        // ActiveCheckoutBlocksUploadError / ReservedCopyDesignTargetError /
+        // UploadConcurrencyConflictError / CadDocumentNotFoundError are NOT
+        // version conflicts - they propagate straight out; uploadCadFileVersion
+        // compensates the just-promoted object and rethrows without retrying.
         return isUniqueConstraintViolation(error);
       },
     },
