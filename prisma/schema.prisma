@@ -341,6 +341,32 @@ model ItemRevision {
 // pointer to future object storage.
 // ============================================================
 
+// P6D ROUND 2, HIGH fix: `documentNumber` alone used to be the organization-
+// wide unique business key (`@@unique([organizationId, documentNumber])`),
+// which made a normal Inventor model/drawing pair - e.g. "1001.ipt" and
+// "1001.idw", the SAME engineering base number, two DIFFERENT CadDocuments
+// per the PDM CAD architecture rule (ITEM != REVISION != CAD DOC != FILE
+// VERSION - a drawing is its own CadDocument, never the same one as its
+// model) - impossible to both create: Copy Design (or any other creator)
+// deriving `newDocumentNumber` from the destination file name's stem would
+// collide "1001" against itself for the .ipt and the .idw alike.
+//
+// The identity is now SCOPED BY documentType too:
+// `@@unique([organizationId, documentNumber, documentType])`. This is
+// STRICTLY LESS restrictive than before (any data that was valid under the
+// old constraint - documentNumber alone unique per org - remains
+// automatically valid under this one, since documentNumber-uniqueness
+// trivially implies (documentNumber, documentType)-uniqueness), so the
+// migration that changed this is safe to apply over existing data with no
+// possibility of a duplicate-row failure.
+//
+// CONSEQUENCE for number-only resolution: `documentNumber` is no longer
+// guaranteed unique BY ITSELF - a caller resolving "1001" with no
+// documentType now gets 0, 1, or (legitimately) 2+ matches. See
+// `desktop-cad-documents-core.ts` / `-db.ts` for how the bootstrap resolve-
+// by-number endpoint now fails closed (409) on an ambiguous match rather
+// than silently picking one row, and requires documentType (or the stable
+// cadDocumentId) to disambiguate.
 model CadDocument {
   id String @id @default(cuid())
 
@@ -403,7 +429,9 @@ model CadDocument {
   operationEntriesAsResult CopyDesignOperationEntry[] @relation("CopyDesignOperationEntryResult")
 
   @@unique([organizationId, id])
-  @@unique([organizationId, documentNumber])
+  // P6D ROUND 2, HIGH fix: scoped by documentType - see the class doc
+  // comment above for why. Was `@@unique([organizationId, documentNumber])`.
+  @@unique([organizationId, documentNumber, documentType])
   @@index([organizationId])
   @@index([createdById])
 }

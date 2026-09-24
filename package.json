@@ -21,7 +21,13 @@
     "fixture:p6c-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p6c-manual.ts --cleanup",
     "itest:p4c-checkout": "node --experimental-strip-types --env-file=.env scripts/itest-p4c-checkout.ts",
     "itest:p6b-copy-design": "node --experimental-strip-types --env-file=.env scripts/itest-p6b-copy-design.ts",
-    "itest:p6c-materialize": "node --experimental-strip-types --env-file=.env scripts/itest-p6c-materialize.ts"
+    "itest:p6c-materialize": "node --experimental-strip-types --env-file=.env scripts/itest-p6c-materialize.ts",
+    "fixture:p6d-manual": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-manual.ts",
+    "fixture:p6d-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-manual.ts --cleanup",
+    "fixture:p6d-nested-manual": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-nested-manual.ts",
+    "fixture:p6d-nested-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-nested-manual.ts --cleanup",
+    "itest:p6d-document-number-scoping": "node --experimental-strip-types --env-file=.env scripts/itest-p6d-document-number-scoping.ts",
+    "itest:p6d-operation-status": "node --experimental-strip-types --env-file=.env scripts/itest-p6d-operation-status.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

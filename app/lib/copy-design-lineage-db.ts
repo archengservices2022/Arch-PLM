@@ -102,16 +102,32 @@ export class CopyDesignSourceNotFoundError extends Error {
   }
 }
 
-/** Thrown when one or more proposed destination documentNumbers already
- *  exist in the tenant. Carries only the CLIENT'S OWN proposed numbers -
- *  never anything about who else might hold them. No overwrite, no
- *  auto-rename: the caller must choose different numbers and retry. */
+/** One (documentNumber, documentType) PAIR that collided against an
+ *  EXISTING document - P6D ROUND 2, HIGH fix: a collision is now scoped by
+ *  type, matching `CadDocument`'s `@@unique([organizationId, documentNumber,
+ *  documentType])` - the SAME documentNumber with a DIFFERENT documentType
+ *  is never a collision. */
+export interface CopyDesignConflictingDestination {
+  documentNumber: string;
+  documentType: string;
+}
+
+/** Thrown when one or more proposed destination (documentNumber,
+ *  documentType) pairs already exist in the tenant. Carries only the
+ *  CLIENT'S OWN proposed pairs - never anything about who else might hold
+ *  them. No overwrite, no auto-rename: the caller must choose a different
+ *  number or type and retry. */
 export class CopyDesignDestinationConflictError extends Error {
+  readonly conflictingDestinations: readonly CopyDesignConflictingDestination[];
+  /** @deprecated Back-compat projection of `conflictingDestinations` -
+   *  the bare documentNumber strings, deduplicated, with no type
+   *  information. Prefer `conflictingDestinations`. */
   readonly conflictingDocumentNumbers: readonly string[];
-  constructor(conflictingDocumentNumbers: readonly string[]) {
+  constructor(conflictingDestinations: readonly CopyDesignConflictingDestination[]) {
     super("One or more destination document numbers already exist in your organization");
     this.name = "CopyDesignDestinationConflictError";
-    this.conflictingDocumentNumbers = conflictingDocumentNumbers;
+    this.conflictingDestinations = conflictingDestinations;
+    this.conflictingDocumentNumbers = [...new Set(conflictingDestinations.map((d) => d.documentNumber))];
   }
 }
 
@@ -186,11 +202,15 @@ const KNOWN_UNIQUE_CONSTRAINTS = {
     fields: ["organizationId", "idempotencyKey"],
     indexName: "CopyDesignOperation_organizationId_idempotencyKey_key",
   },
-  /** CadDocument's `@@unique([organizationId, documentNumber])` - see
-   *  20260903144453_add_item_revision_document_links/migration.sql. */
-  documentNumber: {
-    fields: ["organizationId", "documentNumber"],
-    indexName: "CadDocument_organizationId_documentNumber_key",
+  /** CadDocument's `@@unique([organizationId, documentNumber, documentType])`
+   *  - see 20260921183016_scope_document_number_uniqueness_by_type/migration.sql.
+   *  P6D ROUND 2, HIGH fix: was `@@unique([organizationId, documentNumber])`
+   *  (index `CadDocument_organizationId_documentNumber_key`) - scoped by
+   *  documentType too, so a model/drawing pair sharing one engineering
+   *  number no longer collides. */
+  documentNumberAndType: {
+    fields: ["organizationId", "documentNumber", "documentType"],
+    indexName: "CadDocument_organizationId_documentNumber_documentType_key",
   },
   /** CopyDesignOperationEntry's `@@unique([organizationId,
    *  copyDesignOperationId, ordinal])` - PostgreSQL's 63-byte identifier
@@ -418,22 +438,35 @@ async function applyWithinTransaction(
     }
   }
 
-  // Destination collision against EXISTING documents. (Intra-request
-  // collisions were already rejected by parseCopyDesignApplyRequest.)
-  const proposedNumbers = [
-    ...new Set(
+  // Destination collision against EXISTING documents, scoped by
+  // (documentNumber, documentType) - P6D ROUND 2, HIGH fix: the SAME
+  // documentNumber with a DIFFERENT documentType (e.g. "1001.ipt" and
+  // "1001.idw") is explicitly NOT a collision, matching CadDocument's
+  // `@@unique([organizationId, documentNumber, documentType])`. (Intra-
+  // request collisions were already rejected by parseCopyDesignApplyRequest,
+  // using the SAME (number, type) pairing.)
+  const proposedPairs = [
+    ...new Map(
       resolved
         .filter((item): item is Extract<ResolvedEntry, { kind: "copy" }> => item.kind === "copy")
-        .map((item) => item.entry.newDocumentNumber),
-    ),
+        .map((item) => {
+          const documentType = CadDocumentType[item.entry.documentType as keyof typeof CadDocumentType];
+          return [`${item.entry.newDocumentNumber}\u0000${documentType}`, { documentNumber: item.entry.newDocumentNumber, documentType }] as const;
+        }),
+    ).values(),
   ];
-  if (proposedNumbers.length > 0) {
+  if (proposedPairs.length > 0) {
     const collisions = await tx.cadDocument.findMany({
-      where: { organizationId: actor.organizationId, documentNumber: { in: proposedNumbers } },
-      select: { documentNumber: true },
+      where: {
+        organizationId: actor.organizationId,
+        OR: proposedPairs.map((pair) => ({ documentNumber: pair.documentNumber, documentType: pair.documentType })),
+      },
+      select: { documentNumber: true, documentType: true },
     });
     if (collisions.length > 0) {
-      throw new CopyDesignDestinationConflictError(collisions.map((row) => row.documentNumber));
+      throw new CopyDesignDestinationConflictError(
+        collisions.map((row) => ({ documentNumber: row.documentNumber, documentType: String(row.documentType) })),
+      );
     }
   }
 
@@ -658,9 +691,9 @@ export async function applyCopyDesignOperationForActor(
       // it as anything else.
       throw new CopyDesignConcurrencyConflictError();
     }
-    if (matchesKnownUniqueConstraint(target, KNOWN_UNIQUE_CONSTRAINTS.documentNumber)) {
+    if (matchesKnownUniqueConstraint(target, KNOWN_UNIQUE_CONSTRAINTS.documentNumberAndType)) {
       // A concurrent, unrelated operation created a CadDocument with one of
-      // our proposed destination numbers first.
+      // our proposed destination (documentNumber, documentType) pairs first.
       throw new CopyDesignDestinationConflictError([]);
     }
     if (matchesKnownUniqueConstraint(target, KNOWN_UNIQUE_CONSTRAINTS.operationEntryOrdinal)) {
@@ -718,7 +751,11 @@ export async function copyDesignApplyHttpResult(
         status: 409,
         body: {
           error: error.message,
+          // Back-compat: bare numbers, deduplicated, no type information.
           conflictingDocumentNumbers: error.conflictingDocumentNumbers,
+          // P6D ROUND 2: the precise (documentNumber, documentType) pairs
+          // that actually collided.
+          conflictingDestinations: error.conflictingDestinations,
         },
       };
     }

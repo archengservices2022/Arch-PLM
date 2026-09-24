@@ -100,6 +100,77 @@ test("rejects an entries array over the hard cap", () => {
 });
 
 // ------------------------------------------------------------
+// P6D FINAL BLOCKER FIX: newFileName path-containment hardening at the
+// reservation boundary (end-to-end through parseCopyDesignApplyRequest,
+// not just the underlying isSafeCadBaseName unit - see
+// cad-basename-core.test.ts for the exhaustive predicate-level coverage).
+// ------------------------------------------------------------
+
+test("rejects every adversarial newFileName from the P6D durable-resume escape report", () => {
+  const attacks = [
+    "..\\P6D-EVIL.ipt",
+    "../P6D-EVIL.ipt",
+    "C:\\Temp\\evil.ipt",
+    "\\\\server\\share\\evil.ipt",
+    "subdir\\evil.ipt",
+    "subdir/evil.ipt",
+    ".",
+    "..",
+    "evil.",
+    "evil ",
+    "CON.ipt",
+    "con.ipt",
+    "COM1.iam",
+    "LPT9.idw",
+  ];
+  for (const newFileName of attacks) {
+    assert.throws(
+      () => parseCopyDesignApplyRequest({ idempotencyKey: "k", entries: [copyEntry({ newFileName })] }),
+      (err: unknown) => err instanceof CopyDesignValidationError && err.status === 400,
+      `expected newFileName ${JSON.stringify(newFileName)} to be rejected`,
+    );
+  }
+});
+
+test("accepts ordinary valid IAM/IPT/IDW/DWG names at the reservation boundary", () => {
+  const validNames = [
+    ["P6DNEW-ROOT.iam", "IAM"],
+    ["1001.idw", "IDW"],
+    ["A B-C_01.ipt", "IPT"],
+    ["weld_assembly-01.dwg", "DWG"],
+  ] as const;
+  for (const [newFileName, documentType] of validNames) {
+    const request = parseCopyDesignApplyRequest({
+      idempotencyKey: "k",
+      entries: [copyEntry({ newFileName, documentType })],
+    });
+    assert.equal((request.entries[0] as { newFileName: string }).newFileName, newFileName);
+  }
+});
+
+test("newFileName safety is validated independently of newDocumentNumber - a matching documentNumber never excuses an unsafe newFileName", () => {
+  assert.throws(
+    () =>
+      parseCopyDesignApplyRequest({
+        idempotencyKey: "k",
+        entries: [copyEntry({ newDocumentNumber: "..\\P6D-EVIL", newFileName: "..\\P6D-EVIL.ipt" })],
+      }),
+    (err: unknown) => err instanceof CopyDesignValidationError,
+  );
+  // Conversely, an unsafe newFileName is rejected even when newDocumentNumber
+  // is itself perfectly ordinary - the two fields are checked on their own
+  // terms, never cross-validated against each other.
+  assert.throws(
+    () =>
+      parseCopyDesignApplyRequest({
+        idempotencyKey: "k",
+        entries: [copyEntry({ newDocumentNumber: "10137-P001", newFileName: "subdir/evil.ipt" })],
+      }),
+    (err: unknown) => err instanceof CopyDesignValidationError,
+  );
+});
+
+// ------------------------------------------------------------
 // Canonicalization / idempotent-retry comparison
 // ------------------------------------------------------------
 

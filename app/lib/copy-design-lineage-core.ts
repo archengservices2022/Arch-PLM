@@ -2,6 +2,18 @@
  * Arch PLM - Copy Design identity reservation + lineage: request shape,
  * canonicalization, and DTOs (P6B, provider-agnostic).
  *
+ * P6D FINAL BLOCKER FIX: `newFileName` is validated with the shared
+ * `isSafeCadBaseName` (`cad-basename-core.ts`) - see that module's doc
+ * comment. This is the ONLY place `newFileName` is ever written into a
+ * persisted `CopyDesignOperationEntry` row (`copy-design-lineage-db.ts`),
+ * and the durable-resume operation-status endpoint later echoes that same
+ * stored value back verbatim as `originalFileName` - so hardening it HERE,
+ * before anything is ever persisted, protects every later reader (this
+ * server's own status endpoint included, and the desktop client, which
+ * independently re-validates on its own side too - see that module's doc
+ * comment for why a client can never simply trust an already-validated
+ * server).
+ *
  * Pure module: no `@/` imports, no Prisma, no framework - only the type
  * system. Holds:
  *   - the request/response DTO shapes this milestone's API exposes;
@@ -27,6 +39,7 @@
  * `description` are DESTINATION METADATA the caller supplies for the NEW
  * CadDocument row - never used as identity, never used to look anything up.
  */
+import { isSafeCadBaseName } from "./cad-basename-core.ts";
 
 export const COPY_DESIGN_APPLY_CONTRACT = "arch-plm.copy-design-apply.v1";
 
@@ -161,6 +174,38 @@ function parseDocumentType(value: unknown, index: number): CadDocumentTypeValue 
   return value as CadDocumentTypeValue;
 }
 
+/**
+ * P6D FINAL BLOCKER FIX: `newFileName` must be exactly ONE safe file name
+ * component - see `isSafeCadBaseName`'s own doc comment for the exact
+ * blocklist. Validated INDEPENDENTLY of `newDocumentNumber` (a plain
+ * business-key string with its own `requiredNonBlankString` check, never
+ * itself used to build a filesystem path here) - a caller cannot satisfy
+ * this by making the two fields agree; each is checked on its own terms.
+ * Fails closed with the SAME `CopyDesignValidationError` (400) every other
+ * malformed-entry case already uses - never silently sanitized/rewritten.
+ *
+ * Deliberately does NOT trim before checking (unlike `requiredNonBlankString`,
+ * used for every other field): trimming FIRST would silently turn a
+ * trailing-space attack ("evil ") into an accepted, sanitized "evil" -
+ * exactly the "do not silently sanitize" the task forbids. The raw value is
+ * checked as-is, and the raw (untouched) value is what gets stored.
+ */
+function parseSafeNewFileName(value: unknown, index: number): string {
+  if (typeof value !== "string") {
+    throw new CopyDesignValidationError(`entries[${index}].newFileName is required.`);
+  }
+  if (value.length > MAX_FIELD_LENGTH) {
+    throw new CopyDesignValidationError(`entries[${index}].newFileName is too long.`);
+  }
+  const result = isSafeCadBaseName(value);
+  if (!result.safe) {
+    throw new CopyDesignValidationError(
+      `entries[${index}].newFileName is not a safe file name (${result.reason}).`,
+    );
+  }
+  return value;
+}
+
 function parseOptionalDescription(value: unknown, index: number): string | null {
   if (value === undefined || value === null) {
     return null;
@@ -202,7 +247,7 @@ function parseEntry(raw: unknown, index: number): CopyDesignEntry {
         `entries[${index}].sourceFileVersionId`,
       ),
       newDocumentNumber: requiredNonBlankString(entry.newDocumentNumber, `entries[${index}].newDocumentNumber`),
-      newFileName: requiredNonBlankString(entry.newFileName, `entries[${index}].newFileName`),
+      newFileName: parseSafeNewFileName(entry.newFileName, index),
       documentType: parseDocumentType(entry.documentType, index),
       description: parseOptionalDescription(entry.description, index),
     };
@@ -225,9 +270,16 @@ function parseEntry(raw: unknown, index: number): CopyDesignEntry {
  * @throws CopyDesignValidationError (400) for any shape problem: missing
  *   idempotencyKey, empty/oversized entries array, an entry with an unknown
  *   action or missing required fields, an invalid documentType, or two COPY
- *   entries within the SAME request proposing the same newDocumentNumber
- *   (an intra-request destination collision - the DB-level collision check
- *   against EXISTING documents happens separately in the db module).
+ *   entries within the SAME request proposing the same (newDocumentNumber,
+ *   documentType) PAIR (an intra-request destination collision - the DB-
+ *   level collision check against EXISTING documents happens separately in
+ *   the db module). P6D ROUND 2, HIGH fix: this is scoped by documentType,
+ *   matching `CadDocument`'s `@@unique([organizationId, documentNumber,
+ *   documentType])` - two COPY entries proposing the SAME documentNumber
+ *   but DIFFERENT documentTypes (e.g. "1001.ipt" and "1001.idw" - the normal
+ *   Inventor model/drawing pair) are explicitly ALLOWED, never rejected as a
+ *   collision; only the SAME (documentNumber, documentType) pair twice is a
+ *   real collision.
  */
 export function parseCopyDesignApplyRequest(body: unknown): CopyDesignApplyRequest {
   if (typeof body !== "object" || body === null) {
@@ -247,17 +299,22 @@ export function parseCopyDesignApplyRequest(body: unknown): CopyDesignApplyReque
 
   const entries = raw.entries.map((entry, index) => parseEntry(entry, index));
 
-  const seenDestinationNumbers = new Set<string>();
+  const seenDestinations = new Set<string>();
   for (const entry of entries) {
     if (entry.action !== "COPY") {
       continue;
     }
-    if (seenDestinationNumbers.has(entry.newDocumentNumber)) {
+    // NUL-separated compound key: documentType values never contain NUL, so
+    // this can never collide two DIFFERENT (number, type) pairs onto the
+    // same key the way plain string concatenation could.
+    const key = `${entry.newDocumentNumber}\u0000${entry.documentType}`;
+    if (seenDestinations.has(key)) {
       throw new CopyDesignValidationError(
-        `Duplicate destination documentNumber "${entry.newDocumentNumber}" within one request.`,
+        `Duplicate destination documentNumber "${entry.newDocumentNumber}" for documentType `
+          + `"${entry.documentType}" within one request.`,
       );
     }
-    seenDestinationNumbers.add(entry.newDocumentNumber);
+    seenDestinations.add(key);
   }
 
   return { idempotencyKey, label, entries };

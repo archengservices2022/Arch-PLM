@@ -170,28 +170,41 @@ class FakeDatabase {
             (d) =>
               d.organizationId === where.organizationId &&
               (where.id === undefined || d.id === where.id) &&
-              (where.documentNumber === undefined || d.documentNumber === where.documentNumber),
+              (where.documentNumber === undefined || d.documentNumber === where.documentNumber) &&
+              (where.documentType === undefined || d.documentType === where.documentType),
           );
           return row ? { ...row } : null;
         }) as unknown,
+        // P6D ROUND 2: mirrors the REAL query shapes copy-design-lineage-db.ts
+        // now sends - either `{ id: { in } }` (unchanged) or
+        // `{ OR: [{ documentNumber, documentType }, ...] }` (the new,
+        // type-scoped collision check) - never the old flat
+        // `{ documentNumber: { in } }` shape.
         findMany: (async ({ where }: { where: Record<string, unknown> }) => {
           const idFilter = (where.id as { in?: string[] } | undefined)?.in;
-          const numberFilter = (where.documentNumber as { in?: string[] } | undefined)?.in;
+          const orFilter = where.OR as Array<{ documentNumber: string; documentType: string }> | undefined;
           return self.cadDocuments
             .filter(
               (d) =>
                 d.organizationId === where.organizationId &&
                 (idFilter === undefined || idFilter.includes(d.id)) &&
-                (numberFilter === undefined || numberFilter.includes(d.documentNumber)),
+                (orFilter === undefined ||
+                  orFilter.some((pair) => pair.documentNumber === d.documentNumber && pair.documentType === d.documentType)),
             )
             .map((d) => ({ ...d }));
         }) as unknown,
         create: (async ({ data }: { data: Record<string, unknown> }) => {
+          // P6D ROUND 2: scoped by (organizationId, documentNumber,
+          // documentType) - matches the real CadDocument unique constraint
+          // after 20260921183016_scope_document_number_uniqueness_by_type.
           const conflict = self.cadDocuments.some(
-            (d) => d.organizationId === data.organizationId && d.documentNumber === data.documentNumber,
+            (d) =>
+              d.organizationId === data.organizationId &&
+              d.documentNumber === data.documentNumber &&
+              d.documentType === data.documentType,
           );
           if (conflict) {
-            throw new FakeP2002Error(["organizationId", "documentNumber"]);
+            throw new FakeP2002Error(["organizationId", "documentNumber", "documentType"]);
           }
           const row: DocRow = {
             id: `new_doc_${++self.docSeq}`,
@@ -566,6 +579,102 @@ test("destination documentNumber collision against an EXISTING document fails cl
     },
   );
   assert.equal(fake.cadDocuments.length, 2); // source + the pre-existing collider only
+});
+
+// P6D ROUND 2, HIGH fix: the SAME documentNumber with a DIFFERENT
+// documentType is explicitly NOT a collision - a model and its drawing
+// sharing one engineering base number, e.g. "1001.ipt" and "1001.idw".
+test("the SAME documentNumber with a DIFFERENT documentType against an EXISTING document is NOT a collision", async () => {
+  const fake = new FakeDatabase();
+  setupSource(fake);
+  fake.addCadDocument({ organizationId: "orgA", id: "existing_idw", documentNumber: "10137-P001", documentType: "IDW" });
+
+  const result = await applyCopyDesignOperationForActor(
+    actorIn("orgA"),
+    { idempotencyKey: "op-same-number-diff-type", entries: [copyEntry({ documentType: "IPT" })] },
+    fake.db,
+  );
+
+  assert.equal(result.entries[0]!.documentType, "IPT");
+  assert.equal(fake.cadDocuments.length, 3); // source + pre-existing IDW + the new IPT
+});
+
+// required test: 1001.ipt + 1001.idw coexist within ONE Copy Design
+// operation (a drawing and its model copied together, sharing one number).
+test("one operation can COPY the SAME documentNumber as BOTH an IPT and an IDW - they coexist", async () => {
+  const fake = new FakeDatabase();
+  setupSource(fake);
+  fake.addCadDocument({ organizationId: "orgA", id: "src_drawing", documentNumber: "10073-DWG-SRC", documentType: "IDW" });
+  fake.addFileVersion({ organizationId: "orgA", cadDocumentId: "src_drawing", id: "src_drawing_fv1", versionNumber: 1 });
+
+  const result = await applyCopyDesignOperationForActor(
+    actorIn("orgA"),
+    {
+      idempotencyKey: "op-model-and-drawing-pair",
+      entries: [
+        copyEntry({ newDocumentNumber: "1001", newFileName: "1001.ipt", documentType: "IPT" }),
+        copyEntry({
+          sourceCadDocumentId: "src_drawing",
+          sourceFileVersionId: "src_drawing_fv1",
+          newDocumentNumber: "1001",
+          newFileName: "1001.idw",
+          documentType: "IDW",
+        }),
+      ],
+    },
+    fake.db,
+  );
+
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0]!.documentNumber, "1001");
+  assert.equal(result.entries[0]!.documentType, "IPT");
+  assert.equal(result.entries[1]!.documentNumber, "1001");
+  assert.equal(result.entries[1]!.documentType, "IDW");
+  assert.notEqual(result.entries[0]!.resultingCadDocumentId, result.entries[1]!.resultingCadDocumentId);
+});
+
+// required test: duplicate same number + SAME type within one request is
+// still rejected (intra-request check, now type-aware).
+test("two COPY entries with the SAME documentNumber AND the SAME documentType within one request are rejected", async () => {
+  const fake = new FakeDatabase();
+  setupSource(fake);
+
+  await assert.rejects(
+    () =>
+      applyCopyDesignOperationForActor(
+        actorIn("orgA"),
+        {
+          idempotencyKey: "op-intra-request-same-type",
+          entries: [
+            copyEntry({ newDocumentNumber: "1001", newFileName: "1001.ipt", documentType: "IPT" }),
+            copyEntry({ newDocumentNumber: "1001", newFileName: "1001-b.ipt", documentType: "IPT" }),
+          ],
+        },
+        fake.db,
+      ),
+    (err: unknown) => err instanceof CopyDesignValidationError,
+  );
+});
+
+// same documentNumber, DIFFERENT type, within one request - allowed at the
+// PARSE level (the DB-level test above proves the full apply path too).
+test("two COPY entries with the SAME documentNumber but DIFFERENT documentTypes within one request are allowed", async () => {
+  const fake = new FakeDatabase();
+  setupSource(fake);
+
+  const result = await applyCopyDesignOperationForActor(
+    actorIn("orgA"),
+    {
+      idempotencyKey: "op-intra-request-diff-type",
+      entries: [
+        copyEntry({ newDocumentNumber: "1001", newFileName: "1001.ipt", documentType: "IPT" }),
+        copyEntry({ newDocumentNumber: "1001", newFileName: "1001.iam", documentType: "IAM" }),
+      ],
+    },
+    fake.db,
+  );
+
+  assert.equal(result.entries.length, 2);
 });
 
 test("a failed multi-entry operation leaves NO partial new identities behind", async () => {
@@ -1105,7 +1214,9 @@ test("a P2002 on the operation-entry ordinal constraint is reported as a concurr
 // ------------------------------------------------------------
 
 const IDEMPOTENCY_KEY_INDEX_NAME = "CopyDesignOperation_organizationId_idempotencyKey_key";
-const DOCUMENT_NUMBER_INDEX_NAME = "CadDocument_organizationId_documentNumber_key";
+// P6D ROUND 2, HIGH fix: was "CadDocument_organizationId_documentNumber_key"
+// - see 20260921183016_scope_document_number_uniqueness_by_type/migration.sql.
+const DOCUMENT_NUMBER_INDEX_NAME = "CadDocument_organizationId_documentNumber_documentType_key";
 const OPERATION_ENTRY_ORDINAL_INDEX_NAME = "CopyDesignOperationEntry_organizationId_copyDesignOperation_key";
 
 test("a STRING-shaped meta.target with the EXACT idempotencyKey index name is recognized (fails closed since no real committed row exists to reconcile)", async () => {
@@ -1185,14 +1296,35 @@ test("an ARRAY-shaped meta.target that is a SUPERSET of a known field set is NOT
   );
 });
 
-test("an ARRAY-shaped meta.target with the EXACT documentNumber field set is recognized as a destination collision", async () => {
+test("an ARRAY-shaped meta.target with the EXACT documentNumber+documentType field set is recognized as a destination collision", async () => {
+  const fake = new FakeDatabase();
+  setupSource(fake);
+  const db = dbWithPoisonedCreate(
+    fake,
+    "cadDocument",
+    new FakeP2002Error(["organizationId", "documentNumber", "documentType"]),
+  );
+
+  await assert.rejects(
+    () => applyCopyDesignOperationForActor(actorIn("orgA"), { idempotencyKey: "op-array-docnumber", entries: [copyEntry()] }, db),
+    (err: unknown) => err instanceof CopyDesignDestinationConflictError,
+  );
+});
+
+// P6D ROUND 2: the OLD (pre-migration) two-column target must NEVER still
+// match - it is a SUBSET of the new three-column constraint, and an exact-
+// set match must reject a subset just as it rejects a superset.
+test("an ARRAY-shaped meta.target with only the OLD two-column documentNumber field set is NOT classified as a destination collision", async () => {
   const fake = new FakeDatabase();
   setupSource(fake);
   const db = dbWithPoisonedCreate(fake, "cadDocument", new FakeP2002Error(["organizationId", "documentNumber"]));
 
   await assert.rejects(
-    () => applyCopyDesignOperationForActor(actorIn("orgA"), { idempotencyKey: "op-array-docnumber", entries: [copyEntry()] }, db),
-    (err: unknown) => err instanceof CopyDesignDestinationConflictError,
+    () => applyCopyDesignOperationForActor(actorIn("orgA"), { idempotencyKey: "op-array-old-docnumber", entries: [copyEntry()] }, db),
+    (err: unknown) =>
+      !(err instanceof CopyDesignConcurrencyConflictError) &&
+      !(err instanceof CopyDesignDestinationConflictError) &&
+      (err as { code?: string }).code === "P2002",
   );
 });
 

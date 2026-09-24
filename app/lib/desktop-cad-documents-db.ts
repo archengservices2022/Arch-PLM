@@ -33,10 +33,21 @@ export type DesktopCadDocDb = Pick<PrismaClient, "cadDocument">;
 const NOT_FOUND_MESSAGE =
   "No CAD document matched that lookup in your organization.";
 
+/** P6D ROUND 2, HIGH fix: documentNumber alone is no longer guaranteed
+ *  unique (see `desktop-cad-documents-core.ts`'s own doc comment) - a
+ *  number-only query that matches more than one document (e.g. "1001.ipt"
+ *  AND "1001.idw" both exist) is AMBIGUOUS and must never silently resolve
+ *  to an arbitrary one of them. */
+const AMBIGUOUS_MESSAGE =
+  "More than one CAD document shares that documentNumber - specify documentType or use cadDocumentId.";
+
 /**
  * Resolve a tenant document (by number or by id) to its authoritative
  * identity. Throws `DesktopCadDocError(404)` when nothing matches in the
  * actor's organization - the message never restates the lookup value.
+ * Throws `DesktopCadDocError(409)` when a number-only query (no
+ * documentType given) matches more than one document - fails closed rather
+ * than picking one arbitrarily.
  */
 export async function resolveCadDocumentForActor(
   actor: Actor,
@@ -45,8 +56,39 @@ export async function resolveCadDocumentForActor(
 ): Promise<ResolvedCadDocumentDto> {
   const where =
     query.kind === "documentNumber"
-      ? { organizationId: actor.organizationId, documentNumber: query.value }
+      ? {
+          organizationId: actor.organizationId,
+          documentNumber: query.value,
+          ...(query.documentType !== null ? { documentType: query.documentType } : {}),
+        }
       : { organizationId: actor.organizationId, id: query.value };
+
+  // A typed documentNumber query, or a cadDocumentId query, is unambiguous
+  // by construction (the unique constraint / primary key guarantees at most
+  // one row) - findFirst is sufficient and unchanged for those. ONLY an
+  // UNTYPED documentNumber query can legitimately match more than one row
+  // now, so ONLY that case pays for findMany + an ambiguity check.
+  if (query.kind === "documentNumber" && query.documentType === null) {
+    const rows = await db.cadDocument.findMany({
+      where,
+      select: { id: true, documentNumber: true, fileName: true, documentType: true },
+      take: 2,
+    });
+    if (rows.length === 0) {
+      throw new DesktopCadDocError(404, NOT_FOUND_MESSAGE);
+    }
+    if (rows.length > 1) {
+      throw new DesktopCadDocError(409, AMBIGUOUS_MESSAGE);
+    }
+    const row = rows[0]!;
+    return {
+      contract: DESKTOP_CAD_DOC_CONTRACT,
+      cadDocumentId: row.id,
+      documentNumber: row.documentNumber,
+      fileName: row.fileName,
+      cadType: String(row.documentType),
+    };
+  }
 
   const row = await db.cadDocument.findFirst({
     where,
