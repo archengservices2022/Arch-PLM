@@ -27,7 +27,8 @@
     "fixture:p6d-nested-manual": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-nested-manual.ts",
     "fixture:p6d-nested-manual:cleanup": "node --experimental-strip-types --env-file=.env scripts/fixture-p6d-nested-manual.ts --cleanup",
     "itest:p6d-document-number-scoping": "node --experimental-strip-types --env-file=.env scripts/itest-p6d-document-number-scoping.ts",
-    "itest:p6d-operation-status": "node --experimental-strip-types --env-file=.env scripts/itest-p6d-operation-status.ts"
+    "itest:p6d-operation-status": "node --experimental-strip-types --env-file=.env scripts/itest-p6d-operation-status.ts",
+    "itest:p6e-verification-support": "node --experimental-strip-types --env-file=.env scripts/itest-p6e-verification-support.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
