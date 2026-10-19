@@ -377,6 +377,42 @@ class IdempotentReplaySignal extends Error {
   }
 }
 
+/** FileVersion's `@@unique([cadDocumentId, versionNumber])`, by its EXACT
+ *  column set (array-shaped `meta.target`) and its EXACT index name
+ *  (string-shaped) - see
+ *  20260903135817_add_cad_documents_and_file_versions/migration.sql. */
+const FILE_VERSION_NUMBER_UNIQUE = {
+  fields: ["cadDocumentId", "versionNumber"],
+  indexName: "FileVersion_cadDocumentId_versionNumber_key",
+} as const;
+
+/**
+ * Milestone 3A, D-1: true iff `error` is a P2002 on EXACTLY the FileVersion
+ * version-number unique constraint. Under SERIALIZABLE, the losing request
+ * of a concurrent first-version race can read a snapshot that predates the
+ * winner's commit (so it sees no version 1) and collide only at INSERT -
+ * which PostgreSQL may report as a unique violation (P2002) instead of a
+ * retryable serialization failure. Any other P2002 - a different
+ * constraint, a subset/superset column set, or an unreadable target - is
+ * NOT this conflict and must never be reclassified.
+ */
+function isFileVersionNumberConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || (error as { code?: unknown }).code !== "P2002") {
+    return false;
+  }
+  const meta = (error as { meta?: unknown }).meta;
+  const target =
+    meta && typeof meta === "object" && "target" in meta ? (meta as { target: unknown }).target : undefined;
+  if (typeof target === "string") {
+    return target === FILE_VERSION_NUMBER_UNIQUE.indexName;
+  }
+  return (
+    Array.isArray(target) &&
+    target.length === FILE_VERSION_NUMBER_UNIQUE.fields.length &&
+    FILE_VERSION_NUMBER_UNIQUE.fields.every((field) => target.includes(field))
+  );
+}
+
 /**
  * Materialize FileVersion 1 for a P6B-reserved Copy Design target.
  *
@@ -385,7 +421,8 @@ class IdempotentReplaySignal extends Error {
  * @throws CopyDesignMaterializeInvalidStateError (409) if the target's
  *   FileVersion state is neither "zero rows" nor "exactly one, versionNumber 1".
  * @throws CopyDesignAlreadyMaterializedError (409) if FileVersion 1 already
- *   exists with different content.
+ *   exists with different content - including when a concurrent winner
+ *   commits it first and this request only collides at INSERT (D-1).
  * @throws CopyDesignMaterializeIntegrityError (500) if an existing
  *   FileVersion 1's ACTUAL stored object cannot be verified as healthy and
  *   matching before replay would be reported.
@@ -532,6 +569,23 @@ export async function materializeFirstFileVersionForActor(
       }
       if (error instanceof SerializableTransactionExhaustedError) {
         throw new CopyDesignMaterializeConcurrencyConflictError();
+      }
+      if (isFileVersionNumberConflict(error)) {
+        // D-1: a concurrent winner committed FileVersion 1 after this
+        // transaction's snapshot. Re-read the now-committed state and
+        // resolve it exactly like the in-transaction replayCandidate branch.
+        // Nothing visible (or anything unexpected) -> the original error.
+        const committed = await classifyFileVersionState(db, actor.organizationId, meta.cadDocumentId);
+        if (committed.kind === "malformed") {
+          throw new CopyDesignMaterializeInvalidStateError();
+        }
+        if (committed.kind === "replayCandidate") {
+          if (committed.row.checksum !== staged.sha256 || Number(committed.row.fileSize) !== staged.size) {
+            throw new CopyDesignAlreadyMaterializedError();
+          }
+          await verifyReplayIntegrity(provider, committed.row, staged);
+          return { ...toResultDto(committed.row, meta.cadDocumentId, meta.copyDesignOperationId), idempotentReplay: true };
+        }
       }
       throw error;
     }

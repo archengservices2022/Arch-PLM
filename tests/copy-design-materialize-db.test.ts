@@ -1064,3 +1064,186 @@ test("a successful operation never invokes storage compensation at all", async (
     assert.equal(deleteCalls, 0);
   });
 });
+
+// ------------------------------------------------------------
+// Milestone 3A / D-1: the REAL PostgreSQL stale-snapshot race. Under
+// SERIALIZABLE the loser's in-transaction reads can use a snapshot taken
+// before the winner committed (so it sees NO FileVersion), and only its
+// INSERT hits the winner's now-committed row through the
+// (cadDocumentId, versionNumber) unique index - surfacing as Prisma P2002
+// rather than a retryable serialization failure. The in-memory fake's
+// row lock alone never produces this, so it is simulated explicitly.
+// ------------------------------------------------------------
+
+function prismaUniqueViolation(target: unknown): Error {
+  const error = new Error("Unique constraint failed") as Error & { code: string; meta: unknown };
+  error.code = "P2002";
+  error.meta = { modelName: "FileVersion", target };
+  return error;
+}
+
+/** The loser's transaction reads a stale (empty) FileVersion set, and the
+ *  winner's row becomes visible exactly when the loser's INSERT fails -
+ *  as a concurrent commit would. */
+function dbWithStaleSnapshotRace(fake: FakeDatabase, winner: VersionRow, error: Error): CopyDesignMaterializeDb {
+  return {
+    ...fake.db,
+    $transaction: (async (fn: (tx: unknown) => Promise<unknown>) => {
+      return (fake.db.$transaction as unknown as (f: (tx: unknown) => Promise<unknown>) => Promise<unknown>)(
+        async (tx) => {
+          const rigged = {
+            ...(tx as Record<string, unknown>),
+            fileVersion: {
+              ...(tx as { fileVersion: Record<string, unknown> }).fileVersion,
+              findMany: async () => [],
+              create: async () => {
+                if (!fake.versions.includes(winner)) fake.versions.push(winner);
+                throw error;
+              },
+            },
+          };
+          return fn(rigged);
+        },
+      );
+    }) as unknown as CopyDesignMaterializeDb["$transaction"],
+  };
+}
+
+/** Materializes `content` normally (real row + real stored object), then
+ *  withdraws the row so the racing request only observes it at its INSERT. */
+async function materializeThenWithdrawWinner(fake: FakeDatabase, provider: LocalFilesystemStorage, content: Buffer): Promise<VersionRow> {
+  await materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, content), bytesSource(content), 10_000_000, fake.db, provider);
+  return fake.versions.pop()!;
+}
+
+const VERSION_UNIQUE_FIELDS = ["cadDocumentId", "versionNumber"];
+const LOSER_CONTENT = Buffer.from("a different upload that lost the race");
+
+test("D-1: stale-snapshot race with DIFFERENT content -> loser gets CopyDesignAlreadyMaterializedError, not a raw P2002", async () => {
+  await withTmpDir(async (dir) => {
+    const fake = new FakeDatabase();
+    setupReserved(fake);
+    const real = new LocalFilesystemStorage(dir);
+    const winner = await materializeThenWithdrawWinner(fake, real, CONTENT);
+    const deletedKeys: string[] = [];
+    const provider = wrapProvider(real, {
+      delete: async (key: string) => {
+        deletedKeys.push(key);
+        return real.delete(key);
+      },
+    });
+    const db = dbWithStaleSnapshotRace(fake, winner, prismaUniqueViolation(VERSION_UNIQUE_FIELDS));
+
+    await assert.rejects(
+      () => materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, LOSER_CONTENT), bytesSource(LOSER_CONTENT), 10_000_000, db, provider),
+      (err: unknown) => err instanceof CopyDesignAlreadyMaterializedError,
+    );
+    // Exactly the winner's FileVersion 1 - no duplicate, no version 2.
+    assert.equal(fake.versions.length, 1);
+    assert.equal(fake.versions[0].id, winner.id);
+    // The loser's own promoted object was compensated; the winner's is untouched.
+    assert.equal(deletedKeys.length, 1);
+    assert.notEqual(deletedKeys[0], winner.storageKey);
+    assert.equal(await real.exists(deletedKeys[0]), false);
+    assert.equal((await real.hashObject(winner.storageKey)).sha256, sha256Hex(CONTENT));
+  });
+});
+
+test("D-1 http: stale-snapshot race with DIFFERENT content maps to 409, never an unhandled 500", async () => {
+  await withTmpDir(async (dir) => {
+    const fake = new FakeDatabase();
+    setupReserved(fake);
+    const provider = new LocalFilesystemStorage(dir);
+    const winner = await materializeThenWithdrawWinner(fake, provider, CONTENT);
+    const db = dbWithStaleSnapshotRace(fake, winner, prismaUniqueViolation(VERSION_UNIQUE_FIELDS));
+
+    const res = await copyDesignMaterializeHttpResult(actorIn("orgA"), metaFor({}, LOSER_CONTENT), bytesSource(LOSER_CONTENT), 10_000_000, db, provider);
+    assert.equal(res.status, 409);
+    assert.equal(fake.versions.length, 1);
+  });
+});
+
+test("D-1: stale-snapshot race with IDENTICAL content -> idempotent replay of the winner, redundant object compensated", async () => {
+  await withTmpDir(async (dir) => {
+    const fake = new FakeDatabase();
+    setupReserved(fake);
+    const real = new LocalFilesystemStorage(dir);
+    const winner = await materializeThenWithdrawWinner(fake, real, CONTENT);
+    const deletedKeys: string[] = [];
+    const provider = wrapProvider(real, {
+      delete: async (key: string) => {
+        deletedKeys.push(key);
+        return real.delete(key);
+      },
+    });
+    const db = dbWithStaleSnapshotRace(fake, winner, prismaUniqueViolation(VERSION_UNIQUE_FIELDS));
+
+    const result = await materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, CONTENT), bytesSource(CONTENT), 10_000_000, db, provider);
+    assert.equal(result.idempotentReplay, true);
+    assert.equal(result.fileVersionId, winner.id);
+    assert.equal(fake.versions.length, 1);
+    assert.equal(deletedKeys.length, 1);
+    assert.notEqual(deletedKeys[0], winner.storageKey);
+    assert.equal(await real.exists(winner.storageKey), true);
+  });
+});
+
+test("D-1: a STRING-shaped meta.target with the EXACT FileVersion version index name is recognized the same way", async () => {
+  await withTmpDir(async (dir) => {
+    const fake = new FakeDatabase();
+    setupReserved(fake);
+    const provider = new LocalFilesystemStorage(dir);
+    const winner = await materializeThenWithdrawWinner(fake, provider, CONTENT);
+    const db = dbWithStaleSnapshotRace(fake, winner, prismaUniqueViolation("FileVersion_cadDocumentId_versionNumber_key"));
+
+    await assert.rejects(
+      () => materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, LOSER_CONTENT), bytesSource(LOSER_CONTENT), 10_000_000, db, provider),
+      (err: unknown) => err instanceof CopyDesignAlreadyMaterializedError,
+    );
+  });
+});
+
+test("D-1: a P2002 on any OTHER constraint is rethrown unchanged - never converted into a 409", async () => {
+  const unrelatedTargets: unknown[] = [
+    ["organizationId", "id"], // a different FileVersion unique constraint
+    ["cadDocumentId", "versionNumber", "organizationId"], // superset - not an exact match
+    ["cadDocumentId"], // subset - not an exact match
+    "FileVersion_organizationId_id_key", // different index name
+    undefined, // unreadable target
+  ];
+  for (const target of unrelatedTargets) {
+    await withTmpDir(async (dir) => {
+      const fake = new FakeDatabase();
+      setupReserved(fake);
+      const provider = new LocalFilesystemStorage(dir);
+      const error = prismaUniqueViolation(target);
+
+      await assert.rejects(
+        () => materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, CONTENT), bytesSource(CONTENT), 10_000_000, dbWithFailingCreate(fake, error), provider),
+        (err: unknown) => err === error,
+        `target ${JSON.stringify(target)} must be rethrown as-is`,
+      );
+      // The HTTP mapping must not swallow it into a 4xx either.
+      await assert.rejects(
+        () => copyDesignMaterializeHttpResult(actorIn("orgA"), metaFor({}, CONTENT), bytesSource(CONTENT), 10_000_000, dbWithFailingCreate(fake, error), provider),
+        (err: unknown) => err === error,
+      );
+      assert.equal(fake.versions.length, 0);
+    });
+  }
+});
+
+test("D-1: a matching P2002 with NO committed version visible on re-read is rethrown unchanged, never guessed into a 409", async () => {
+  await withTmpDir(async (dir) => {
+    const fake = new FakeDatabase();
+    setupReserved(fake);
+    const provider = new LocalFilesystemStorage(dir);
+    const error = prismaUniqueViolation(VERSION_UNIQUE_FIELDS);
+
+    await assert.rejects(
+      () => materializeFirstFileVersionForActor(actorIn("orgA"), metaFor({}, CONTENT), bytesSource(CONTENT), 10_000_000, dbWithFailingCreate(fake, error), provider),
+      (err: unknown) => err === error,
+    );
+    assert.equal(fake.versions.length, 0);
+  });
+});
