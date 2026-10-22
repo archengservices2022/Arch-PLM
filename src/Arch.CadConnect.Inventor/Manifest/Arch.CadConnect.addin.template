@@ -19,7 +19,9 @@
 
   <Assembly>%ASSEMBLY_PATH%</Assembly>
 
-  <!-- Inventor 2025 = 29, Inventor 2026 = 30. Load on 2025 and newer. -->
+  <!-- Inventor 2025 = 29, Inventor 2026 = 30, Inventor 2027 = 31 (preliminary,
+       not validated in Inventor). Load on 2025 and newer - this rule therefore
+       also lets Inventor 2027 load the add-in once a manifest is installed. -->
   <SupportedSoftwareVersionGreaterThan>28..</SupportedSoftwareVersionGreaterThan>
 
   <LoadOnStartUp>1</LoadOnStartUp>

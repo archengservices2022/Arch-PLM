@@ -10,6 +10,10 @@
     both host .NET 8 add-ins; see inventor/README.md). The Inventor interop is
     referenced with EmbedInteropTypes=true so ONE build loads in both.
 
+    Inventor 2027 (release 31) - PRELIMINARY: this project builds against the
+    2027 interop, but Inventor 2027 hosts add-ins on .NET 10, and loading this
+    net8.0 add-in into that runtime has NOT been validated in Inventor.
+
     COM activation: EnableComHosting produces Arch.CadConnect.Inventor.comhost.dll,
     which the install script registers (per-user, no admin). Inventor reads the
     .addin manifest, finds our ClassId, and CoCreateInstances it.
@@ -51,7 +55,7 @@
 
   <Target Name="RequireInventorInterop" BeforeTargets="ResolveReferences"
           Condition="'$(ArchInventorInteropResolved)' != 'true'">
-    <Error Text="Autodesk.Inventor.Interop.dll was not found. Set ArchInventorInteropDll (env var or build/Inventor.local.props) to its full path, or install Inventor 2025/2026. This project cannot build without the Inventor SDK; Core/Api/tests build without it. See inventor/README.md." />
+    <Error Text="Autodesk.Inventor.Interop.dll was not found. Set ArchInventorInteropDll (env var or build/Inventor.local.props) to its full path, or install Inventor 2025, 2026 or 2027 (2027 is preliminary). This project cannot build without the Inventor SDK; Core/Api/tests build without it. See inventor/README.md." />
   </Target>
 
 </Project>

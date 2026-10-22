@@ -13,13 +13,19 @@
       3. The version-independent Autodesk "Inventor Interoperability <year>"
          shared assembly, newest supported year first (2026 then 2025). This
          is the folder Autodesk documents as the reference target.
-      4. The per-install "Inventor <year>\Bin" copy as a last resort.
+      4. The per-install "Inventor <year>\Bin" copy (2026 then 2025).
+      5. Inventor 2027 (release 31) - shared assembly, then "Inventor 2027\Bin".
+         PRELIMINARY: probed only AFTER every 2025/2026 location, so a machine
+         with 2025 or 2026 installed keeps compiling against that interop and
+         2027-only API cannot slip into the build unnoticed. 2027 is used only
+         when no 2025/2026 interop exists (e.g. a 2027-only build machine).
 
     The reference is ALWAYS EmbedInteropTypes=true: the COM type information is
     baked into our add-in, so a single build loads in BOTH Inventor 2025
     (release 29) and Inventor 2026 (release 30) - we never take a hard binding
-    on one interop assembly version. See README "Inventor 2025/2026
-    compatibility".
+    on one interop assembly version. Inventor 2027 hosts add-ins on .NET 10
+    (not .NET 8); building against its interop does NOT prove the add-in loads
+    there. See README "Inventor 2025 / 2026 / 2027 compatibility".
   -->
 
   <Import Project="$(MSBuildThisFileDirectory)Inventor.local.props"
@@ -30,11 +36,15 @@
     <_ArchInteropShared2025>$(CommonProgramFiles)\Autodesk Shared\Inventor Interoperability 2025\Bin\Autodesk.Inventor.Interop.dll</_ArchInteropShared2025>
     <_ArchInteropBin2026>$(ProgramFiles)\Autodesk\Inventor 2026\Bin\Autodesk.Inventor.Interop.dll</_ArchInteropBin2026>
     <_ArchInteropBin2025>$(ProgramFiles)\Autodesk\Inventor 2025\Bin\Autodesk.Inventor.Interop.dll</_ArchInteropBin2025>
+    <_ArchInteropShared2027>$(CommonProgramFiles)\Autodesk Shared\Inventor Interoperability 2027\Bin\Autodesk.Inventor.Interop.dll</_ArchInteropShared2027>
+    <_ArchInteropBin2027>$(ProgramFiles)\Autodesk\Inventor 2027\Bin\Autodesk.Inventor.Interop.dll</_ArchInteropBin2027>
 
     <ArchInventorInteropDll Condition="Exists('$(_ArchInteropShared2026)')">$(_ArchInteropShared2026)</ArchInventorInteropDll>
     <ArchInventorInteropDll Condition="'$(ArchInventorInteropDll)' == '' and Exists('$(_ArchInteropShared2025)')">$(_ArchInteropShared2025)</ArchInventorInteropDll>
     <ArchInventorInteropDll Condition="'$(ArchInventorInteropDll)' == '' and Exists('$(_ArchInteropBin2026)')">$(_ArchInteropBin2026)</ArchInventorInteropDll>
     <ArchInventorInteropDll Condition="'$(ArchInventorInteropDll)' == '' and Exists('$(_ArchInteropBin2025)')">$(_ArchInteropBin2025)</ArchInventorInteropDll>
+    <ArchInventorInteropDll Condition="'$(ArchInventorInteropDll)' == '' and Exists('$(_ArchInteropShared2027)')">$(_ArchInteropShared2027)</ArchInventorInteropDll>
+    <ArchInventorInteropDll Condition="'$(ArchInventorInteropDll)' == '' and Exists('$(_ArchInteropBin2027)')">$(_ArchInteropBin2027)</ArchInventorInteropDll>
   </PropertyGroup>
 
   <PropertyGroup>

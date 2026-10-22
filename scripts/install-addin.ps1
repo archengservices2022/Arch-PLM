@@ -25,6 +25,13 @@
 .EXAMPLE
   .\scripts\install-addin.ps1 -InventorVersions 2025,2026 -Configuration Release
 
+.NOTES
+  Inventor 2027 (release 31) is PRELIMINARY, not officially supported: it
+  hosts add-ins on .NET 10 while this add-in targets .NET 8, and loading it
+  there has not been validated. With no -InventorVersions the script installs
+  for EVERY detected Inventor, including 2027 - pass -InventorVersions
+  explicitly on a machine where 2027 must not receive the add-in.
+
 .EXAMPLE
   .\scripts\install-addin.ps1 -SelfTest
   # Verifies the publish-failure fail-fast behavior without Inventor or dotnet.
@@ -48,6 +55,10 @@ $ProgId     = 'Arch.CadConnect.Inventor.ArchAddInServer'
 # (e.g. 2023) and the script will still install for them for convenience, but
 # they are NOT an expansion of the supported set.
 $OfficialSupport = @('2025', '2026')
+
+# Build-compatible but NOT validated in Inventor (Inventor 2027 hosts .NET 10;
+# this add-in targets .NET 8). Reported separately; never treated as official.
+$PreliminarySupport = @('2027')
 
 function Get-InstalledInventorVersions {
   Get-ChildItem 'C:\Program Files\Autodesk' -Directory -ErrorAction SilentlyContinue |
@@ -162,7 +173,13 @@ foreach ($v in $InventorVersions) {
 Write-Host "`nInstallation complete for Inventor $($InventorVersions -join ', ')."
 Write-Host 'Start a supported Inventor version and verify the ARCH ENGINEERING ribbon.'
 
-$unsupported = @($InventorVersions | Where-Object { $OfficialSupport -notcontains $_ })
+$preliminary = @($InventorVersions | Where-Object { $PreliminarySupport -contains $_ })
+if ($preliminary.Count -gt 0) {
+  Write-Host ''
+  Write-Host ("Note: Inventor {0} support is PRELIMINARY - the add-in builds against its API, but loading under its .NET 10 runtime has not been validated." -f ($preliminary -join ', ')) -ForegroundColor Yellow
+}
+
+$unsupported = @($InventorVersions | Where-Object { $OfficialSupport -notcontains $_ -and $PreliminarySupport -notcontains $_ })
 if ($unsupported.Count -gt 0) {
   Write-Host ''
   Write-Host ("Note: the officially supported Inventor versions for this add-in are {0}." -f ($OfficialSupport -join ' and ')) -ForegroundColor Yellow

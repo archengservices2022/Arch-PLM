@@ -53,20 +53,36 @@ the PDM routes so the add-in can call them is a mechanical P4B step.
 
 ---
 
-## Inventor 2025 / 2026 compatibility
+## Inventor 2025 / 2026 / 2027 compatibility
+
+Official support: **Inventor 2025 and 2026**. Inventor **2027 is preliminary** —
+the add-in builds against the 2027 interop, but it has not been loaded or run
+in Inventor 2027 (see the 2027 note below the table).
 
 | Concern | Decision |
 |---|---|
-| **.NET target** | `net8.0-windows`. Inventor 2025 (release **29**) and Inventor 2026 (release **30**) both host .NET 8 add-ins — confirmed on this machine: `…\Inventor 2025\Bin\ClrAddinLoader.runtimeconfig.json` pins `net8.0` / `Microsoft.NETCore.App 8.0.0`. |
+| **.NET target** | `net8.0-windows`. Inventor 2025 (release **29**) and Inventor 2026 (release **30**) both host .NET 8 add-ins — confirmed on this machine: `…\Inventor 2025\Bin\ClrAddinLoader.runtimeconfig.json` pins `net8.0` / `Microsoft.NETCore.App 8.0.0`. Inventor 2027 (release **31**) hosts **.NET 10**: `…\Inventor 2027\Bin\ClrAddinLoader.runtimeconfig.json` pins `net10.0` / `Microsoft.NETCore.App 10.0.0`. The target framework is unchanged. |
 | **Interop reference** | `Autodesk.Inventor.Interop.dll` referenced with **`EmbedInteropTypes=true`**, so the COM type info is baked into our DLL and one build loads in both 2025 and 2026. We use only the stable core API (`Application`, `Document`, `UserInterfaceManager.Ribbons`, `CommandManager.ControlDefinitions`, `ApplicationEvents`) present in R29 and R30. |
-| **Interop path** | `build/Inventor.props` probes, in order: `$(ArchInventorInteropDll)` → `build/Inventor.local.props` (git-ignored) → `%CommonProgramFiles%\Autodesk Shared\Inventor Interoperability 2026\Bin\…` → `…2025\…` → `%ProgramFiles%\Autodesk\Inventor 20xx\Bin\…`. **No absolute install path is committed.** If nothing resolves, the Inventor project fails the build with a clear message; Core/Api/tests still build. |
+| **Interop path** | `build/Inventor.props` probes, in order: `$(ArchInventorInteropDll)` → `build/Inventor.local.props` (git-ignored) → `%CommonProgramFiles%\Autodesk Shared\Inventor Interoperability 2026\Bin\…` → `…2025\…` → `%ProgramFiles%\Autodesk\Inventor 2026\Bin\…` → `…2025\…` → (preliminary) `…Inventor Interoperability 2027\Bin\…` → `%ProgramFiles%\Autodesk\Inventor 2027\Bin\…`. 2027 is probed last so a machine with 2025/2026 keeps building against that interop. **No absolute install path is committed.** If nothing resolves, the Inventor project fails the build with a clear message; Core/Api/tests still build. |
 | **AddIn manifest** | `Manifest/Arch.CadConnect.addin.template` with an assembly-path token. `scripts/install-addin.ps1` renders it with the absolute path of the built DLL and drops it in the **per-user** `%APPDATA%\Autodesk\Inventor <version>\Addins\` folder (no admin). |
 | **COM activation** | `EnableComHosting=true` → `Arch.CadConnect.Inventor.comhost.dll`. The install script registers it **per-user** under `HKCU\Software\Classes\CLSID\{93C45016-…}` (no `regsvr32`, no admin). Inventor reads the `.addin`, finds our `ClassId`, and `CoCreateInstance`s the comhost, which starts the .NET 8 runtime in Inventor's native process. |
 | **Debugging / loading for both versions** | Run `install-addin.ps1 -InventorVersions 2025,2026`. Attach the debugger to `Inventor.exe` after start-up (`Debug ▸ Attach to Process`). To iterate: edit → `install-addin.ps1` (re-publishes + re-points the manifest) → restart Inventor. Use `Tools ▸ Add-Ins` in Inventor to toggle load state without uninstalling. |
 
-Inventor **2026 is not installed on the current build machine**, so the 2026
-path is validated by design + the version-independent interop + `EmbedInteropTypes`,
-not by an in-app run. See *Known limitations*.
+Inventor **2026 has not been run**: the 2026 path is validated by design + the
+version-independent interop + `EmbedInteropTypes`, not by an in-app run. See
+*Known limitations*.
+
+**Inventor 2027 (preliminary).** The Inventor project builds against the 2027
+interop (`Autodesk.Inventor.Interop` 31.x). That proves compile-time API
+compatibility only; **loading under Inventor 2027's .NET 10 runtime is not
+validated**. If Inventor activates the add-in through our comhost, the current
+`net8.0` runtimeconfig (`LatestMinor`, which `EnableDynamicLoading` implies) is
+rejected by the already-running .NET 10 runtime. Inventor 2027's own managed
+add-ins are instead loaded directly from `<Assembly>` without COM registration,
+a path that does not consult our runtimeconfig. Which path Inventor 2027 takes
+for this add-in has not been observed. `install-addin.ps1` reports 2027 as *preliminary*;
+with no `-InventorVersions` it installs for every detected Inventor, so pass
+`-InventorVersions` explicitly where 2027 must not receive the add-in.
 
 ---
 
@@ -80,7 +96,8 @@ dotnet test             # 78 tests, no Inventor / no server required
 ```
 
 `Arch.CadConnect.Inventor` only builds where `Autodesk.Inventor.Interop.dll` is
-resolvable (Inventor 2025/2026 installed, or `ArchInventorInteropDll` set).
+resolvable (Inventor 2025/2026 installed, Inventor 2027 installed — preliminary,
+build-only — or `ArchInventorInteropDll` set).
 
 ---
 
@@ -177,6 +194,9 @@ Follows the reference CLI's established lessons:
   null — there is no operation yet that would learn it. File names are never
   treated as identity.
 - **Inventor 2026 not run.** Design-validated only (see compatibility section).
+- **Inventor 2027 build-only.** Compiles against the 2027 interop; never
+  loaded in Inventor 2027, whose add-in host runs .NET 10 (see compatibility
+  section).
 - **Smoke test is partial** (see report §12): comhost COM activation is
   verified headlessly; the in-Inventor ribbon/flow check is a manual step.
 
@@ -189,4 +209,4 @@ Follows the reference CLI's established lessons:
 | **P4B** | Wire `resolveApiActor` into the PDM routes; implement **Get Latest** end-to-end into an Inventor workspace; real document→PLM identity resolution; real `CadDocumentStatus` (CURRENT / OUT_OF_DATE / RELEASED). |
 | **P4C** | **Checkout / Check In / Undo Checkout** from the ribbon, with the server's exclusive-lock + version-creation semantics; `CHECKED_OUT_BY_ME/OTHER`, `LOCAL_CONFLICT`. |
 | **P4D** | **Where Used**, release information, assembly-aware multi-document operations. |
-| later | Token rotation / short-lived sessions; session management UI; packaging/installer; Inventor 2027+. |
+| later | Token rotation / short-lived sessions; session management UI; packaging/installer; Inventor 2027 runtime validation (.NET 10 host); Inventor 2028+. |
