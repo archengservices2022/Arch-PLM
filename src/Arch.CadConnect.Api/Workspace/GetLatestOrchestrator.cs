@@ -14,6 +14,7 @@ namespace Arch.CadConnect.Api.Workspace;
 ///
 ///   resolve (documentNumber -> stable cadDocumentId)
 ///     -> fetch + validate the workspace plan (refuse an unsafe plan wholesale)
+///     -> refuse any entry that would land inside another workspace (M4.4)
 ///     -> materialize (staged, size + SHA-256 verified, never overwriting)
 ///     -> update the workspace manifest ATOMICALLY, only for what was verified
 ///     -> return a MaterializationReport
@@ -30,6 +31,7 @@ public sealed class GetLatestOrchestrator
     private readonly Func<IArchSession, CadDocumentLookup, CancellationToken, Task<ResolvedCadDocument>> _resolve;
     private readonly WorkspaceMaterializer _materializer;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Func<string, string?> _findRootForFile;
 
     public GetLatestOrchestrator(
         ArchServerUri server,
@@ -37,8 +39,10 @@ public sealed class GetLatestOrchestrator
         Func<IArchSession, WorkspacePlanClient>? planClientFactory = null,
         Func<IArchSession, IContentDownloader>? downloaderFactory = null,
         WorkspaceMaterializer? materializer = null,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        Func<string, string?>? findRootForFile = null)
     {
+        _findRootForFile = findRootForFile ?? WorkspaceRootLocator.FindRootForFile;
         _server = server ?? throw new ArgumentNullException(nameof(server));
         _resolve = resolve ?? throw new ArgumentNullException(nameof(resolve));
         _planClientFactory = planClientFactory ?? (s => WorkspacePlanClient.Create(_server, s));
@@ -62,6 +66,14 @@ public sealed class GetLatestOrchestrator
         // 2. fetch + validate the version-pinned plan (throws on unsafe).
         var planClient = _planClientFactory(session);
         var plan = await planClient.FetchAsync(resolved.CadDocumentId, ct).ConfigureAwait(false);
+
+        // 2b. P6 M4.4: refuse, BEFORE any download, a plan any of whose
+        //     entries would land inside a DIFFERENT workspace (nested roots).
+        var nested = GetLatestNestingCheck.FindNestedEntries(plan, request.WorkspaceRoot, _findRootForFile);
+        if (nested.Count > 0)
+        {
+            throw new UnsafeWorkspacePlanException(nested);
+        }
 
         // 3. materialize (per-entry verified downloads; never overwrites).
         var downloader = _downloaderFactory(session);

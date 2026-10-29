@@ -189,6 +189,49 @@ public class GetLatestOrchestratorTests : IDisposable
     }
 
     [Fact]
+    public async Task M44_a_target_inside_another_workspace_is_refused_before_any_download()
+    {
+        // _root becomes a workspace; then Get Latest is aimed at a folder INSIDE it.
+        await Orchestrator(new HttpClient(ServerHandler())).RunAsync(WorkspaceTestSession.Make(),
+            new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-1"), WorkspaceRoot = _root });
+        var outerManifest = await File.ReadAllTextAsync(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath));
+        var inner = Path.Combine(_root, "inner");
+        Directory.CreateDirectory(inner);
+        var handler = ServerHandler();
+
+        var ex = await Assert.ThrowsAsync<UnsafeWorkspacePlanException>(
+            () => Orchestrator(new HttpClient(handler)).RunAsync(WorkspaceTestSession.Make(),
+                new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-1"), WorkspaceRoot = inner }));
+
+        Assert.Equal(2, ex.Problems.Count);
+        Assert.All(ex.Problems, p => Assert.Equal(GetLatestNestingCheck.ProblemKind, p.Kind));
+        Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
+        Assert.Empty(Directory.GetFileSystemEntries(inner));
+        Assert.Equal(outerManifest, await File.ReadAllTextAsync(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
+    }
+
+    [Fact]
+    public async Task M44_an_entry_landing_in_a_nested_workspace_below_the_target_is_refused_before_any_download()
+    {
+        var handler = ServerHandler();
+        var nestedBelow = Path.Combine(_root, "nested");
+        var orchestrator = new GetLatestOrchestrator(
+            WorkspaceTestSession.Server,
+            resolve: (s, lu, c) => GetLatestOrchestrator.ResolveViaHttpAsync(WorkspaceTestSession.Server, s, new HttpClient(handler), lu, TimeSpan.FromSeconds(5), c),
+            planClientFactory: s => new WorkspacePlanClient(WorkspaceTestSession.Server, s, new HttpClient(handler), TimeSpan.FromSeconds(5)),
+            downloaderFactory: s => new HttpContentDownloader(WorkspaceTestSession.Server, s, new HttpClient(handler)),
+            findRootForFile: path => path.EndsWith("part.ipt", StringComparison.Ordinal) ? nestedBelow : null);
+
+        var ex = await Assert.ThrowsAsync<UnsafeWorkspacePlanException>(() => orchestrator.RunAsync(WorkspaceTestSession.Make(),
+            new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-1"), WorkspaceRoot = _root }));
+
+        Assert.Equal("cad_part", Assert.Single(ex.Problems).CadDocumentId);
+        Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
+        Assert.False(File.Exists(Path.Combine(_root, "asm.iam")), "not even the entries outside the nested workspace are downloaded");
+        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+    }
+
+    [Fact]
     public async Task A_local_conflict_on_re_run_downgrades_that_binding_without_overwriting()
     {
         var http = new HttpClient(ServerHandler());

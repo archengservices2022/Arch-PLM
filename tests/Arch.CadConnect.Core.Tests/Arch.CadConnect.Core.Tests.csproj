@@ -21,6 +21,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Arch.CadConnect.Core\Arch.CadConnect.Core.csproj" />
+    <!-- P6 M4.4: the separate-process lock helper, built into this output folder -->
+    <ProjectReference Include="..\Arch.CadConnect.LockProbe\Arch.CadConnect.LockProbe.csproj" />
   </ItemGroup>
 
 </Project>

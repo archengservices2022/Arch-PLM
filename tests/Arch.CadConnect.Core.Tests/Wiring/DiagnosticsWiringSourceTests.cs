@@ -61,7 +61,7 @@ public class DiagnosticsWiringSourceTests
 
         var guarded = At(body, guard, method);
         var start = At(body, $"PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.{operation}Operation, file, _connection.CurrentSession)", method);
-        var background = At(body, "RunBackground(", method);
+        var background = At(body, "RunLockedInBackground(", method); // M4.4: the locked runner
         var server = At(body, call, method);
         var record = At(body, $"PdmDiagnostics.{recorder}(log, result);", method);
         var failure = At(body, "PdmDiagnostics.RecordException(log, ex);", method);

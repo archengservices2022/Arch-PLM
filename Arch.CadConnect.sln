@@ -19,6 +19,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{84E701CA
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Arch.CadConnect.Ui.Tests", "tests\Arch.CadConnect.Ui.Tests\Arch.CadConnect.Ui.Tests.csproj", "{92712C24-8ECB-4331-9ED2-D13979D7380D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Arch.CadConnect.LockProbe", "tests\Arch.CadConnect.LockProbe\Arch.CadConnect.LockProbe.csproj", "{81159534-BA0D-4253-B2C1-F155294D7ED8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -101,6 +103,18 @@ Global
 		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x64.Build.0 = Release|Any CPU
 		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x86.ActiveCfg = Release|Any CPU
 		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x86.Build.0 = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|x64.Build.0 = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Debug|x86.Build.0 = Debug|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|x64.ActiveCfg = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|x64.Build.0 = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|x86.ActiveCfg = Release|Any CPU
+		{81159534-BA0D-4253-B2C1-F155294D7ED8}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -112,5 +126,6 @@ Global
 		{865ED1CA-CC58-4129-865E-495063E4D202} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{1C29DE58-2587-4135-8E1E-CF6240A12E66} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{92712C24-8ECB-4331-9ED2-D13979D7380D} = {84E701CA-1304-4380-8934-5621E3C056DD}
+		{81159534-BA0D-4253-B2C1-F155294D7ED8} = {84E701CA-1304-4380-8934-5621E3C056DD}
 	EndGlobalSection
 EndGlobal

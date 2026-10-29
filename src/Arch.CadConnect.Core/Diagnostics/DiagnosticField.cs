@@ -93,6 +93,10 @@ public static class DiagnosticFieldAllowList
         ["documentType"] = DiagnosticFieldKind.Code,
         ["materialization"] = DiagnosticFieldKind.Code,
         ["source"] = DiagnosticFieldKind.Code,
+        // M4.4 multi-instance locks
+        ["lockScope"] = DiagnosticFieldKind.Code,
+        ["lockMode"] = DiagnosticFieldKind.Code,
+        ["pathLocality"] = DiagnosticFieldKind.Code,
         // the only free text: a sanitized, short document number
         ["documentNumber"] = DiagnosticFieldKind.Text,
         // numbers
@@ -106,6 +110,8 @@ public static class DiagnosticFieldAllowList
         ["failed"] = DiagnosticFieldKind.Number,
         ["removed"] = DiagnosticFieldKind.Number,
         ["durationMs"] = DiagnosticFieldKind.Number,
+        ["lockCount"] = DiagnosticFieldKind.Number,
+        ["holderProcessId"] = DiagnosticFieldKind.Number,
         // flags
         ["physicallyCreated"] = DiagnosticFieldKind.Flag,
         ["verificationPassed"] = DiagnosticFieldKind.Flag,

@@ -103,9 +103,22 @@ internal sealed class ArchAddInController : IDisposable
     private readonly Core.Diagnostics.IDiagnosticsSink _diagnostics =
         new Core.Diagnostics.JsonLinesDiagnosticsSink(Core.Diagnostics.JsonLinesDiagnosticsSink.DefaultDirectory);
 
+    /// <summary>P6 M4.4 MULTI-INSTANCE LOCKS: every mutating command (Get
+    ///  Latest, Checkout, Check In, Undo Checkout, Copy Design Apply / Resume /
+    ///  Recover) takes its workspace / operation / destination locks here -
+    ///  after its M4.1 origin check, before its first server request - and
+    ///  holds them until its background work has completely finished. See
+    ///  <see cref="AcquireCommandLock"/>.</summary>
+    private readonly Core.Workspace.Locking.CommandLockGate _locks;
+
     public ArchAddInController(InventorApi.Application application)
     {
         _application = application;
+        _locks = new Core.Workspace.Locking.CommandLockGate(
+            new Core.Workspace.Locking.WorkspaceLockAcquirer(
+                Core.Workspace.Locking.WindowsLockPathSystem.Instance,
+                Core.Workspace.Locking.WindowsLockHandleFactory.Instance),
+            _diagnostics);
 
         // Force the hidden control's handle so BeginInvoke works.
         _ = _uiMarshal.Handle;
@@ -212,6 +225,39 @@ internal sealed class ArchAddInController : IDisposable
         Error($"{commandName} was not run. {binding.Message}");
         return false;
     }
+
+    /// <summary>P6 M4.4: the command's locks, or null - with the refusal shown
+    ///  and logged - when it must not run. <paramref name="originAllowed"/> is
+    ///  the command's M4.1 origin check: run before any lock is touched (so an
+    ///  origin refusal creates no lock artifact) and again while locked. Called
+    ///  after every dialog has closed, before the first server request.</summary>
+    private Core.Workspace.Locking.CommandLock? AcquireCommandLock(
+        Core.Workspace.Locking.WorkspaceLockRequest request, Func<bool> originAllowed)
+    {
+        var admission = _locks.Admit(request, originAllowed);
+        if (admission.Lock is { } held)
+        {
+            return held;
+        }
+        if (admission.LockRefusal is { } refusal)
+        {
+            Error($"{request.Command} was not run. {Core.Workspace.Locking.WorkspaceLockMessages.Describe(refusal)}");
+        }
+        return null;
+    }
+
+    /// <summary>P6 M4.4: <see cref="RunBackground"/> with the command's locks
+    ///  held through EVERY await of <paramref name="work"/> (server requests,
+    ///  file changes, manifest writes, cleanup) and released exactly once in
+    ///  the work's own <c>finally</c> - or at once if it cannot be queued.</summary>
+    private void RunLockedInBackground(
+        Core.Workspace.Locking.CommandLock held,
+        Func<CancellationToken, Task> work,
+        string? title,
+        Action? onDone = null,
+        Action? onSettled = null,
+        TimeSpan? timeout = null) =>
+        held.Queue(locked => RunBackground(locked, title, onDone, onSettled, timeout), work);
 
     private static WorkspaceManifestEntry? LoadManifestEntry(ManagedFileRef file)
     {
@@ -336,10 +382,16 @@ internal sealed class ArchAddInController : IDisposable
         var file = ActiveManagedFile();
         if (file is null) return;
         if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Checkout")) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Checkout", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Checkout")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
 
         CheckoutOperationResult? result = null;
         var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckoutOperation, file, _connection.CurrentSession);
-        RunBackground(
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
             async ct =>
             {
                 try
@@ -382,10 +434,16 @@ internal sealed class ArchAddInController : IDisposable
             "Upload the saved local file as a new version and release your checkout?",
             ArchAddInInfo.DisplayName, MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (confirm != DialogResult.OK) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Check In", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Check In")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
 
         CheckInOperationResult? result = null;
         var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckInOperation, file, _connection.CurrentSession);
-        RunBackground(
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
             async ct =>
             {
                 try
@@ -426,10 +484,16 @@ internal sealed class ArchAddInController : IDisposable
             $"Undo Checkout of \"{label}\" will DISCARD your local changes and restore the checked-out version. Continue?",
             ArchAddInInfo.DisplayName, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
         if (confirm != DialogResult.OK) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Undo Checkout", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Undo Checkout")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
 
         UndoOperationResult? result = null;
         var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.UndoCheckoutOperation, file, _connection.CurrentSession);
-        RunBackground(
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
             async ct =>
             {
                 try
@@ -1341,24 +1405,49 @@ internal sealed class ArchAddInController : IDisposable
             return;
         }
 
-        if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession.Server)) return;
-        foreach (var destination in plan.Nodes
-                     .Where(n => n.ProposedAction == CopyDesignAction.Copy && !string.IsNullOrWhiteSpace(n.ProposedDestinationAbsolutePath))
-                     .Select(n => n.ProposedDestinationAbsolutePath!))
+        var destinations = plan.Nodes
+            .Where(n => n.ProposedAction == CopyDesignAction.Copy && !string.IsNullOrWhiteSpace(n.ProposedDestinationAbsolutePath))
+            .Select(n => n.ProposedDestinationAbsolutePath!)
+            .ToArray();
+
+        // P6 M4.1: the source workspace and every workspace a destination lies
+        // in must belong to the BOUND session's server. P6 M4.4: run once
+        // here, once more before the locks and once while they are held.
+        bool OriginChecksPass()
         {
-            // A destination is normally a plain folder; if it lies inside a
-            // workspace, that workspace must belong to the same server too.
-            if (WorkspaceRootLocator.FindRootForFile(destination) is { } destinationRoot
-                && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server))
+            if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession.Server)) return false;
+            foreach (var destination in destinations)
             {
-                return;
+                // A destination is normally a plain folder; if it lies inside a
+                // workspace, that workspace must belong to the same server too.
+                if (WorkspaceRootLocator.FindRootForFile(destination) is { } destinationRoot
+                    && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server))
+                {
+                    return false;
+                }
             }
+            return true;
         }
+
+        if (!OriginChecksPass()) return;
+
+        // P6 M4.4: this operation (machine-wide), every unmanaged destination
+        // folder (machine-wide), every destination workspace (exclusive) and
+        // every source workspace (shared) - for the whole attempt.
+        var lockRequest = Core.Workspace.Locking.WorkspaceLockRequest.ForCopyDesign(
+            commandName,
+            boundSession.Server.OriginString,
+            idempotencyKey,
+            plan.Nodes.Where(n => n.IsResolved && !string.IsNullOrWhiteSpace(n.SourceAbsolutePath)).Select(n => n.SourceAbsolutePath).ToArray(),
+            destinations);
+        if (AcquireCommandLock(lockRequest, OriginChecksPass) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
 
         // P6 M4.2: one diagnostics log per attempt, started once every guard
         // above has passed.
         var log = Core.Diagnostics.CopyDesignDiagnostics.Start(
             _diagnostics, kind.ToString(), plan, idempotencyKey, boundSession, confirmedFingerprint);
+        held.AttachDiagnostics(log);
 
         var orchestrator = new Core.CopyDesign.Apply.CopyDesignApplyOrchestrator(
             _copyDesignApplyGuard,
@@ -1428,7 +1517,8 @@ internal sealed class ArchAddInController : IDisposable
             throw;
         }
 
-        void RunCopyDesignAttemptInBackground() => RunBackground(
+        void RunCopyDesignAttemptInBackground() => RunLockedInBackground(
+            held,
             async ct =>
             {
                 try
@@ -2002,6 +2092,14 @@ internal sealed class ArchAddInController : IDisposable
             return;
         }
 
+        // P6 M4.4: the target workspace, exclusively, for the whole run - the
+        // downloads AND the final manifest write. The origin is checked again
+        // (without remembering anything) before and while locked.
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForGetLatest("Get Latest", workspaceRoot),
+                () => GetLatestTargetAllowed(workspaceRoot)) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
         var request = new GetLatestRequest
         {
             Root = CadDocumentLookup.ByNumber(documentNumber: documentNumber, documentType: documentType),
@@ -2010,7 +2108,9 @@ internal sealed class ArchAddInController : IDisposable
 
         MaterializationReport? report = null;
         var log = PdmDiagnostics.StartGetLatest(_diagnostics, request, _connection.CurrentSession);
-        RunBackground(
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
             async ct =>
             {
                 try
@@ -2036,6 +2136,21 @@ internal sealed class ArchAddInController : IDisposable
                 }
             },
             timeout: TimeSpan.FromMinutes(15));
+    }
+
+    /// <summary>P6 M4.4: the Get Latest origin check again - like
+    ///  <see cref="WorkspaceServerBinding.AdmitGetLatestTarget"/> but remembering
+    ///  nothing.</summary>
+    private bool GetLatestTargetAllowed(string workspaceRoot)
+    {
+        var target = WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server);
+        if (target.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, "Get Latest", target);
+        Error($"Get Latest was not run. {target.Message}");
+        return false;
     }
 
     private void ShowGetLatestResult(MaterializationReport report)
