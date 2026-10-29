@@ -35,7 +35,14 @@ public sealed record CopyDesignNode(
     string? ProposedDestinationFileName,
     string? ProposedDestinationAbsolutePath,
     IReadOnlyList<string> Reasons,
-    bool IsRoot = false)
+    bool IsRoot = false,
+    /// <summary>P6 Milestone 2: the source document's human document number
+    ///  as recorded in the local workspace manifest, when known - DISPLAY and
+    ///  same-number collision checking only, never identity (see
+    ///  <see cref="CadDocumentId"/>). <c>null</c> when the planner had no
+    ///  manifest number for it (e.g. a drawing reported by association
+    ///  evidence).</summary>
+    string? SourceDocumentNumber = null)
 {
     /// <summary>True only for a fully-identified, resolved, Verified managed
     ///  node whose identity is COMPLETE - both <see cref="CadDocumentId"/> AND

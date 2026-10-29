@@ -36,6 +36,9 @@ public static class CopyDesignPlanTextReport
         sb.AppendLine("Plan status: " + (plan.IsExecutable ? "READY (all nodes resolved safely)" : "NOT EXECUTABLE"));
         sb.AppendLine();
 
+        // P6 Milestone 2: the Status column is now a severity summary; EVERY
+        // reason is listed (with its severity) in the sections below - never
+        // just node.Reasons[0].
         sb.AppendLine($"{"Source",-32} {"Type",-6} {"Action",-14} {"Destination",-32} Status");
         sb.AppendLine(new string('-', 100));
         foreach (var node in plan.Nodes)
@@ -44,19 +47,34 @@ public static class CopyDesignPlanTextReport
             var type = node.DocumentType.ToString().ToUpperInvariant();
             var action = node.IsRoot ? $"{node.ProposedAction} (root)" : node.ProposedAction.ToString();
             var destination = node.ProposedDestinationFileName ?? (node.ProposedAction == CopyDesignAction.Reuse ? "(same identity)" : "-");
-            var status = node.Reasons.Count > 0 ? node.Reasons[0] : "";
+            var blockingCount = node.Reasons.Count(r => CopyDesignPlanIssues.ClassifyNodeReason(node, r) == CopyDesignIssueSeverity.Blocking);
+            var status = blockingCount > 0 ? $"BLOCKED ({blockingCount} reason{(blockingCount == 1 ? "" : "s")} below)" : "OK";
             sb.AppendLine($"{Truncate(source, 32),-32} {Truncate(type, 6),-6} {Truncate(action, 14),-14} {Truncate(destination, 32),-32} {status}");
         }
 
-        if (plan.Warnings.Count > 0)
+        var issues = CopyDesignPlanIssues.Collect(plan);
+        foreach (var (severity, heading) in new[]
+                 {
+                     (CopyDesignIssueSeverity.Blocking, "Blocking errors (must be resolved before Apply):"),
+                     (CopyDesignIssueSeverity.Warning, "Warnings:"),
+                     (CopyDesignIssueSeverity.Info, "Information:"),
+                 })
         {
-            sb.AppendLine();
-            sb.AppendLine("Warnings:");
-            foreach (var warning in plan.Warnings)
+            var group = issues.Where(i => i.Severity == severity).ToArray();
+            if (group.Length == 0)
             {
-                foreach (var line in Wrap(warning))
+                continue;
+            }
+            sb.AppendLine();
+            sb.AppendLine(heading);
+            foreach (var issue in group)
+            {
+                var text = $"[{CopyDesignPlanIssues.Label(severity)}] {(issue.SourceFileName is null ? "" : issue.SourceFileName + ": ")}{issue.Message}";
+                var first = true;
+                foreach (var line in Wrap(text))
                 {
-                    sb.AppendLine("  - " + line);
+                    sb.AppendLine((first ? "  - " : "    ") + line);
+                    first = false;
                 }
             }
         }
@@ -66,7 +84,7 @@ public static class CopyDesignPlanTextReport
         sb.AppendLine(plan.IsExecutable
             ? "This is a PREVIEW only. No file has been copied, renamed, saved, or replaced. Execution is a "
               + "LATER phase - P6A never performs it."
-            : "This plan is NOT EXECUTABLE - resolve the warning(s) above before any later phase may act on it. "
+            : "This plan is NOT EXECUTABLE - resolve the blocking error(s) above before any later phase may act on it. "
               + "No file has been copied, renamed, saved, or replaced.");
         sb.AppendLine(Rule);
 

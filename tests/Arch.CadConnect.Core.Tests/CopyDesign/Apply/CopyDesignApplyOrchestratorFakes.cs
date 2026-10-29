@@ -20,6 +20,11 @@ internal sealed class FakeReservationClient : ICopyDesignReservationClient
     ///  wins if set, for existing tests' unconditional-failure scenarios).</summary>
     public int ThrowForFirstNCalls { get; set; }
     public Exception TransientException { get; set; } = new IOException("simulated transient network failure");
+
+    /// <summary>P6 M4.1a support: the exception (or null to proceed) for the
+    ///  Nth call, 1-based - lets a test vary the failure between attempts
+    ///  (e.g. a transient first attempt, then a session-change refusal).</summary>
+    public Func<int, Exception?>? ThrowForCall { get; set; }
     private int _callCount;
 
     /// <summary>P6D ROUND 3 support: invoked with the EXACT (request,
@@ -43,6 +48,10 @@ internal sealed class FakeReservationClient : ICopyDesignReservationClient
         if (_callCount <= ThrowForFirstNCalls)
         {
             throw TransientException;
+        }
+        if (ThrowForCall?.Invoke(_callCount) is { } forCall)
+        {
+            throw forCall;
         }
         var response = (Responder ?? HappyResponse)(request);
         OnResponded?.Invoke(request, response);
@@ -98,9 +107,25 @@ internal sealed class FakePhysicalCopier : ICopyDesignPhysicalCopier
     ///  the SAME baseline already threaded into the verifier.</summary>
     public Dictionary<string, string> CapturedSourceSha256BeforeOperation { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>P6 METADATA FIX support: shared, ordered log of adapter calls
+    ///  ("copy:id", "normalize:id", "rewire:id", "verify:id", ...) - set by
+    ///  <see cref="OrchestratorHarness"/> so a test can assert phase order.</summary>
+    public List<string>? EventLog { get; set; }
+
+    /// <summary>P6 METADATA FIX support: the temp file NAME a successful copy
+    ///  reports as <see cref="CopyDesignPhysicalCopyResult.PromotedFromTempFileName"/> -
+    ///  mirrors the real copier's ".p6c-tmp-&lt;guid&gt;-&lt;final name&gt;" shape.</summary>
+    /// <summary>P6 Milestone 3 support: invoked when a copy succeeds (e.g. to
+    ///  create the destination in a <see cref="FakeBackupFileSystem"/>).</summary>
+    public Action<CopyDesignNode>? OnCopied { get; set; }
+
+    public static string TempFileNameFor(CopyDesignNode node) =>
+        $"{CopyDesignAtomicPromotion.TempFileNamePrefix}0123456789abcdef0123456789abcdef-{Path.GetFileName(node.ProposedDestinationAbsolutePath)}";
+
     public Task<CopyDesignPhysicalCopyResult> CopyAsync(CopyDesignNode node, string sourceSha256BeforeOperation, CancellationToken ct)
     {
         Calls.Add(node.CadDocumentId!);
+        EventLog?.Add("copy:" + node.CadDocumentId);
         CapturedSourceSha256BeforeOperation[node.CadDocumentId!] = sourceSha256BeforeOperation;
         if (ThrowFor.Contains(node.CadDocumentId!))
         {
@@ -108,7 +133,8 @@ internal sealed class FakePhysicalCopier : ICopyDesignPhysicalCopier
         }
         if (!FailFor.Contains(node.CadDocumentId!))
         {
-            return Task.FromResult(new CopyDesignPhysicalCopyResult(true, null));
+            OnCopied?.Invoke(node);
+            return Task.FromResult(new CopyDesignPhysicalCopyResult(true, null, PromotedFromTempFileName: TempFileNameFor(node)));
         }
         UnremovedTempPathFor.TryGetValue(node.CadDocumentId!, out var unremovedTempPath);
         return Task.FromResult(new CopyDesignPhysicalCopyResult(false, "simulated copy failure", unremovedTempPath));
@@ -126,9 +152,19 @@ internal sealed class FakeRewirer : ICopyDesignReferenceRewirer
     ///  protection check already validated, never re-resolving independently.</summary>
     public Dictionary<string, IReadOnlyList<CopyDesignReferenceTarget>> CapturedTargets { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>See <see cref="FakePhysicalCopier.EventLog"/>.</summary>
+    public List<string>? EventLog { get; set; }
+
+    /// <summary>P6 Milestone 3 support: invoked as the rewirer's "save" (e.g.
+    ///  to simulate Inventor's OldVersions backup in a <see cref="FakeBackupFileSystem"/>).
+    ///  May throw to simulate a save that fails after the backup appeared.</summary>
+    public Action<CopyDesignNode>? OnSave { get; set; }
+
     public Task<CopyDesignRewireResult> RewireAsync(CopyDesignNode copiedIamNode, IReadOnlyList<CopyDesignReferenceTarget> targets, CancellationToken ct)
     {
         Calls.Add(copiedIamNode.CadDocumentId!);
+        EventLog?.Add("rewire:" + copiedIamNode.CadDocumentId);
+        OnSave?.Invoke(copiedIamNode);
         CapturedTargets[copiedIamNode.CadDocumentId!] = targets;
         return Task.FromResult(FailFor.Contains(copiedIamNode.CadDocumentId!)
             ? new CopyDesignRewireResult(false, "simulated rewire failure")
@@ -155,10 +191,28 @@ internal sealed class FakeVerifier : ICopyDesignVerifier
     ///  verification failures).</summary>
     public HashSet<string> EnumerationFailureFor { get; } = new();
 
+    /// <summary>See <see cref="FakePhysicalCopier.EventLog"/>.</summary>
+    public List<string>? EventLog { get; set; }
+
+    /// <summary>P6 METADATA FIX support: the string iProperties reported for
+    ///  a given cadDocumentId (default: none).</summary>
+    public Dictionary<string, IReadOnlyList<CopyDesignStringPropertyFact>> StringPropertiesFor { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>P6 METADATA FIX support: report
+    ///  <c>PropertyEnumerationSucceeded: false</c> for a given cadDocumentId.</summary>
+    public HashSet<string> PropertyEnumerationFailureFor { get; } = new();
+
+    /// <summary>P6 METADATA FIX support: when set, supplies the destination's
+    ///  ResultingSha256 at the moment verification reads it (default
+    ///  "result-hash") - lets a test prove the hash that is materialized is
+    ///  the one captured AFTER normalization.</summary>
+    public Func<CopyDesignNode, string>? ResultingSha256Provider { get; set; }
+
     public Task<CopyDesignNodeVerificationFacts> GatherFactsAsync(
         CopyDesignNode node, IReadOnlyList<CopyDesignReferenceTarget> referenceTargets, string sourceSha256BeforeOperation, CancellationToken ct)
     {
         Calls.Add(node.CadDocumentId!);
+        EventLog?.Add("verify:" + node.CadDocumentId);
         if (ThrowFor.Contains(node.CadDocumentId!))
         {
             throw ExceptionToThrow;
@@ -173,10 +227,51 @@ internal sealed class FakeVerifier : ICopyDesignVerifier
         return Task.FromResult(new CopyDesignNodeVerificationFacts(
             node.CadDocumentId!, node.SourceAbsolutePath, node.ProposedDestinationAbsolutePath ?? "",
             DestinationExists: !fail, DocumentTypeMatches: true, OpenableThroughInventor: true,
-            ResultingSha256: fail ? null : "result-hash", ResultingFileSize: fail ? null : 100L,
+            ResultingSha256: fail ? null : ResultingSha256Provider?.Invoke(node) ?? "result-hash", ResultingFileSize: fail ? null : 100L,
             SourceSha256BeforeOperation: sourceSha256BeforeOperation,
             SourceSha256AfterOperation: sourceSha256BeforeOperation, ReferenceResolutions: refs,
-            ActualComponentOccurrences: actual, OccurrenceEnumerationSucceeded: enumerationSucceeded));
+            ActualComponentOccurrences: actual, OccurrenceEnumerationSucceeded: enumerationSucceeded,
+            StringProperties: StringPropertiesFor.TryGetValue(node.CadDocumentId!, out var properties) ? properties : null,
+            PropertyEnumerationSucceeded: !PropertyEnumerationFailureFor.Contains(node.CadDocumentId!)));
+    }
+}
+
+/// <summary>P6 METADATA FIX support: a fake <see cref="ICopyDesignMetadataNormalizer"/>.
+///  Succeeds by default and records every call (with the temp file name it
+///  was handed) plus which destinations it "normalized".</summary>
+internal sealed class FakeMetadataNormalizer : ICopyDesignMetadataNormalizer
+{
+    public List<string> Calls { get; } = new();
+    public Dictionary<string, string?> CapturedTempFileName { get; } = new(StringComparer.Ordinal);
+    public HashSet<string> NormalizedDestinations { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> FailFor { get; } = new();
+    public HashSet<string> ThrowFor { get; } = new();
+    public Exception ExceptionToThrow { get; set; } = new InvalidOperationException("simulated normalization exception");
+
+    /// <summary>See <see cref="FakePhysicalCopier.EventLog"/>.</summary>
+    public List<string>? EventLog { get; set; }
+
+    /// <summary>P6 Milestone 3 support: invoked as the normalizer's "save" -
+    ///  see <see cref="FakeRewirer.OnSave"/>.</summary>
+    public Action<CopyDesignNode>? OnSave { get; set; }
+
+    public Task<CopyDesignMetadataNormalizationResult> NormalizeAsync(
+        CopyDesignNode node, string? promotedFromTempFileName, CancellationToken ct)
+    {
+        Calls.Add(node.CadDocumentId!);
+        EventLog?.Add("normalize:" + node.CadDocumentId);
+        CapturedTempFileName[node.CadDocumentId!] = promotedFromTempFileName;
+        OnSave?.Invoke(node);
+        if (ThrowFor.Contains(node.CadDocumentId!))
+        {
+            throw ExceptionToThrow;
+        }
+        if (FailFor.Contains(node.CadDocumentId!))
+        {
+            return Task.FromResult(new CopyDesignMetadataNormalizationResult(false, "simulated normalization failure"));
+        }
+        NormalizedDestinations.Add(node.ProposedDestinationAbsolutePath!);
+        return Task.FromResult(new CopyDesignMetadataNormalizationResult(true, null));
     }
 }
 
@@ -386,8 +481,34 @@ internal sealed class OrchestratorHarness
     ///  file on disk. A path not present here defaults to <c>0</c>.</summary>
     public Dictionary<string, long> FileSizeFor { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>P6 METADATA FIX: wired by default (always succeeds), so EVERY
+    ///  existing orchestrator test also exercises the normalization step's
+    ///  success path; set <see cref="IncludeMetadataNormalizer"/> to
+    ///  <c>false</c> to prove the unconfigured (null) path.</summary>
+    public FakeMetadataNormalizer MetadataNormalizer { get; } = new();
+    public bool IncludeMetadataNormalizer { get; set; } = true;
+
+    /// <summary>P6 METADATA FIX: shared, ordered adapter-call log (see
+    ///  <see cref="FakePhysicalCopier.EventLog"/>).</summary>
+    public List<string> Events { get; } = new();
+
+    /// <summary>P6 Milestone 3: <c>null</c> by default (backup tracking off -
+    ///  every existing test unchanged); set to enable tracking.</summary>
+    public FakeBackupFileSystem? BackupFileSystem { get; set; }
+
+    /// <summary>P6 M4.2: <c>null</c> by default (no observer - every existing
+    ///  test unchanged).</summary>
+    public ICopyDesignApplyProgress? Progress { get; set; }
+
     public CopyDesignApplyOrchestrator Build()
     {
+        Copier.EventLog = Events;
+        MetadataNormalizer.EventLog = Events;
+        Rewirer.EventLog = Events;
+        Verifier.EventLog = Events;
+        DrawingRewirer.EventLog = Events;
+        DrawingVerifier.EventLog = Events;
+
         if (IncludeOperationStatusClient && Reservation.OnResponded is null)
         {
             // A test may have already set Reservation.OnResponded directly
@@ -417,6 +538,82 @@ internal sealed class OrchestratorHarness
             IncludeDrawingAdapters ? DrawingRewirer : null,
             IncludeDrawingAdapters ? DrawingVerifier : null,
             IncludeOperationStatusClient ? OperationStatusClient : null,
-            path => FileSizeFor.TryGetValue(path, out var size) ? size : 0L);
+            path => FileSizeFor.TryGetValue(path, out var size) ? size : 0L,
+            IncludeMetadataNormalizer ? MetadataNormalizer : null,
+            BackupFileSystem,
+            Progress);
+    }
+}
+
+
+/// <summary>P6 Milestone 3 support: an in-memory file system that models
+///  Inventor 2027's MEASURED OldVersions behavior (see CopyDesignBackupTracking.cs):
+///  a save MOVES the previous bytes to <c>&lt;dir&gt;\OldVersions\&lt;stem&gt;.NNNN&lt;ext&gt;</c>
+///  (NNNN from the document's own save count) and rotation keeps only the
+///  newest <see cref="KeepVersions"/> backups PER NAME. "Contents" are opaque
+///  strings standing in for SHA-256 values.</summary>
+internal sealed class FakeBackupFileSystem : ICopyDesignBackupFileSystem
+{
+    public Dictionary<string, string> Files { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> ThrowOnListFor { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> ThrowOnDeleteFor { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public List<string> Deleted { get; } = new();
+    public int KeepVersions { get; set; } = 1;
+    /// <summary>The next backup number per destination (the document's own
+    ///  save count) - defaults to 2, as measured for a once-saved source.</summary>
+    public Dictionary<string, int> NextBackupNumber { get; } = new(StringComparer.OrdinalIgnoreCase);
+    private int _contentSeq;
+
+    public string NewContent(string label) => $"{label}#{++_contentSeq}";
+
+    public static string BackupPath(string destination, int number) =>
+        Path.Combine(CopyDesignBackupNaming.OldVersionsFolderOf(destination),
+            $"{Path.GetFileNameWithoutExtension(destination)}.{number:0000}{Path.GetExtension(destination)}");
+
+    /// <summary>Exactly what Inventor does on Save2 of an existing file.</summary>
+    public string SimulateInventorSave(string destination)
+    {
+        var number = NextBackupNumber.TryGetValue(destination, out var n) ? n : 2;
+        NextBackupNumber[destination] = number + 1;
+        var backup = BackupPath(destination, number);
+        Files[backup] = Files[destination];
+        Files[destination] = NewContent("saved:" + Path.GetFileName(destination));
+        var sameName = ListBackupsOf(destination).OrderBy(b => b.FileName, StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var old in sameName.Take(Math.Max(0, sameName.Count - KeepVersions)))
+        {
+            Files.Remove(old.AbsolutePath);
+        }
+        return backup;
+    }
+
+    public IReadOnlyList<CopyDesignBackupFile> ListBackupsOf(string destinationAbsolutePath)
+    {
+        if (ThrowOnListFor.Contains(destinationAbsolutePath))
+        {
+            throw new IOException("simulated OldVersions read failure");
+        }
+        var folder = CopyDesignBackupNaming.OldVersionsFolderOf(destinationAbsolutePath);
+        var name = Path.GetFileName(destinationAbsolutePath);
+        return Files
+            .Where(f => string.Equals(Path.GetDirectoryName(f.Key), folder, StringComparison.OrdinalIgnoreCase)
+                && CopyDesignBackupNaming.IsBackupOf(Path.GetFileName(f.Key), name))
+            .OrderBy(f => f.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(f => new CopyDesignBackupFile(f.Key, Path.GetFileName(f.Key), f.Value.Length, f.Value))
+            .ToArray();
+    }
+
+    public string ComputeSha256(string absolutePath) =>
+        Files.TryGetValue(absolutePath, out var content) ? content : throw new FileNotFoundException(absolutePath);
+
+    public bool FileExists(string absolutePath) => Files.ContainsKey(absolutePath);
+
+    public void DeleteFile(string absolutePath)
+    {
+        if (ThrowOnDeleteFor.Contains(absolutePath))
+        {
+            throw new IOException("simulated delete failure (file locked)");
+        }
+        Files.Remove(absolutePath);
+        Deleted.Add(absolutePath);
     }
 }

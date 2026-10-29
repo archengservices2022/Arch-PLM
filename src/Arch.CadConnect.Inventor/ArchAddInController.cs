@@ -51,6 +51,16 @@ internal sealed class ArchAddInController : IDisposable
     ///  doc comment for why a single global guard is sufficient here.</summary>
     private readonly Core.CopyDesign.Apply.CopyDesignApplyOperationGuard _copyDesignApplyGuard = new();
 
+    /// <summary>P6 M4.1a: 1 while a Copy Design Apply / Resume / Recover is
+    ///  running (set on the UI thread BEFORE the background work starts,
+    ///  cleared in that work's <c>finally</c>). While set, the ribbon AND
+    ///  <see cref="OnCommandInvoked"/> refuse every command outside
+    ///  <see cref="RibbonCommandPolicy.IsAllowedWhileCopyDesignRuns"/> -
+    ///  in particular Sign In / Sign Out / Server Status.</summary>
+    private int _copyDesignRunning;
+
+    private bool CopyDesignRunning => Volatile.Read(ref _copyDesignRunning) == 1;
+
     /// <summary>P6D ROUND 2 (RESUME): the LAST Apply Copy Design attempt that
     ///  ended <see cref="Core.CopyDesign.Apply.CopyDesignApplyOperationResult.ReservedButUnmaterialized"/>
     ///  - i.e. genuinely resumable - remembered ONLY in this add-in
@@ -86,6 +96,13 @@ internal sealed class ArchAddInController : IDisposable
 
     private bool _disposed;
 
+    /// <summary>P6 M4.2: the local diagnostics log (JSON Lines, one file per
+    ///  attempt under %LOCALAPPDATA%\ArchEngineering\CadConnect\logs).
+    ///  Best-effort - it never changes an operation's outcome, and nothing
+    ///  ever reads it back.</summary>
+    private readonly Core.Diagnostics.IDiagnosticsSink _diagnostics =
+        new Core.Diagnostics.JsonLinesDiagnosticsSink(Core.Diagnostics.JsonLinesDiagnosticsSink.DefaultDirectory);
+
     public ArchAddInController(InventorApi.Application application)
     {
         _application = application;
@@ -101,6 +118,7 @@ internal sealed class ArchAddInController : IDisposable
                 EditorProbe = new InventorEditorDocumentProbe(_application),
             }),
             store: new DpapiSessionStore());
+        _connection.Diagnostics = _diagnostics;
 
         _connection.StateChanged += _ => OnUi(RefreshEnablement);
         _connection.SessionChanged += session => OnUi(() =>
@@ -147,8 +165,52 @@ internal sealed class ArchAddInController : IDisposable
             _connection.State, doc, role,
             hasRememberedUndoTarget: _undoTarget.Current is not null,
             hasResumableCopyDesignAttempt: _resumableCopyDesignAttempt is not null,
-            hasUncertainCopyDesignAttempt: _uncertainCopyDesignAttempt is not null);
+            hasUncertainCopyDesignAttempt: _uncertainCopyDesignAttempt is not null,
+            copyDesignRunning: CopyDesignRunning);
         _ribbon.ApplyEnablement(map);
+    }
+
+    /// <summary>P6 M4.1 SERVER-ORIGIN GUARD (UI layer): refuse - with a clear
+    ///  message, before any dialog or server call - when the workspace
+    ///  <paramref name="workspaceRoot"/> was not materialized from EXACTLY the
+    ///  server this session is signed in to. The connection manager enforces
+    ///  the same rule again for every call that carries a workspace; this
+    ///  layer additionally covers the calls that do not (Copy Design apply /
+    ///  resume / recover / verify, latest-version lookups). See
+    ///  <see cref="WorkspaceServerBinding"/>.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName) =>
+        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession?.Server);
+
+    /// <summary>P6 M4.1a: the same check against an explicit server - the
+    ///  BOUND session's, for a Copy Design attempt.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, ArchServerUri? server)
+    {
+        var binding = WorkspaceServerBinding.CheckWorkspace(workspaceRoot, server);
+        if (binding.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, commandName, binding);
+        Error($"{commandName} was not run. {binding.Message}");
+        return false;
+    }
+
+    /// <summary>M4.1 T5 finding: the same check against the connected server,
+    ///  for a command whose dialog remembers folders -
+    ///  <paramref name="rememberSettingsWhenAllowed"/> runs ONLY when the
+    ///  workspace is allowed, so a refused workspace leaves connect.json
+    ///  untouched.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, Action rememberSettingsWhenAllowed)
+    {
+        var binding = WorkspaceServerBinding.AdmitWorkspace(
+            workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed);
+        if (binding.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, commandName, binding);
+        Error($"{commandName} was not run. {binding.Message}");
+        return false;
     }
 
     private static WorkspaceManifestEntry? LoadManifestEntry(ManagedFileRef file)
@@ -177,6 +239,15 @@ internal sealed class ArchAddInController : IDisposable
 
     private void OnCommandInvoked(ArchCommand command)
     {
+        // P6 M4.1a: enforced HERE, not only by ribbon enablement (which is
+        // refreshed asynchronously and could lag a click).
+        if (CopyDesignRunning && !RibbonCommandPolicy.IsAllowedWhileCopyDesignRuns(command))
+        {
+            Info($"'{command.DisplayName()}' is not available while Copy Design is running. "
+                + "Wait for it to finish - the connection and the documents it uses must not change until then.");
+            return;
+        }
+
         switch (command)
         {
             case ArchCommand.SignIn:
@@ -264,10 +335,24 @@ internal sealed class ArchAddInController : IDisposable
     {
         var file = ActiveManagedFile();
         if (file is null) return;
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Checkout")) return;
 
         CheckoutOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckoutOperation, file, _connection.CurrentSession);
         RunBackground(
-            async ct => result = await _connection.CheckoutAsync(file, ct),
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.CheckoutAsync(file, ct);
+                    PdmDiagnostics.RecordCheckout(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
             "Checking out",
             onDone: () =>
             {
@@ -284,6 +369,7 @@ internal sealed class ArchAddInController : IDisposable
     {
         var file = ActiveManagedFile();
         if (file is null) return;
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Check In")) return;
 
         if (!_tracker.Current.IsSaved)
         {
@@ -298,8 +384,21 @@ internal sealed class ArchAddInController : IDisposable
         if (confirm != DialogResult.OK) return;
 
         CheckInOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckInOperation, file, _connection.CurrentSession);
         RunBackground(
-            async ct => result = await _connection.CheckInAsync(file, ct),
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.CheckInAsync(file, ct);
+                    PdmDiagnostics.RecordCheckIn(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
             "Checking in",
             onDone: () =>
             {
@@ -320,6 +419,7 @@ internal sealed class ArchAddInController : IDisposable
             Info("There is no checked-out managed document to undo. Open the checked-out file, then try again.");
             return;
         }
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Undo Checkout")) return;
 
         var confirm = MessageBox.Show(
             new Win32Owner(SafeMainHwnd()),
@@ -328,8 +428,21 @@ internal sealed class ArchAddInController : IDisposable
         if (confirm != DialogResult.OK) return;
 
         UndoOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.UndoCheckoutOperation, file, _connection.CurrentSession);
         RunBackground(
-            async ct => result = await _connection.UndoCheckoutAsync(file, reason: null, ct),
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.UndoCheckoutAsync(file, reason: null, ct);
+                    PdmDiagnostics.RecordUndo(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
             "Undoing checkout",
             onDone: () =>
             {
@@ -439,6 +552,10 @@ internal sealed class ArchAddInController : IDisposable
             return;
         }
 
+        // P6 M4.1: the managed ids come from the document's workspace (or the
+        // last Get Latest workspace) - never ask a different server about them.
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(_tracker.Current.FullPath), "Reference Health")) return;
+
         LatestVersionLookup? lookup = null;
         RunBackground(
             async ct => lookup = await _connection.GetLatestVersionsAsync(managedIds, ct),
@@ -472,6 +589,10 @@ internal sealed class ArchAddInController : IDisposable
         {
             return;
         }
+
+        // P6 M4.1: the source must come from a workspace of the CONNECTED
+        // server - checked before the dialog and before any server lookup.
+        if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(_tracker.Current.FullPath), "Copy Design Preview")) return;
 
         using var input = new CopyDesignPreviewDialog();
         if (input.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
@@ -631,8 +752,12 @@ internal sealed class ArchAddInController : IDisposable
     /// </summary>
     private void RunCopyDesignApply(CopyDesignPlan plan)
     {
-        using var confirm = new CopyDesignApplyConfirmDialog(plan);
-        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        // P6 Milestone 2: the confirmation is built from the SAME mapping the
+        // orchestrator executes; its fingerprint is passed through below so a
+        // plan that changed after confirmation can never run.
+        var confirmation = Core.CopyDesign.Apply.CopyDesignApplyConfirmationBuilder.Build(plan, destinationExists: SafeFileExists);
+        using var confirm = new CopyDesignApplyConfirmDialog(confirmation);
+        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK || !confirmation.CanApply)
         {
             return;
         }
@@ -652,7 +777,8 @@ internal sealed class ArchAddInController : IDisposable
         // _uncertainCopyDesignAttempt's key - that key is only ever reused by
         // an explicit Recover.
         var attempt = Core.CopyDesign.Apply.CopyDesignApplyAttempt.StartNewAttempt();
-        ExecuteCopyDesignAttempt(plan, attempt.IdempotencyKey, label: null, CopyDesignAttemptKind.Fresh);
+        ExecuteCopyDesignAttempt(plan, attempt.IdempotencyKey, label: null, CopyDesignAttemptKind.Fresh,
+            confirmedFingerprint: confirmation.Fingerprint);
     }
 
     /// <summary>
@@ -747,6 +873,8 @@ internal sealed class ArchAddInController : IDisposable
                 + "documents into.");
             return;
         }
+        if (!EnsureWorkspaceServer(input.SourceWorkspaceRoot, "Resume Copy Design",
+                rememberSettingsWhenAllowed: () => (ConnectSettings.Load() with { LastCopyDesignDestinationFolder = input.DestinationFolder }).Save())) return;
 
         var operationId = input.OperationId;
         var destinationFolder = input.DestinationFolder;
@@ -955,6 +1083,8 @@ internal sealed class ArchAddInController : IDisposable
                 + "documents into.");
             return;
         }
+        if (!EnsureWorkspaceServer(input.SourceWorkspaceRoot, "Verify Copy Design",
+                rememberSettingsWhenAllowed: () => (ConnectSettings.Load() with { LastWorkspaceRoot = input.SourceWorkspaceRoot, LastCopyDesignDestinationFolder = input.DestinationFolder }).Save())) return;
 
         var operationId = input.OperationId;
         var destinationFolder = input.DestinationFolder;
@@ -1177,15 +1307,66 @@ internal sealed class ArchAddInController : IDisposable
     ///  shows the result. Ends at READY FOR MANUAL INVENTOR TEST (or a clear
     ///  failure/cleanup report) - it never auto-accepts or releases
     ///  anything.</summary>
-    private void ExecuteCopyDesignAttempt(CopyDesignPlan plan, string idempotencyKey, string? label, CopyDesignAttemptKind kind)
+    private void ExecuteCopyDesignAttempt(
+        CopyDesignPlan plan, string idempotencyKey, string? label, CopyDesignAttemptKind kind, string? confirmedFingerprint = null)
     {
+        // P6 M4.1: re-checked at EXECUTION time for Apply, Resume and Recover
+        // alike - the connection may have changed since Preview / since the
+        // attempt was remembered. A Resume/Recover against a DIFFERENT server
+        // would send the same idempotency key to a database that has never
+        // seen it and create a second, unrelated reservation.
+        var commandName = kind switch
+        {
+            CopyDesignAttemptKind.Resume => "Resume Copy Design",
+            CopyDesignAttemptKind.Recover => "Recover Copy Design",
+            _ => "Apply Copy Design",
+        };
+
+        // P6 M4.1a SESSION BINDING: the EXACT session this attempt runs
+        // under, captured once. The workspace checks below are made against
+        // ITS server, and every reservation / status / materialization
+        // request of the attempt is addressed with it and refused (nothing
+        // sent) once it is no longer the current session - see
+        // ArchConnectionManager's session-bound overloads.
+        if (_connection.CurrentSession is not { } boundSession)
+        {
+            Core.Diagnostics.RefusalDiagnostics.Command(_diagnostics, commandName, Core.Diagnostics.RefusalDiagnostics.NotSignedIn);
+            Error($"{commandName} was not run. Sign in to the Arch PLM server this workspace belongs to first.");
+            return;
+        }
+        if (CopyDesignRunning)
+        {
+            Core.Diagnostics.RefusalDiagnostics.Command(_diagnostics, commandName, Core.Diagnostics.RefusalDiagnostics.AlreadyRunning);
+            Error($"{commandName} was not run. A Copy Design operation is already running.");
+            return;
+        }
+
+        if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession.Server)) return;
+        foreach (var destination in plan.Nodes
+                     .Where(n => n.ProposedAction == CopyDesignAction.Copy && !string.IsNullOrWhiteSpace(n.ProposedDestinationAbsolutePath))
+                     .Select(n => n.ProposedDestinationAbsolutePath!))
+        {
+            // A destination is normally a plain folder; if it lies inside a
+            // workspace, that workspace must belong to the same server too.
+            if (WorkspaceRootLocator.FindRootForFile(destination) is { } destinationRoot
+                && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server))
+            {
+                return;
+            }
+        }
+
+        // P6 M4.2: one diagnostics log per attempt, started once every guard
+        // above has passed.
+        var log = Core.Diagnostics.CopyDesignDiagnostics.Start(
+            _diagnostics, kind.ToString(), plan, idempotencyKey, boundSession, confirmedFingerprint);
+
         var orchestrator = new Core.CopyDesign.Apply.CopyDesignApplyOrchestrator(
             _copyDesignApplyGuard,
-            new ApplyCopyDesignReservationAdapter(_connection),
+            new ApplyCopyDesignReservationAdapter(_connection, boundSession),
             new Inventor.CopyDesign.InventorCopyDesignPhysicalCopier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher()),
             new Inventor.CopyDesign.InventorCopyDesignReferenceRewirer(_application),
             new Inventor.CopyDesign.InventorCopyDesignVerifier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher()),
-            new MaterializeCopyDesignAdapter(_connection),
+            new MaterializeCopyDesignAdapter(_connection, boundSession),
             new Core.CopyDesign.Apply.CopyDesignFileHasher(),
             sourceExists: File.Exists,
             destinationExists: File.Exists,
@@ -1217,11 +1398,54 @@ internal sealed class ArchAddInController : IDisposable
             // status call itself fails immediately after a successful
             // reservation (a genuine transport/auth problem worth surfacing,
             // not silently swallowed).
-            operationStatusClient: new CopyDesignOperationStatusAdapter(_connection));
+            operationStatusClient: new CopyDesignOperationStatusAdapter(_connection, boundSession),
+            // P6 METADATA FIX: undoes the Part Number Inventor derives from
+            // the operation-owned temp name, on the FINAL promoted path only
+            // (see InventorCopyDesignMetadataNormalizer's doc comment).
+            metadataNormalizer: new Inventor.CopyDesign.InventorCopyDesignMetadataNormalizer(_application),
+            // P6 Milestone 3: OldVersions backup ownership tracking around
+            // every attempt-owned save (see CopyDesignBackupOwnershipEvaluator).
+            backupFileSystem: new Core.CopyDesign.Apply.CopyDesignBackupFileSystem(),
+            // P6 M4.2: phase boundaries into this attempt's diagnostics log.
+            progress: Core.Diagnostics.CopyDesignDiagnostics.Progress(log));
 
         Core.CopyDesign.Apply.CopyDesignApplyOperationResult? result = null;
-        RunBackground(
-            async ct => result = await orchestrator.ExecuteAsync(plan, idempotencyKey, label, ct),
+
+        // P6 M4.1a CONNECTION LOCK: set BEFORE the work is queued (so no click
+        // can slip in between) and cleared in the work's own `finally` - for
+        // success, a refusal, an exception or a timeout alike. A failure to
+        // even queue the work clears it too.
+        Volatile.Write(ref _copyDesignRunning, 1);
+        RefreshEnablement();
+        try
+        {
+            RunCopyDesignAttemptInBackground();
+        }
+        catch
+        {
+            Volatile.Write(ref _copyDesignRunning, 0);
+            RefreshEnablement();
+            throw;
+        }
+
+        void RunCopyDesignAttemptInBackground() => RunBackground(
+            async ct =>
+            {
+                try
+                {
+                    result = await orchestrator.ExecuteAsync(plan, idempotencyKey, label, ct, confirmedFingerprint);
+                    Core.Diagnostics.CopyDesignDiagnostics.RecordResult(log, result);
+                }
+                catch (Exception ex)
+                {
+                    log.Failed(ex);
+                    throw;
+                }
+                finally
+                {
+                    Volatile.Write(ref _copyDesignRunning, 0);
+                }
+            },
             kind switch
             {
                 CopyDesignAttemptKind.Resume => "Resuming Copy Design",
@@ -1291,33 +1515,34 @@ internal sealed class ArchAddInController : IDisposable
     /// <summary>Thin adapter: <see cref="ArchConnectionManager"/> already owns
     ///  the current session/API factory - this just satisfies the Core-level
     ///  seam without Core ever depending on the Api project's connection
-    ///  machinery.</summary>
-    private sealed class ApplyCopyDesignReservationAdapter(ArchConnectionManager connection)
+    ///  machinery. P6 M4.1a: every adapter is BOUND to the session the
+    ///  attempt started with - see <see cref="ExecuteCopyDesignAttempt"/>.</summary>
+    private sealed class ApplyCopyDesignReservationAdapter(ArchConnectionManager connection, IArchSession boundSession)
         : Core.CopyDesign.Apply.ICopyDesignReservationClient
     {
         public Task<Core.CopyDesign.Apply.CopyDesignReservationResponse> ApplyAsync(
             Core.CopyDesign.Apply.CopyDesignApplyRequest request, CancellationToken ct) =>
-            connection.ApplyCopyDesignAsync(request, ct);
+            connection.ApplyCopyDesignAsync(request, boundSession, ct);
     }
 
-    private sealed class MaterializeCopyDesignAdapter(ArchConnectionManager connection)
+    private sealed class MaterializeCopyDesignAdapter(ArchConnectionManager connection, IArchSession boundSession)
         : Core.CopyDesign.Apply.ICopyDesignMaterializer
     {
         public Task<Core.CopyDesign.Apply.CopyDesignMaterializationResult> MaterializeFirstFileVersionAsync(
             Core.CopyDesign.Apply.CopyDesignMaterializeRequest request, CancellationToken ct) =>
-            connection.MaterializeFirstFileVersionAsync(request, ct);
+            connection.MaterializeFirstFileVersionAsync(request, boundSession, ct);
     }
 
     /// <summary>P6D ROUND 3, HIGH fix (items D/E): thin adapter over
     ///  <see cref="ArchConnectionManager.GetCopyDesignOperationStatusAsync"/> -
     ///  the ONLY thing that lets the orchestrator's RESUME classification
     ///  consult the authoritative per-operation status endpoint.</summary>
-    private sealed class CopyDesignOperationStatusAdapter(ArchConnectionManager connection)
+    private sealed class CopyDesignOperationStatusAdapter(ArchConnectionManager connection, IArchSession boundSession)
         : Core.CopyDesign.Apply.ICopyDesignOperationStatusClient
     {
         public Task<Core.CopyDesign.Apply.CopyDesignOperationStatusResult> GetStatusAsync(
             Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation expectation, CancellationToken ct) =>
-            connection.GetCopyDesignOperationStatusAsync(expectation, ct);
+            connection.GetCopyDesignOperationStatusAsync(expectation, boundSession, ct);
     }
 
     // ---- P5C: controlled reference repair --------------------------
@@ -1360,6 +1585,7 @@ internal sealed class ArchAddInController : IDisposable
             Info("Repair Reference found no managed references on this document. Nothing to repair.");
             return;
         }
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(_tracker.Current.FullPath), "Repair Reference")) return;
 
         var activePath = _tracker.Current.FullPath!;
         var roots = WorkspaceRootsForDocument(activePath).Where(r => r is not null).Select(r => r!).ToList();
@@ -1442,6 +1668,10 @@ internal sealed class ArchAddInController : IDisposable
 
     private void BeginFinalRepairPreflight(ReferenceRepairPlan previewed, IReadOnlyList<string> roots)
     {
+        // P6 M4.1: re-checked after the (modal) Repair dialog - the user may
+        // have signed in to another server while it was open.
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(previewed.ReferencingDocumentPath), "Repair Reference")) return;
+
         var parentEntry = FindManifestEntry(previewed.ReferencingDocumentPath, roots);
         var parentIds = parentEntry is { CadDocumentId.Length: > 0 }
             ? new[] { parentEntry.CadDocumentId }
@@ -1757,6 +1987,21 @@ internal sealed class ArchAddInController : IDisposable
             workspaceRoot = dialog.WorkspaceRoot;
         }
 
+        // P6 M4.1: a folder that already belongs to another server is never
+        // refreshed (and silently re-bound) from this one. The connection
+        // manager enforces this again before any request. Only an allowed
+        // folder is remembered as the last workspace.
+        var target = WorkspaceServerBinding.AdmitGetLatestTarget(
+            workspaceRoot,
+            _connection.CurrentSession?.Server,
+            rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save());
+        if (!target.Allowed)
+        {
+            Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, "Get Latest", target);
+            Error($"Get Latest was not run. {target.Message}");
+            return;
+        }
+
         var request = new GetLatestRequest
         {
             Root = CadDocumentLookup.ByNumber(documentNumber: documentNumber, documentType: documentType),
@@ -1764,8 +2009,21 @@ internal sealed class ArchAddInController : IDisposable
         };
 
         MaterializationReport? report = null;
+        var log = PdmDiagnostics.StartGetLatest(_diagnostics, request, _connection.CurrentSession);
         RunBackground(
-            async ct => report = await _connection.GetLatestAsync(request, ct),
+            async ct =>
+            {
+                try
+                {
+                    report = await _connection.GetLatestAsync(request, ct);
+                    PdmDiagnostics.RecordGetLatest(log, report);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
             "Getting latest",
             onDone: () =>
             {
@@ -1808,6 +2066,14 @@ internal sealed class ArchAddInController : IDisposable
             Error(text);
         }
     }
+
+    /// <summary>P6 M4.1: the workspace whose manifest supplied the managed
+    ///  identities a reference command is about to send to the server - the
+    ///  active document's own workspace, or (for a document outside any
+    ///  workspace) the last Get Latest workspace, mirroring
+    ///  <see cref="WorkspaceRootsForDocument"/>.</summary>
+    private static string? IdentityWorkspaceRoot(string? activeDocumentPath) =>
+        WorkspaceRootLocator.FindRootForFile(activeDocumentPath) ?? SafeLastWorkspaceRoot();
 
     private static IEnumerable<string?> KnownWorkspaceRoots()
     {

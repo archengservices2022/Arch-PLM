@@ -40,7 +40,9 @@ namespace Arch.CadConnect.Core.CopyDesign.Apply;
 ///     <see cref="CopyDesignExecutionOrderPlanner"/>, which already ignores
 ///     any non-Component edge);
 ///  8. PHASE 1: physically copy every COPY model node, journalling each
-///     success;
+///     success - then (P6 METADATA FIX) normalize its metadata on the FINAL
+///     promoted path via the optional <c>metadataNormalizer</c> (PHASE 4
+///     does the same for each drawing);
 ///  9. PHASE 2: rewire every copied IAM's COMPONENT references (COPY child ->
 ///     its copied destination; REUSE child -> unchanged, confirmed only);
 ///  10. PHASE 3: verify every COPY model node (destination, type, openability,
@@ -197,13 +199,63 @@ public sealed class CopyDesignApplyOrchestrator(
     ///  the RESUME integrity check stays testable with fakes, matching every
     ///  other file-touching seam in this class. Defaults to the real
     ///  filesystem when omitted (every existing caller).</summary>
-    Func<string, long>? getFileSize = null)
+    Func<string, long>? getFileSize = null,
+    /// <summary>P6 METADATA FIX: normalizes each freshly-created COPY
+    ///  destination's metadata (the Part Number Inventor derived from the
+    ///  operation-owned temp name) on the FINAL promoted path, immediately
+    ///  after that destination is journalled and BEFORE rewiring,
+    ///  verification, or materialization - so a normalization failure is
+    ///  cleaned up like any other post-creation failure and can never be
+    ///  uploaded or materialized. <c>null</c> (the default) skips
+    ///  normalization entirely - every existing caller and test keeps working
+    ///  unmodified; verification's own temp-name leak rule (see
+    ///  <see cref="CopyDesignVerificationEvaluator"/>) still fails closed on
+    ///  any leak regardless.</summary>
+    ICopyDesignMetadataNormalizer? metadataNormalizer = null,
+    /// <summary>P6 Milestone 3: when supplied, every attempt-owned save
+    ///  (metadata normalization, IAM rewiring, drawing rewiring) is wrapped
+    ///  in OldVersions ownership tracking (see <see cref="CopyDesignBackupOwnershipEvaluator"/>):
+    ///  a pre-existing backup named like a destination blocks the attempt
+    ///  before any physical change; only backups PROVED to be this attempt's
+    ///  are journalled, cleaned up on failure and swept at the end; any
+    ///  unexplained backup change fails closed. <c>null</c> (the default)
+    ///  disables tracking entirely - every existing caller and test keeps
+    ///  working unmodified.</summary>
+    ICopyDesignBackupFileSystem? backupFileSystem = null,
+    /// <summary>M4.2: optional observer of phase boundaries for the
+    ///  diagnostics log. Observation only - never consulted, and a throwing
+    ///  observer is ignored (see <see cref="Progress"/>). <c>null</c> (the
+    ///  default) reports nothing - every existing caller and test keeps
+    ///  working unmodified.</summary>
+    ICopyDesignApplyProgress? progress = null)
 {
     private readonly Func<string, long> _getFileSize = getFileSize ?? (path => new FileInfo(path).Length);
+
+    private void Progress(string step, string? operationId = null, string? cadDocumentId = null, string? detail = null)
+    {
+        if (progress is null) return;
+        try
+        {
+            progress.Report(new CopyDesignApplyProgressEvent(step, operationId, cadDocumentId, detail));
+        }
+        catch
+        {
+            // observation only - never affects the attempt
+        }
+    }
     private static readonly HashSet<CadDocumentType> DrawingTypes = new() { CadDocumentType.Idw, CadDocumentType.Dwg };
 
+    /// <param name="expectedConfirmationFingerprint">P6 Milestone 2: the
+    ///  <see cref="CopyDesignApplyConfirmation.Fingerprint"/> the engineer
+    ///  actually confirmed. When supplied, the mapping about to be executed
+    ///  must produce the IDENTICAL fingerprint, or the attempt stops with
+    ///  <see cref="CopyDesignApplyOutcome.MappingFailed"/> before any server
+    ///  call or physical mutation - a changed/stale plan can never run under
+    ///  a confirmation that showed something else. <c>null</c> (Resume /
+    ///  Recover, which have their own confirmation surfaces) skips the check.</param>
     public async Task<CopyDesignApplyOperationResult> ExecuteAsync(
-        CopyDesignPlan plan, string idempotencyKey, string? label, CancellationToken ct = default)
+        CopyDesignPlan plan, string idempotencyKey, string? label, CancellationToken ct = default,
+        string? expectedConfirmationFingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
 
@@ -252,6 +304,21 @@ public sealed class CopyDesignApplyOrchestrator(
             return CopyDesignApplyOperationResult.Simple(CopyDesignApplyOutcome.MappingFailed, mapping.FailureReason!, idempotencyKey);
         }
         var request = mapping.Request!;
+        Progress("mapped", detail: request.Entries.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        // P6 Milestone 2: what runs must be EXACTLY what was confirmed.
+        if (expectedConfirmationFingerprint is not null
+            && !string.Equals(
+                CopyDesignApplyConfirmationBuilder.ComputeFingerprint(request, plan.ModelFilesOnlyAcknowledged),
+                expectedConfirmationFingerprint,
+                StringComparison.Ordinal))
+        {
+            return CopyDesignApplyOperationResult.Simple(
+                CopyDesignApplyOutcome.MappingFailed,
+                "The Copy Design plan changed after it was confirmed - refusing to apply a mapping the engineer did "
+                + "not see. Run Copy Design Preview again and confirm the new mapping.",
+                idempotencyKey);
+        }
 
         // ---- 3. revalidate (RESUME-agnostic half only - duplicate-within-
         //         request, self-overwrite, source-still-exists) - safe here,
@@ -299,6 +366,7 @@ public sealed class CopyDesignApplyOrchestrator(
         {
             try
             {
+                Progress("reservation.sent", detail: attempt.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 response = await reservationClient.ApplyAsync(request, ct).ConfigureAwait(false);
                 lastReservationException = null;
                 break;
@@ -307,6 +375,7 @@ public sealed class CopyDesignApplyOrchestrator(
             {
                 lastReservationException = ex;
                 var isTransient = isTransientReservationFailure?.Invoke(ex) ?? false;
+                Progress("reservation.failed", detail: isTransient ? "transient" : "deterministic");
                 if (!isTransient || attempt >= attempts)
                 {
                     break;
@@ -351,6 +420,7 @@ public sealed class CopyDesignApplyOrchestrator(
                 idempotencyKey);
         }
         var operationId = validated.CopyDesignOperationId!;
+        Progress("reservation.validated", operationId);
         var resultingIdByCadDocumentId = validated.Entries.ToDictionary(e => e.Node.CadDocumentId!, e => e.ResultingCadDocumentId, StringComparer.Ordinal);
 
         // P6D ROUND 3, item G: SEED entryOutcomes for EVERY entry the NOW-
@@ -608,6 +678,42 @@ public sealed class CopyDesignApplyOrchestrator(
                 operationId, FinalizeOutcomes(entryOutcomes), null, idempotencyKey);
         }
 
+        // ---- 6d. P6 Milestone 3: no HISTORICAL OldVersions backup may share
+        //          a destination's name - Inventor's rotation deletes older
+        //          backups of the same name on save, so this attempt's saves
+        //          could destroy one. Checked for exactly the entries this
+        //          attempt will physically create (never an already-
+        //          materialized RESUME entry). Fail closed; nothing is ever
+        //          moved or deleted to "make room". ---------------------------
+        if (backupFileSystem is not null)
+        {
+            var historicalBackups = new List<string>();
+            foreach (var entry in copyEntries.Where(e => !alreadyMaterialized.ContainsKey(e.Node.CadDocumentId!)))
+            {
+                try
+                {
+                    historicalBackups.AddRange(backupFileSystem.ListBackupsOf(entry.Node.ProposedDestinationAbsolutePath!).Select(b => b.AbsolutePath));
+                }
+                catch (Exception ex)
+                {
+                    return new CopyDesignApplyOperationResult(
+                        CopyDesignApplyOutcome.RevalidationFailed,
+                        $"Could not read the OldVersions folder for \"{entry.Node.ProposedDestinationFileName}\" ({ex.Message}) - "
+                        + "backup ownership cannot be guaranteed, refusing to continue (fail closed).",
+                        operationId, FinalizeOutcomes(entryOutcomes), null, idempotencyKey);
+                }
+            }
+            if (historicalBackups.Count > 0)
+            {
+                return new CopyDesignApplyOperationResult(
+                    CopyDesignApplyOutcome.RevalidationFailed,
+                    "Existing Inventor OldVersions backup(s) share a destination's name - this attempt's saves could make "
+                    + "Inventor's backup rotation delete them. They were NOT touched; move or remove them deliberately, then "
+                    + "retry: " + string.Join(", ", historicalBackups.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)),
+                    operationId, FinalizeOutcomes(entryOutcomes), null, idempotencyKey);
+            }
+        }
+
         // ---- 7. execution order (MODEL nodes only - a drawing never
         //         participates in this ordering; see CopyDesignExecutionOrderPlanner,
         //         which already ignores any non-Component edge) -----------
@@ -644,6 +750,7 @@ public sealed class CopyDesignApplyOrchestrator(
         // ==================================================================
 
         // ---- 8. PHASE 1: physical copy (models) -----------------------------
+        Progress("models.copy", operationId);
         foreach (var node in modelCopyNodesInOrder)
         {
             // RESUME: already materialized in a prior attempt - never
@@ -668,7 +775,7 @@ public sealed class CopyDesignApplyOrchestrator(
 
             if (!copyResult.Success)
             {
-                var cleanup = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+                var cleanup = CleanUpAttempt(journal);
                 // CODEX ROUND 3, MEDIUM fix: reuse the EXISTING FailureReason/
                 // "Reason:" reporting surface for an unremoved operation-owned
                 // temp artifact - never a new UI section, and never silently
@@ -688,16 +795,32 @@ public sealed class CopyDesignApplyOrchestrator(
             entryOutcomes[node.CadDocumentId!] = new CopyDesignApplyEntryOutcome(
                 resultingIdByCadDocumentId[node.CadDocumentId!], CopyDesignApplyEntryAction.Copy,
                 node.ProposedDestinationAbsolutePath, PhysicallyCreated: true, VerificationPassed: null, Materialization: null);
+
+            // P6 METADATA FIX: normalize on the FINAL promoted path, now that
+            // the destination is journalled - a failure cleans up exactly
+            // what THIS attempt created and never reaches materialization.
+            var (normalization, normalizationBackupProblem) = await RunTrackedSaveAsync(
+                node, journal, resultingIdByCadDocumentId[node.CadDocumentId!], () => NormalizeMetadataAsync(node, copyResult, ct)).ConfigureAwait(false);
+            var normalizationFailure = normalizationBackupProblem ?? (normalization!.Success ? null : normalization.FailureReason);
+            if (normalizationFailure is not null)
+            {
+                var cleanup = CleanUpAttempt(journal);
+                return new CopyDesignApplyOperationResult(
+                    CopyDesignApplyOutcome.PhysicalCopyFailed,
+                    $"Metadata normalization failed for \"{node.SourceFileName}\": {normalizationFailure}",
+                    operationId, FinalizeOutcomes(entryOutcomes), cleanup, idempotencyKey);
+            }
         }
 
         // ---- 9. PHASE 2: reference rewiring (copied IAMs only) --------------
+        Progress("models.rewire", operationId);
         var referenceTargetsByNode = new Dictionary<string, IReadOnlyList<CopyDesignReferenceTarget>>(StringComparer.Ordinal);
         foreach (var node in modelCopyNodesInOrder.Where(n => n.DocumentType == CadDocumentType.Iam && !alreadyMaterialized.ContainsKey(n.CadDocumentId!)))
         {
             var mappingResult = CopyDesignReferenceTargetResolver.Resolve(node, plan.Edges, plan.Nodes);
             if (!mappingResult.Success)
             {
-                var cleanup = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+                var cleanup = CleanUpAttempt(journal);
                 return new CopyDesignApplyOperationResult(
                     CopyDesignApplyOutcome.ReferenceRewiringFailed,
                     $"Reference mapping failed for \"{node.SourceFileName}\": {mappingResult.FailureReason}",
@@ -708,7 +831,9 @@ public sealed class CopyDesignApplyOrchestrator(
             CopyDesignRewireResult rewireResult;
             try
             {
-                rewireResult = await rewirer.RewireAsync(node, mappingResult.Targets, ct).ConfigureAwait(false);
+                var (rewired, rewireBackupProblem) = await RunTrackedSaveAsync(
+                    node, journal, resultingIdByCadDocumentId[node.CadDocumentId!], () => rewirer.RewireAsync(node, mappingResult.Targets, ct)).ConfigureAwait(false);
+                rewireResult = rewireBackupProblem is not null ? new CopyDesignRewireResult(false, rewireBackupProblem) : rewired!;
             }
             catch (Exception ex)
             {
@@ -716,7 +841,7 @@ public sealed class CopyDesignApplyOrchestrator(
             }
             if (!rewireResult.Success)
             {
-                var cleanup = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+                var cleanup = CleanUpAttempt(journal);
                 return new CopyDesignApplyOperationResult(
                     CopyDesignApplyOutcome.ReferenceRewiringFailed,
                     $"Reference rewiring failed for \"{node.SourceFileName}\": {rewireResult.FailureReason}",
@@ -733,6 +858,7 @@ public sealed class CopyDesignApplyOrchestrator(
         //          outcome, preserves the CopyDesignOperationId, and reports
         //          cleanup honestly - and it NEVER claims the server
         //          reservation itself was rolled back, since it was not.) --
+        Progress("models.verify", operationId);
         var allFacts = new List<CopyDesignNodeVerificationFacts>();
         foreach (var node in modelCopyNodesInOrder)
         {
@@ -755,7 +881,7 @@ public sealed class CopyDesignApplyOrchestrator(
                 // physical creation is an INCOMPLETE, unverified state, never
                 // a clean no-op abort - it must be cleaned up exactly like
                 // any other verification failure, never left dangling.
-                var cleanupOnException = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+                var cleanupOnException = CleanUpAttempt(journal);
                 return new CopyDesignApplyOperationResult(
                     CopyDesignApplyOutcome.VerificationFailed,
                     $"Verification could not complete for \"{node.SourceFileName}\": {ex.Message}. "
@@ -772,7 +898,7 @@ public sealed class CopyDesignApplyOrchestrator(
         }
         if (!verification.Passed)
         {
-            var cleanup = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+            var cleanup = CleanUpAttempt(journal);
             return new CopyDesignApplyOperationResult(
                 CopyDesignApplyOutcome.VerificationFailed,
                 "Verification failed: " + string.Join(" | ", verification.AllReasons),
@@ -961,6 +1087,7 @@ public sealed class CopyDesignApplyOrchestrator(
             //      correctness matters more than avoiding an extra hash. ---
             if (drawingFailureOutcome is null)
             {
+                Progress("drawings.copy", operationId);
                 foreach (var node in drawingCopyNodesInOrder)
                 {
                     // RESUME: already materialized in a prior attempt - never
@@ -1029,6 +1156,21 @@ public sealed class CopyDesignApplyOrchestrator(
                         entryOutcomes[node.CadDocumentId!] = new CopyDesignApplyEntryOutcome(
                             resultingIdByCadDocumentId[node.CadDocumentId!], CopyDesignApplyEntryAction.Copy,
                             node.ProposedDestinationAbsolutePath, PhysicallyCreated: true, VerificationPassed: null, Materialization: null);
+
+                        // P6 METADATA FIX: normalize on the FINAL promoted
+                        // path BEFORE the post-attempt integrity recheck
+                        // below, so that recheck also covers this open/save.
+                        // A failure becomes an ordinary drawing physical-copy
+                        // failure - the destination is already journalled in
+                        // drawingJournal, so it is cleaned up, never
+                        // materialized.
+                        var (normalization, normalizationBackupProblem) = await RunTrackedSaveAsync(
+                            node, drawingJournal, resultingIdByCadDocumentId[node.CadDocumentId!], () => NormalizeMetadataAsync(node, copyResult, ct)).ConfigureAwait(false);
+                        var normalizationFailure = normalizationBackupProblem ?? (normalization!.Success ? null : normalization.FailureReason);
+                        if (normalizationFailure is not null)
+                        {
+                            copyResult = new CopyDesignPhysicalCopyResult(false, $"metadata normalization failed: {normalizationFailure}");
+                        }
                     }
 
                     var postAttemptViolations = RecheckIntegrityBaseline(relevantSourcePaths, integrityBaseline);
@@ -1070,6 +1212,7 @@ public sealed class CopyDesignApplyOrchestrator(
             //      somehow mutable). ------------------------------------
             if (drawingFailureOutcome is null)
             {
+                Progress("drawings.rewire", operationId);
                 foreach (var node in nonResumedDrawings)
                 {
                     var targets = drawingModelTargetsByNode[node.CadDocumentId!];
@@ -1077,7 +1220,9 @@ public sealed class CopyDesignApplyOrchestrator(
                     CopyDesignRewireResult rewireResult;
                     try
                     {
-                        rewireResult = await drawingRewirer!.RewireAsync(node, targets, ct).ConfigureAwait(false);
+                        var (rewired, rewireBackupProblem) = await RunTrackedSaveAsync(
+                            node, drawingJournal, resultingIdByCadDocumentId[node.CadDocumentId!], () => drawingRewirer!.RewireAsync(node, targets, ct)).ConfigureAwait(false);
+                        rewireResult = rewireBackupProblem is not null ? new CopyDesignRewireResult(false, rewireBackupProblem) : rewired!;
                     }
                     catch (Exception ex)
                     {
@@ -1095,6 +1240,7 @@ public sealed class CopyDesignApplyOrchestrator(
             // ---- 13. PHASE 6: drawing verification (HIGH 5 pattern) --------
             if (drawingFailureOutcome is null)
             {
+                Progress("drawings.verify", operationId);
                 foreach (var node in nonResumedDrawings)
                 {
                     var targets = drawingModelTargetsByNode.TryGetValue(node.CadDocumentId!, out var t) ? t : Array.Empty<CopyDesignReferenceTarget>();
@@ -1180,7 +1326,7 @@ public sealed class CopyDesignApplyOrchestrator(
 
             if (drawingFailureOutcome is not null)
             {
-                drawingCleanup = CopyDesignCleanupPlanner.CleanUp(drawingJournal, deleteFile);
+                drawingCleanup = CleanUpAttempt(drawingJournal);
             }
         }
 
@@ -1229,6 +1375,7 @@ public sealed class CopyDesignApplyOrchestrator(
                     facts.ResultingSha256!,
                     facts.ResultingFileSize!.Value);
                 var materialization = await materializer.MaterializeFirstFileVersionAsync(materializeRequest, ct).ConfigureAwait(false);
+                Progress("materialize", operationId, resultingCadDocumentId, materialization.Outcome.ToString());
                 anyGap |= materialization.Outcome != CopyDesignMaterializationOutcome.Materialized;
                 var existing = entryOutcomes[node.CadDocumentId!];
                 entryOutcomes[node.CadDocumentId!] = existing with { Materialization = materialization };
@@ -1252,9 +1399,13 @@ public sealed class CopyDesignApplyOrchestrator(
 
         if (drawingFailureOutcome is not null)
         {
+            // P6 Milestone 3: the verified MODELS' intermediate backups are
+            // swept; the failed drawings' backups were already removed with
+            // the rest of the drawing cleanup.
             return new CopyDesignApplyOperationResult(
                 drawingFailureOutcome.Value, drawingFailureReason, operationId,
-                FinalizeOutcomes(entryOutcomes), drawingCleanup, idempotencyKey);
+                FinalizeOutcomes(entryOutcomes), drawingCleanup, idempotencyKey,
+                BackupCleanup: SweepOwnedBackups(journal, drawingJournal));
         }
 
         var drawingFactsBySourceId = allDrawingFacts.ToDictionary(f => f.CadDocumentId, StringComparer.Ordinal);
@@ -1278,6 +1429,7 @@ public sealed class CopyDesignApplyOrchestrator(
                 facts.ResultingSha256!,
                 facts.ResultingFileSize!.Value);
             var materialization = await materializer.MaterializeFirstFileVersionAsync(materializeRequest, ct).ConfigureAwait(false);
+            Progress("materialize", operationId, resultingCadDocumentId, materialization.Outcome.ToString());
             anyGap |= materialization.Outcome != CopyDesignMaterializationOutcome.Materialized;
             var existing = entryOutcomes[node.CadDocumentId!];
             entryOutcomes[node.CadDocumentId!] = existing with { Materialization = materialization };
@@ -1287,7 +1439,124 @@ public sealed class CopyDesignApplyOrchestrator(
         // above, BEFORE the drawing-failure return - see the ROUND 2,
         // MEDIUM fix comment there.
         var finalOutcome = anyGap ? CopyDesignApplyOutcome.SucceededWithMaterializationGaps : CopyDesignApplyOutcome.Succeeded;
-        return new CopyDesignApplyOperationResult(finalOutcome, null, operationId, FinalizeOutcomes(entryOutcomes), null, idempotencyKey);
+        // P6 Milestone 3: every final file is verified - the intermediate
+        // backups this attempt PROVED it created have no further value (the
+        // first one even carries the leaked temp-name metadata). Swept here,
+        // each re-proven by hash; failures are reported, never hidden.
+        return new CopyDesignApplyOperationResult(finalOutcome, null, operationId, FinalizeOutcomes(entryOutcomes), null, idempotencyKey,
+            BackupCleanup: SweepOwnedBackups(journal, drawingJournal));
+    }
+
+    /// <summary>P6 Milestone 3: deletes this attempt's created destinations
+    ///  (unchanged P6C behavior) AND then the OldVersions backups it PROVED it
+    ///  created, as ONE report.</summary>
+    private CopyDesignCleanupReport CleanUpAttempt(CopyDesignExecutionJournal journal)
+    {
+        var report = CopyDesignCleanupPlanner.CleanUp(journal, deleteFile);
+        if (backupFileSystem is null || journal.OwnedBackups.Count == 0)
+        {
+            return report;
+        }
+        var backups = CopyDesignBackupCleanup.CleanUpOwnedBackups(journal, backupFileSystem);
+        return new CopyDesignCleanupReport(report.Outcomes.Concat(backups.Outcomes).ToArray());
+    }
+
+    private CopyDesignCleanupReport? SweepOwnedBackups(params CopyDesignExecutionJournal[] journals)
+    {
+        if (backupFileSystem is null)
+        {
+            return null;
+        }
+        var outcomes = journals.SelectMany(j => CopyDesignBackupCleanup.CleanUpOwnedBackups(j, backupFileSystem).Outcomes).ToArray();
+        return outcomes.Length == 0 ? null : new CopyDesignCleanupReport(outcomes);
+    }
+
+    /// <summary>P6 Milestone 3: runs ONE attempt-owned save with OldVersions
+    ///  ownership tracking. Snapshot first (destination hash + every backup
+    ///  named like it) - if that fails, the save is NOT attempted. After the
+    ///  save (even one that threw), only backups proved to be this attempt's
+    ///  are journalled; a backup rotated away by Inventor is forgotten; any
+    ///  unexplained change is returned as a problem (the caller fails the
+    ///  step). An exception from the save itself is rethrown unchanged after
+    ///  tracking, so existing per-step error handling is preserved.</summary>
+    private async Task<(T? Result, string? BackupProblem)> RunTrackedSaveAsync<T>(
+        CopyDesignNode node, CopyDesignExecutionJournal journal, string resultingCadDocumentId, Func<Task<T>> save)
+        where T : class
+    {
+        if (backupFileSystem is null)
+        {
+            return (await save().ConfigureAwait(false), null);
+        }
+
+        var destination = node.ProposedDestinationAbsolutePath!;
+        CopyDesignBackupSnapshot before;
+        try
+        {
+            before = new CopyDesignBackupSnapshot(destination, backupFileSystem.ComputeSha256(destination), backupFileSystem.ListBackupsOf(destination));
+        }
+        catch (Exception ex)
+        {
+            return (null, $"OldVersions backup ownership could not be established before saving \"{node.SourceFileName}\" "
+                + $"({ex.Message}) - the save was not attempted (fail closed).");
+        }
+
+        T? result = null;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? thrown = null;
+        try
+        {
+            result = await save().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            thrown = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+        }
+
+        string? problem;
+        try
+        {
+            var evaluation = CopyDesignBackupOwnershipEvaluator.Evaluate(
+                before, backupFileSystem.ListBackupsOf(destination), journal.OwnedBackups.Select(b => b.AbsolutePath).ToArray());
+            foreach (var rotated in evaluation.RotatedAwayOwnedPaths)
+            {
+                journal.ForgetOwnedBackup(rotated);
+            }
+            foreach (var owned in evaluation.NewlyOwned)
+            {
+                journal.RecordOwnedBackup(resultingCadDocumentId, owned);
+            }
+            problem = evaluation.Success
+                ? null
+                : $"OldVersions backup ownership could not be established for \"{node.SourceFileName}\": {string.Join(" ", evaluation.Problems)}";
+        }
+        catch (Exception ex)
+        {
+            problem = $"The OldVersions folder could not be re-read after saving \"{node.SourceFileName}\" ({ex.Message}) - fail closed.";
+        }
+
+        thrown?.Throw();
+        return (result, problem);
+    }
+
+    /// <summary>P6 METADATA FIX: runs the OPTIONAL <c>metadataNormalizer</c>
+    ///  for a destination that was just created - ANY exception (cancellation
+    ///  included: it lands AFTER physical creation, so it is an incomplete,
+    ///  unnormalized state, never a clean no-op - the HIGH 5 discipline) is
+    ///  reported as a failure, never allowed to escape uncontrolled.</summary>
+    private async Task<CopyDesignMetadataNormalizationResult> NormalizeMetadataAsync(
+        CopyDesignNode node, CopyDesignPhysicalCopyResult copyResult, CancellationToken ct)
+    {
+        if (metadataNormalizer is null)
+        {
+            return new CopyDesignMetadataNormalizationResult(true, null);
+        }
+        try
+        {
+            return await metadataNormalizer.NormalizeAsync(node, copyResult.PromotedFromTempFileName, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return new CopyDesignMetadataNormalizationResult(false, ex.Message);
+        }
     }
 
     private static IReadOnlyList<CopyDesignApplyEntryOutcome> FinalizeOutcomes(

@@ -24,6 +24,11 @@ public sealed record CopyDesignReferenceResolutionFact(
 ///  reports this occurrence as unresolved.</summary>
 public sealed record CopyDesignActualComponentOccurrence(string? ResolvedAbsolutePath);
 
+/// <summary>P6 METADATA FIX: ONE string-valued iProperty actually read from
+///  the FINAL destination document (as saved on disk) by the verification
+///  pass - see <see cref="CopyDesignNodeVerificationFacts.StringProperties"/>.</summary>
+public sealed record CopyDesignStringPropertyFact(string PropertySetName, string PropertyName, string Value);
+
 /// <summary>
 /// Every fact <see cref="CopyDesignVerificationEvaluator"/> needs to decide
 /// whether ONE COPY node's result is trustworthy - gathered entirely by the
@@ -71,7 +76,22 @@ public sealed record CopyDesignNodeVerificationFacts(
     ///  an empty <see cref="ActualComponentOccurrences"/> looks identical to
     ///  "there was nothing to enumerate" when it actually means "enumeration
     ///  failed and lost the real, possibly non-empty, set".</summary>
-    bool OccurrenceEnumerationSucceeded = true);
+    bool OccurrenceEnumerationSucceeded = true,
+    /// <summary>P6 METADATA FIX: every string-valued iProperty the
+    ///  verification pass read from the FINAL destination document - AFTER
+    ///  metadata normalization, from a fresh open of the saved file. ANY value
+    ///  carrying an operation-owned temp file name fails verification (see
+    ///  <see cref="CopyDesignTempNameLeak"/>). <c>null</c> is treated as
+    ///  empty.</summary>
+    IReadOnlyList<CopyDesignStringPropertyFact>? StringProperties = null,
+    /// <summary>P6 METADATA FIX: <c>false</c> when reading the destination's
+    ///  iProperties was attempted and FAILED (or the critical Part Number
+    ///  could not be read at all) - REQUIRED to be <c>true</c> by
+    ///  <see cref="CopyDesignVerificationEvaluator"/>, mirroring
+    ///  <see cref="OccurrenceEnumerationSucceeded"/>: an empty
+    ///  <see cref="StringProperties"/> must never pass merely because the
+    ///  read itself failed.</summary>
+    bool PropertyEnumerationSucceeded = true);
 
 public sealed record CopyDesignNodeVerificationResult(string CadDocumentId, bool Passed, IReadOnlyList<string> Reasons);
 
@@ -136,6 +156,24 @@ public static class CopyDesignVerificationEvaluator
         {
             reasons.Add("Component occurrence enumeration for the resulting document could not be completed - " +
                 "refusing to trust an incomplete/undercounted occurrence set.");
+        }
+
+        // P6 METADATA FIX: the FINAL file's own metadata must never carry an
+        // operation-owned temp file name (Inventor derives the default Part
+        // Number from the name a file is SAVED under, and the atomic
+        // promotion's rename never touches iProperties).
+        if (!facts.PropertyEnumerationSucceeded)
+        {
+            reasons.Add("The resulting document's iProperties could not be read - refusing to trust metadata that was " +
+                "never checked for temporary-name leakage.");
+        }
+        foreach (var property in facts.StringProperties ?? Array.Empty<CopyDesignStringPropertyFact>())
+        {
+            if (CopyDesignTempNameLeak.Contains(property.Value))
+            {
+                reasons.Add($"iProperty \"{property.PropertySetName} / {property.PropertyName}\" contains an operation-owned " +
+                    $"temporary file name (\"{property.Value}\") - temporary-name leakage into the final file's metadata.");
+            }
         }
 
         // HIGH 3 fix: evaluate the COMPLETE actual occurrence set, not

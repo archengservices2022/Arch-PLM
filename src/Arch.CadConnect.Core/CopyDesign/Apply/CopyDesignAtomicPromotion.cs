@@ -25,6 +25,18 @@ namespace Arch.CadConnect.Core.CopyDesign.Apply;
 /// </summary>
 public static class CopyDesignAtomicPromotion
 {
+    /// <summary>P6 METADATA FIX: the distinctive marker every operation-owned
+    ///  temp file name carries (without the leading dot, so a value Inventor
+    ///  derived from the temp name is still recognized even if a leading dot
+    ///  was ever dropped). The SINGLE source of truth shared by
+    ///  <see cref="NewTempPath"/> and <see cref="CopyDesignTempNameLeak"/> -
+    ///  the leak check can never drift from the names actually generated.</summary>
+    public const string TempFileNameMarker = "p6c-tmp-";
+
+    /// <summary>The exact prefix of every name <see cref="NewTempPath"/>
+    ///  generates.</summary>
+    public const string TempFileNamePrefix = "." + TempFileNameMarker;
+
     /// <summary>A unique, operation-owned temp file name in the SAME
     ///  directory as <paramref name="finalDestinationAbsolutePath"/> - same
     ///  directory so <see cref="PromoteToFinal"/> is a same-volume rename
@@ -44,7 +56,7 @@ public static class CopyDesignAtomicPromotion
             throw new ArgumentException("The final destination has no usable directory.", nameof(finalDestinationAbsolutePath));
         }
         var name = Path.GetFileName(finalDestinationAbsolutePath);
-        return Path.Combine(dir, $".p6c-tmp-{Guid.NewGuid():N}-{name}");
+        return Path.Combine(dir, $"{TempFileNamePrefix}{Guid.NewGuid():N}-{name}");
     }
 
     public sealed record PromotionResult(

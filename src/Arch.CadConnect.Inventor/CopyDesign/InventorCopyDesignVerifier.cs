@@ -75,6 +75,10 @@ internal sealed class InventorCopyDesignVerifier(InventorApi.Application applica
             .ToList();
         var actualOccurrences = new List<CopyDesignActualComponentOccurrence>();
         var occurrencesGathered = false;
+        // P6 METADATA FIX: read from THIS fresh open of the saved FINAL file -
+        // i.e. AFTER metadata normalization - never from any earlier session.
+        var stringProperties = new List<CopyDesignStringPropertyFact>();
+        var propertiesGathered = false;
 
         if (destinationExists)
         {
@@ -88,6 +92,7 @@ internal sealed class InventorCopyDesignVerifier(InventorApi.Application applica
                 {
                     openableThroughInventor = true;
                     documentTypeMatches = document.DocumentType == expectedType;
+                    propertiesGathered = InventorCopyDesignPropertyReader.TryGatherStringProperties(document, stringProperties);
 
                     if (document is InventorApi.AssemblyDocument assembly)
                     {
@@ -135,7 +140,8 @@ internal sealed class InventorCopyDesignVerifier(InventorApi.Application applica
             node.CadDocumentId!, node.SourceAbsolutePath, destination,
             destinationExists, documentTypeMatches, openableThroughInventor,
             resultingSha256, resultingFileSize, sourceSha256BeforeOperation, sourceSha256After,
-            referenceResolutions, actualOccurrences, occurrenceEnumerationSucceeded));
+            referenceResolutions, actualOccurrences, occurrenceEnumerationSucceeded,
+            StringProperties: stringProperties, PropertyEnumerationSucceeded: propertiesGathered));
     }
 
     /// <summary>Snapshots EVERY current component occurrence in

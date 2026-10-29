@@ -22,6 +22,21 @@ public sealed class ArchConnectionManager
     private readonly ConnectionStateMachine _machine = new();
     private readonly Func<DateTimeOffset> _clock;
 
+    /// <summary>P6 M4.1a: serializes every change of <see cref="CurrentSession"/>
+    ///  with every SESSION-BOUND request (<see cref="WithBoundSessionAsync{T}"/>).
+    ///  A bound request holds it from the "is my session still current?"
+    ///  check until its response arrives, so a sign-in / sign-out / rejection
+    ///  can never take effect between that check and the dispatch - it waits
+    ///  for the in-flight request instead. Never held while
+    ///  <see cref="SessionChanged"/> handlers run.</summary>
+    private readonly SemaphoreSlim _sessionGate = new(1, 1);
+
+    /// <summary>P6 M4.1a: the user-facing reason a session-bound request was
+    ///  refused because the connection changed after the operation started.</summary>
+    public const string SessionChangedMessage =
+        "The Arch PLM connection changed while Copy Design was running, so nothing further was sent to any server. "
+        + "Sign in to the server this Copy Design started on, then use Resume Copy Design / Recover Copy Design.";
+
     public ArchConnectionManager(
         Func<ArchServerUri, IArchApi> apiFactory,
         ISessionStore store,
@@ -36,6 +51,11 @@ public sealed class ArchConnectionManager
     public ConnectionState State => _machine.State;
 
     public IArchSession? CurrentSession { get; private set; }
+
+    /// <summary>M4.2: where this manager logs its own refusals (workspace
+    ///  origin re-checks, session-binding refusals). Best-effort; the default
+    ///  logs nothing.</summary>
+    public Core.Diagnostics.IDiagnosticsSink Diagnostics { get; set; } = Core.Diagnostics.NullDiagnosticsSink.Instance;
 
     public event Action<ConnectionStateChange>? StateChanged;
 
@@ -193,6 +213,10 @@ public sealed class ArchConnectionManager
         var session = CurrentSession
             ?? throw new ArchApiException(ArchApiFailureKind.Unauthorized, "Sign in before running Get Latest.");
 
+        // P6 M4.1: a folder that already belongs to ANOTHER server is never
+        // refreshed (and silently re-bound) from this one.
+        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckGetLatestTarget(request.WorkspaceRoot, session.Server));
+
         try
         {
             return await _apiFactory(session.Server).GetLatestAsync(session, request, ct).ConfigureAwait(false);
@@ -212,17 +236,17 @@ public sealed class ArchConnectionManager
     ///  <see cref="ConnectionState.Unauthorized"/> and the exception is
     ///  rethrown for the UI.</summary>
     public Task<Workspace.CheckoutOperationResult> CheckoutAsync(ManagedFileRef file, CancellationToken ct = default)
-        => WithSessionAsync((api, s) => api.CheckoutAsync(s, file, ct));
+        => WithSessionAsync((api, s) => { RequireWorkspaceServer(file, s); return api.CheckoutAsync(s, file, ct); });
 
     /// <summary>P4C: check in a managed file's saved local copy as a new
     ///  FileVersion and release the checkout.</summary>
     public Task<Workspace.CheckInOperationResult> CheckInAsync(ManagedFileRef file, CancellationToken ct = default)
-        => WithSessionAsync((api, s) => api.CheckInAsync(s, file, ct));
+        => WithSessionAsync((api, s) => { RequireWorkspaceServer(file, s); return api.CheckInAsync(s, file, ct); });
 
     /// <summary>P4C: release a checkout and restore the base FileVersion
     ///  locally (staged + verified before the server release).</summary>
     public Task<Workspace.UndoOperationResult> UndoCheckoutAsync(ManagedFileRef file, string? reason, CancellationToken ct = default)
-        => WithSessionAsync((api, s) => api.UndoCheckoutAsync(s, file, reason, ct));
+        => WithSessionAsync((api, s) => { RequireWorkspaceServer(file, s); return api.UndoCheckoutAsync(s, file, reason, ct); });
 
     /// <summary>Read the authenticated server-authoritative checkout state for
     /// one stable CAD document id. This is read-only and never checks a file
@@ -252,6 +276,153 @@ public sealed class ArchConnectionManager
     /// like <see cref="GetLatestVersionsAsync"/>. With no session, resolves
     /// to <see cref="Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.AuthenticationFailed"/>.
     /// </summary>
+    // ---- P6 M4.1a: SESSION-BOUND Copy Design calls --------------------
+    //
+    // Copy Design Apply / Resume / Recover is a SEQUENCE of requests
+    // (reserve -> status -> materialize ...). The controller captures the
+    // exact session when the operation starts and passes it to every call
+    // below. Each call is ADDRESSED with that bound session (its server, its
+    // token) - never with whatever session happens to be current - and is
+    // refused, with nothing sent, unless the bound session is STILL the
+    // current one. Check and dispatch run under _sessionGate, which every
+    // session change also takes, so they cannot be separated by a switch.
+    // A refusal is never classified as transient (no retry) nor as an auth
+    // failure (no sign-out of the NEW session).
+
+    /// <summary>P6 M4.1a: <see cref="ApplyCopyDesignAsync(Core.CopyDesign.Apply.CopyDesignApplyRequest, CancellationToken)"/>
+    ///  bound to <paramref name="boundSession"/>. Refusal throws
+    ///  <see cref="ArchApiFailureKind.Conflict"/> - the orchestrator reports
+    ///  it as <c>ReservationCallFailed</c>, preserving the idempotency key for
+    ///  Recover.</summary>
+    public Task<Core.CopyDesign.Apply.CopyDesignReservationResponse> ApplyCopyDesignAsync(
+        Core.CopyDesign.Apply.CopyDesignApplyRequest request, IArchSession boundSession, CancellationToken ct = default)
+        => WithBoundSessionAsync(
+            boundSession,
+            (api, s) => api.ApplyCopyDesignAsync(s, request, ct),
+            refused: () => throw SessionChangedRefusal(),
+            ct);
+
+    /// <summary>P6 M4.1a: <see cref="MaterializeFirstFileVersionAsync(Core.CopyDesign.Apply.CopyDesignMaterializeRequest, CancellationToken)"/>
+    ///  bound to <paramref name="boundSession"/>. Refusal is a
+    ///  <see cref="Core.CopyDesign.Apply.CopyDesignMaterializationOutcome.Failed"/>
+    ///  result (the materializer contract never throws for a controlled
+    ///  rejection) - the operation id stays attached for Resume.</summary>
+    public Task<Core.CopyDesign.Apply.CopyDesignMaterializationResult> MaterializeFirstFileVersionAsync(
+        Core.CopyDesign.Apply.CopyDesignMaterializeRequest request, IArchSession boundSession, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return WithBoundSessionAsync(
+            boundSession,
+            (api, s) => api.MaterializeFirstFileVersionAsync(s, request, ct),
+            refused: () => new Core.CopyDesign.Apply.CopyDesignMaterializationResult(
+                request.ResultingCadDocumentId, Core.CopyDesign.Apply.CopyDesignMaterializationOutcome.Failed,
+                null, null, null, null, SessionChangedMessage),
+            ct);
+    }
+
+    /// <summary>P6 M4.1a: <see cref="GetCopyDesignOperationStatusAsync(Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation, CancellationToken)"/>
+    ///  bound to <paramref name="boundSession"/>. Never throws; a refusal is
+    ///  <see cref="Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.AuthenticationFailed"/>
+    ///  (fails the resume classification closed) WITHOUT touching the new
+    ///  session.</summary>
+    public async Task<Core.CopyDesign.Apply.CopyDesignOperationStatusResult> GetCopyDesignOperationStatusAsync(
+        Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation expectation, IArchSession boundSession, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(expectation);
+
+        var refusedResult = Core.CopyDesign.Apply.CopyDesignOperationStatusResult.Failure(
+            Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.AuthenticationFailed);
+        Core.CopyDesign.Apply.CopyDesignOperationStatusResult result;
+        try
+        {
+            result = await WithBoundSessionAsync(
+                boundSession,
+                async (api, s) =>
+                {
+                    try
+                    {
+                        return await api.GetCopyDesignOperationStatusAsync(s, expectation, ct).ConfigureAwait(false);
+                    }
+                    catch (ArchApiException ex) when (!ex.IsAuthFailure)
+                    {
+                        return Core.CopyDesign.Apply.CopyDesignOperationStatusResult.Failure(
+                            Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.ServerUnavailable);
+                    }
+                },
+                refused: () => refusedResult,
+                ct).ConfigureAwait(false);
+        }
+        catch (ArchApiException ex) when (ex.IsAuthFailure)
+        {
+            // Already invalidated (if still current) by WithBoundSessionAsync.
+            return Core.CopyDesign.Apply.CopyDesignOperationStatusResult.Failure(
+                Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.AuthenticationFailed);
+        }
+
+        if (!ReferenceEquals(result, refusedResult)
+            && result.Outcome == Core.CopyDesign.Apply.CopyDesignOperationStatusOutcome.AuthenticationFailed)
+        {
+            InvalidateRejectedSessionIfCurrent(boundSession);
+        }
+        return result;
+    }
+
+    private static ArchApiException SessionChangedRefusal() =>
+        new(ArchApiFailureKind.Conflict, SessionChangedMessage, diagnostic: "M4.1a session binding: bound session is no longer current");
+
+    /// <summary>P6 M4.1a: run ONE request addressed with
+    ///  <paramref name="boundSession"/>, only while it is still the current
+    ///  session; otherwise return <paramref name="refused"/>() with nothing
+    ///  sent. See <see cref="_sessionGate"/>.</summary>
+    private async Task<T> WithBoundSessionAsync<T>(
+        IArchSession boundSession,
+        Func<IArchApi, IArchSession, Task<T>> op,
+        Func<T> refused,
+        CancellationToken ct,
+        [System.Runtime.CompilerServices.CallerMemberName] string command = "")
+    {
+        ArgumentNullException.ThrowIfNull(boundSession);
+
+        ArchApiException? authFailure = null;
+        string? refusedCurrentOrigin = null;
+        var wasRefused = false;
+        await _sessionGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!ReferenceEquals(CurrentSession, boundSession))
+            {
+                wasRefused = true;
+                refusedCurrentOrigin = CurrentSession?.Server.OriginString;
+                return refused();
+            }
+            try
+            {
+                return await op(_apiFactory(boundSession.Server), boundSession).ConfigureAwait(false);
+            }
+            catch (ArchApiException ex) when (ex.IsAuthFailure)
+            {
+                authFailure = ex;
+                throw;
+            }
+        }
+        finally
+        {
+            _sessionGate.Release();
+            // Outside the gate (it takes the gate itself), and only if the
+            // rejected session is still the current one - never sign out a
+            // session that replaced it.
+            if (authFailure is not null)
+            {
+                InvalidateRejectedSessionIfCurrent(boundSession);
+            }
+            // M4.2: logged outside the gate too - best-effort, never thrown.
+            if (wasRefused)
+            {
+                Core.Diagnostics.RefusalDiagnostics.SessionBinding(Diagnostics, command, boundSession.Server.OriginString, refusedCurrentOrigin);
+            }
+        }
+    }
+
     public async Task<Core.CopyDesign.Apply.CopyDesignOperationStatusResult> GetCopyDesignOperationStatusAsync(
         Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation expectation, CancellationToken ct = default)
     {
@@ -461,6 +632,15 @@ public sealed class ArchConnectionManager
             return AllNotAvailable(modelCadDocumentIds);
         }
 
+        // P6 M4.1: never ask THIS server about identities from a workspace that
+        // belongs to another one. "Not available" - exactly like no session -
+        // makes the Copy Design planner fail closed.
+        if (manifest is not null
+            && !Core.Workspace.WorkspaceServerBinding.CheckWorkspace(WorkspaceRootOf(manifest), session.Server).Allowed)
+        {
+            return AllNotAvailable(modelCadDocumentIds);
+        }
+
         try
         {
             return await _apiFactory(session.Server)
@@ -487,6 +667,33 @@ public sealed class ArchConnectionManager
         }
         return result;
     }
+
+    /// <summary>P6 M4.1: refuse (before any request) when
+    ///  <paramref name="file"/>'s workspace does not belong to the server
+    ///  <paramref name="session"/> is signed in to - see
+    ///  <see cref="Core.Workspace.WorkspaceServerBinding"/>.</summary>
+    private void RequireWorkspaceServer(ManagedFileRef file, IArchSession session,
+        [System.Runtime.CompilerServices.CallerMemberName] string command = "")
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckWorkspace(file.WorkspaceRoot, session.Server), command);
+    }
+
+    /// <summary>A refusal is a plain, non-retryable request error - never an
+    ///  auth failure (which would sign the user out) and never "server
+    ///  unavailable" (which a caller may retry). M4.2: logged first.</summary>
+    private void RequireAllowed(Core.Workspace.WorkspaceServerBindingResult binding,
+        [System.Runtime.CompilerServices.CallerMemberName] string command = "")
+    {
+        if (!binding.Allowed)
+        {
+            Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(Diagnostics, command, binding, source: "connection-manager");
+            throw new ArchApiException(ArchApiFailureKind.BadRequest, binding.Message);
+        }
+    }
+
+    private static string WorkspaceRootOf(Core.Workspace.WorkspaceManifest manifest) =>
+        Path.GetDirectoryName(Path.GetDirectoryName(manifest.ManifestFilePath)!)!;
 
     private async Task<T> WithSessionAsync<T>(Func<IArchApi, IArchSession, Task<T>> op)
     {
@@ -538,8 +745,46 @@ public sealed class ArchConnectionManager
 
     private void SetSession(IArchSession? session)
     {
-        CurrentSession = session;
+        // P6 M4.1a: a session change waits for any in-flight session-bound
+        // request (see _sessionGate). Every caller runs off the UI thread.
+        _sessionGate.Wait();
+        try
+        {
+            CurrentSession = session;
+        }
+        finally
+        {
+            _sessionGate.Release();
+        }
         SessionChanged?.Invoke(session);
+    }
+
+    /// <summary>P6 M4.1a: <see cref="InvalidateRejectedSession"/>, but only
+    ///  while <paramref name="rejected"/> is still the current session -
+    ///  compared and cleared atomically under <see cref="_sessionGate"/>.</summary>
+    private void InvalidateRejectedSessionIfCurrent(IArchSession rejected)
+    {
+        _sessionGate.Wait();
+        try
+        {
+            if (!ReferenceEquals(CurrentSession, rejected))
+            {
+                return;
+            }
+            _store.Clear();
+            CurrentSession = null;
+        }
+        finally
+        {
+            _sessionGate.Release();
+        }
+        SessionChanged?.Invoke(null);
+        if (_machine.State is ConnectionState.Connecting
+            or ConnectionState.Connected
+            or ConnectionState.ServerUnavailable)
+        {
+            _machine.Rejected();
+        }
     }
 
     private void ApplyFailure(ArchApiException ex)

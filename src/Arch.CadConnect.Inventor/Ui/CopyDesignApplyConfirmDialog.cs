@@ -1,109 +1,133 @@
 using System.Windows.Forms;
 
-using Arch.CadConnect.Core;
-using Arch.CadConnect.Core.CopyDesign;
+using Arch.CadConnect.Core.CopyDesign.Apply;
 
 namespace Arch.CadConnect.Inventor.Ui;
 
 /// <summary>
 /// P6C/P6D: the MANDATORY explicit confirmation shown between an EXECUTABLE
-/// P6A preview and the actual apply - summarizing exactly what is about to
-/// happen so the user makes an informed, explicit choice. Never shown for a
-/// non-executable plan (the caller is responsible for that gate - this
-/// dialog itself has no "apply anyway" escape hatch). Purely a summary/
-/// confirmation surface - it builds nothing, calls nothing, and performs no
-/// I/O of its own.
+/// P6A preview and the actual apply. Purely a confirmation surface - it
+/// builds nothing, calls nothing, and performs no I/O of its own.
 ///
-/// P6D fix: this dialog previously told the user "drawings are out of scope
-/// and are never modified" UNCONDITIONALLY - that became FALSE the moment
-/// P6D started executing drawings, and showing false information in a
-/// mandatory confirmation immediately before a mutating operation is a real
-/// correctness bug, not a cosmetic one. The summary now counts and reports
-/// drawing (IDW/DWG) Copy/Reuse entries exactly like model entries, and only
-/// claims "no drawing is copied/rewired" when that is actually true (the
-/// explicit model-files-only acknowledgement).
+/// P6 Milestone 2: shows the COMPLETE mapping the orchestrator will execute -
+/// for every entry the COPY/REUSE action, source file name and document
+/// number, destination file name, proposed new document number and
+/// destination folder, plus every blocking error, warning and informational
+/// message - rendered by <see cref="CopyDesignApplyConfirmationTextReport"/>
+/// from a <see cref="CopyDesignApplyConfirmation"/> (previously: file counts
+/// and one destination folder only). The Apply button is ENABLED ONLY when
+/// <see cref="CopyDesignApplyConfirmation.CanApply"/> is true - a blocked
+/// confirmation can be read and copied, never applied. The caller passes the
+/// confirmation's <see cref="CopyDesignApplyConfirmation.Fingerprint"/> to
+/// the orchestrator, which refuses to run any mapping that differs from it.
+///
+/// M4.1 T6 follow-up (two accidental live Applies): Apply also stays disabled
+/// until the engineer types the exact phrase from
+/// <see cref="CopyDesignApplyTypedConfirmation"/> (<c>APPLY N</c>, N = files
+/// to be copied); changing or clearing the text disables it again at once.
+/// Cancel stays the Enter and Esc button, the typed-confirmation box has the
+/// initial focus (Enter there does nothing - see
+/// <see cref="ConfirmationPhraseBox"/>), and Apply sits at the far left, away
+/// from Cancel at the far right.
 /// </summary>
 internal sealed class CopyDesignApplyConfirmDialog : Form
 {
-    private readonly Label _summary = new() { AutoSize = true, MaximumSize = new System.Drawing.Size(420, 0) };
-    private readonly Button _apply = new() { Text = "Apply Copy Design", Width = 140 };
-    private readonly Button _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 90 };
-
-    public CopyDesignApplyConfirmDialog(CopyDesignPlan plan)
+    private readonly TextBox _report = new()
     {
-        ArgumentNullException.ThrowIfNull(plan);
+        Multiline = true,
+        ReadOnly = true,
+        ScrollBars = ScrollBars.Both,
+        WordWrap = false,
+        Font = new System.Drawing.Font(System.Drawing.FontFamily.GenericMonospace, 9f),
+        Width = 760,
+        Height = 420,
+        Name = "report",
+    };
+    private readonly Label _prompt = new() { AutoSize = true, Margin = new Padding(0, 6, 8, 0) };
+    private readonly ConfirmationPhraseBox _typed = new() { Width = 160, Name = "typedConfirmation" };
+    private readonly Button _apply = new() { AutoSize = true, Name = "apply" };
+    private readonly Button _copy = new() { Text = "Copy to Clipboard", Width = 140, Name = "copy" };
+    private readonly Button _cancel = new() { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 90, Name = "cancel" };
 
-        var modelCopyCount = plan.Nodes.Count(n => n.ProposedAction == CopyDesignAction.Copy && n.DocumentType is CadDocumentType.Ipt or CadDocumentType.Iam);
-        var modelReuseCount = plan.Nodes.Count(n => n.ProposedAction == CopyDesignAction.Reuse && n.DocumentType is CadDocumentType.Ipt or CadDocumentType.Iam);
-        var drawingCopyCount = plan.Nodes.Count(n => n.ProposedAction == CopyDesignAction.Copy && n.DocumentType is CadDocumentType.Idw or CadDocumentType.Dwg);
-        var drawingReuseCount = plan.Nodes.Count(n => n.ProposedAction == CopyDesignAction.Reuse && n.DocumentType is CadDocumentType.Idw or CadDocumentType.Dwg);
-        var destinationRoot = plan.Nodes
-            .Where(n => n.ProposedAction == CopyDesignAction.Copy && n.ProposedDestinationAbsolutePath is not null)
-            .Select(n => Path.GetDirectoryName(n.ProposedDestinationAbsolutePath))
-            .FirstOrDefault() ?? "(unknown)";
+    public CopyDesignApplyConfirmDialog(CopyDesignApplyConfirmation confirmation)
+    {
+        ArgumentNullException.ThrowIfNull(confirmation);
 
-        Text = "Apply Copy Design - confirm";
+        Text = confirmation.CanApply ? "Apply Copy Design - confirm" : "Apply Copy Design - BLOCKED";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MinimizeBox = false;
         MaximizeBox = false;
         AutoSize = true;
         AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(16);
-        AcceptButton = _apply;
+        Padding = new Padding(12);
+        // Never let Enter apply: Cancel is the default action.
+        AcceptButton = _cancel;
         CancelButton = _cancel;
 
-        // Drawings execute normally UNLESS the plan itself carries the
-        // explicit model-files-only acknowledgement - see
-        // CopyDesignApplyOrchestrator's own class doc comment. That
-        // acknowledgement is the ONLY case where "no drawing is touched" is
-        // actually true, so it is the only case that says so.
-        string modeLine;
-        string drawingLine;
-        if (plan.ModelFilesOnlyAcknowledged)
-        {
-            // Round 8: repeat the acknowledged mode here too - the mandatory
-            // confirmation must restate it, never assume the preview alone
-            // was enough.
-            modeLine = "MODE: MODEL FILES ONLY - DRAWINGS: NOT INCLUDED. Drawing associations could not be proven for one " +
-                "or more models; no IDW/DWG file will be copied or reference-rewired by this operation.\n\n";
-            drawingLine = string.Empty;
-        }
-        else
-        {
-            modeLine = string.Empty;
-            drawingLine = drawingCopyCount > 0 || drawingReuseCount > 0
-                ? $"This will ALSO physically create {drawingCopyCount} new IDW/DWG drawing file(s) and rewire their " +
-                  $"model reference(s) to the copied/reused targets above, leaving {drawingReuseCount} reused drawing " +
-                  "file(s) untouched.\n\n"
-                : string.Empty;
-        }
+        _report.Text = CopyDesignApplyConfirmationTextReport.Render(confirmation).Replace("\n", Environment.NewLine);
+        _report.Select(0, 0);
 
-        _summary.Text =
-            $"This will physically create {modelCopyCount} new IAM/IPT file(s) and leave {modelReuseCount} reused file(s) untouched.\n\n" +
-            $"Destination: {destinationRoot}\n\n" +
-            modeLine +
-            drawingLine +
-            "Source files are never modified. Nothing is staged, committed, or released automatically.";
+        var phrase = CopyDesignApplyTypedConfirmation.ExpectedPhrase(confirmation);
+        _apply.Text = $"Apply Copy Design ({confirmation.CopyCount} file{(confirmation.CopyCount == 1 ? "" : "s")})";
+        _apply.Enabled = false;
+        _typed.Enabled = confirmation.CanApply;
+        _prompt.Text = confirmation.CanApply
+            ? $"To enable Apply, type {phrase} :"
+            : "This plan cannot be applied.";
+        _typed.TextChanged += (_, _) =>
+            _apply.Enabled = CopyDesignApplyTypedConfirmation.IsSatisfied(confirmation, _typed.Text);
 
-        var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Dock = DockStyle.Bottom };
-        buttons.Controls.Add(_cancel);
-        buttons.Controls.Add(_apply);
+        var confirmRow = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true, Dock = DockStyle.Fill };
+        confirmRow.Controls.Add(_prompt);
+        confirmRow.Controls.Add(_typed);
 
-        var root = new TableLayoutPanel { RowCount = 2, AutoSize = true, Dock = DockStyle.Fill };
-        root.Controls.Add(_summary);
+        // Apply far left, Cancel far right, so a click meant for one cannot
+        // land on the other.
+        var rightButtons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Anchor = AnchorStyles.Right };
+        rightButtons.Controls.Add(_cancel);
+        rightButtons.Controls.Add(_copy);
+        var buttons = new TableLayoutPanel { ColumnCount = 3, RowCount = 1, AutoSize = true, Dock = DockStyle.Fill };
+        buttons.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        buttons.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        buttons.Controls.Add(_apply, 0, 0);
+        buttons.Controls.Add(rightButtons, 2, 0);
+
+        var root = new TableLayoutPanel { RowCount = 3, AutoSize = true, Dock = DockStyle.Fill };
+        root.Controls.Add(_report);
+        root.Controls.Add(confirmRow);
         root.Controls.Add(buttons);
         Controls.Add(root);
 
-        _apply.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        // The typed-confirmation box gets the initial focus (Enter there does
+        // nothing); for a blocked plan, Cancel does.
+        Shown += (_, _) => (confirmation.CanApply ? (Control)_typed : _cancel).Select();
+
+        _apply.Click += (_, _) =>
+        {
+            if (!CopyDesignApplyTypedConfirmation.IsSatisfied(confirmation, _typed.Text))
+            {
+                return; // defense in depth - the button is disabled anyway
+            }
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+        _copy.Click += (_, _) =>
+        {
+            try { Clipboard.SetText(_report.Text); } catch { /* clipboard busy - non-fatal */ }
+        };
     }
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            _summary.Dispose();
+            _report.Dispose();
+            _prompt.Dispose();
+            _typed.Dispose();
             _apply.Dispose();
+            _copy.Dispose();
             _cancel.Dispose();
         }
         base.Dispose(disposing);

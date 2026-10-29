@@ -138,7 +138,14 @@ internal sealed class InventorCopyDesignReferenceRewirer(InventorApi.Application
                 }
             }
 
-            document.Save();
+            // P6 Milestone 3: Save2(SaveDependents: false), never plain
+            // Save() - Save()/Save2's own default ALSO save every dirty
+            // referenced document (confirmed via reflection: SaveDependents
+            // defaults to true), which for a copied assembly can include a
+            // REUSE target or a COPY source loaded in this session. Only THIS
+            // freshly copied assembly is ever persisted - the same rule
+            // InventorCopyDesignDrawingReferenceRewirer already follows.
+            document.Save2(SaveDependents: false, DocumentsToSave: Type.Missing);
         }
         catch (COMException ex)
         {

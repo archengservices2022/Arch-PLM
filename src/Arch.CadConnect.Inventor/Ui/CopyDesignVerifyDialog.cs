@@ -151,10 +151,9 @@ internal sealed class CopyDesignVerifyDialog : Form
         SourceWorkspaceRoot = validation.SourceWorkspaceRoot;
         DestinationFolder = validation.DestinationFolder;
 
-        // Remember both folders (non-secret) for next time, reusing the
-        // existing settings fields and keeping every other preference.
-        (ConnectSettings.Load() with { LastWorkspaceRoot = SourceWorkspaceRoot, LastCopyDesignDestinationFolder = DestinationFolder }).Save();
-
+        // The folders are NOT remembered here: the controller remembers both
+        // only after the M4.1 server-origin check allows the source workspace
+        // (a refused workspace must leave connect.json untouched).
         DialogResult = DialogResult.OK;
         Close();
     }

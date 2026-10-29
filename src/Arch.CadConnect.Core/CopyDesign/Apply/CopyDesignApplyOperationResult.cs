@@ -159,7 +159,12 @@ public sealed record CopyDesignApplyOperationResult(
     ///  carries the exact key needed to safely retry the SAME logical
     ///  attempt (<see cref="CopyDesignApplyAttempt.Resume"/>), never a
     ///  freshly-minted one.</summary>
-    string? IdempotencyKey = null)
+    string? IdempotencyKey = null,
+    /// <summary>P6 Milestone 3: removal of the Inventor OldVersions backups
+    ///  this attempt PROVED it created (see <see cref="CopyDesignBackupCleanup"/>)
+    ///  - on failure and at the end of a successful run alike. <c>null</c>
+    ///  when backup tracking is not configured or nothing was owned.</summary>
+    CopyDesignCleanupReport? BackupCleanup = null)
 {
     public static CopyDesignApplyOperationResult Simple(CopyDesignApplyOutcome outcome, string reason, string? idempotencyKey = null) =>
         new(outcome, reason, null, Array.Empty<CopyDesignApplyEntryOutcome>(), null, idempotencyKey);

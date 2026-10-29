@@ -80,6 +80,10 @@ internal sealed class InventorCopyDesignDrawingVerifier(InventorApi.Application 
             .ToList();
         var actualOccurrences = new List<CopyDesignActualComponentOccurrence>();
         var descriptorsGathered = false;
+        // P6 METADATA FIX: read from THIS fresh open of the saved FINAL file -
+        // i.e. AFTER metadata normalization - never from any earlier session.
+        var stringProperties = new List<CopyDesignStringPropertyFact>();
+        var propertiesGathered = false;
 
         if (destinationExists)
         {
@@ -95,6 +99,7 @@ internal sealed class InventorCopyDesignDrawingVerifier(InventorApi.Application 
                     documentTypeMatches = document.DocumentType == InventorApi.DocumentTypeEnum.kDrawingDocumentObject
                         && document is InventorApi.DrawingDocument drawingCheck
                         && drawingCheck.IsInventorDWG == (node.DocumentType == CadDocumentType.Dwg);
+                    propertiesGathered = InventorCopyDesignPropertyReader.TryGatherStringProperties(document, stringProperties);
 
                     if (document is InventorApi.DrawingDocument drawing)
                     {
@@ -139,7 +144,8 @@ internal sealed class InventorCopyDesignDrawingVerifier(InventorApi.Application 
             node.CadDocumentId!, node.SourceAbsolutePath, destination,
             destinationExists, documentTypeMatches, openableThroughInventor,
             resultingSha256, resultingFileSize, sourceSha256BeforeOperation, sourceSha256After,
-            referenceResolutions, actualOccurrences, occurrenceEnumerationSucceeded));
+            referenceResolutions, actualOccurrences, occurrenceEnumerationSucceeded,
+            StringProperties: stringProperties, PropertyEnumerationSucceeded: propertiesGathered));
     }
 
     /// <summary>Snapshots EVERY current referenced-document descriptor in

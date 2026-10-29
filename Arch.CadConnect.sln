@@ -15,6 +15,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Arch.CadConnect.Core.Tests"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Arch.CadConnect.Api.Tests", "tests\Arch.CadConnect.Api.Tests\Arch.CadConnect.Api.Tests.csproj", "{1C29DE58-2587-4135-8E1E-CF6240A12E66}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{84E701CA-1304-4380-8934-5621E3C056DD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Arch.CadConnect.Ui.Tests", "tests\Arch.CadConnect.Ui.Tests\Arch.CadConnect.Ui.Tests.csproj", "{92712C24-8ECB-4331-9ED2-D13979D7380D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -85,6 +89,18 @@ Global
 		{1C29DE58-2587-4135-8E1E-CF6240A12E66}.Release|x64.Build.0 = Release|Any CPU
 		{1C29DE58-2587-4135-8E1E-CF6240A12E66}.Release|x86.ActiveCfg = Release|Any CPU
 		{1C29DE58-2587-4135-8E1E-CF6240A12E66}.Release|x86.Build.0 = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|x64.Build.0 = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Debug|x86.Build.0 = Debug|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x64.ActiveCfg = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x64.Build.0 = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x86.ActiveCfg = Release|Any CPU
+		{92712C24-8ECB-4331-9ED2-D13979D7380D}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -95,5 +111,6 @@ Global
 		{E610ED04-A848-4CA8-BCCB-C16B19BB9CA0} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{865ED1CA-CC58-4129-865E-495063E4D202} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{1C29DE58-2587-4135-8E1E-CF6240A12E66} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{92712C24-8ECB-4331-9ED2-D13979D7380D} = {84E701CA-1304-4380-8934-5621E3C056DD}
 	EndGlobalSection
 EndGlobal

@@ -197,8 +197,12 @@ public class CopyDesignPlannerTests
         Assert.Equal("10137-P001.ipt", TokenRule.Rename("10073-P001.ipt"));
     }
 
+    // P6 Milestone 1 (supersedes P6A's "left completely unchanged"): a COPY is
+    // a NEW identity - a rule that does not match its file name FAILS CLOSED
+    // instead of silently keeping the source name (the live ARCH-TEST-001
+    // acceptance defect).
     [Fact]
-    public void A_file_name_without_the_source_token_is_left_completely_unchanged()
+    public void A_COPY_whose_file_name_does_not_match_the_rename_rule_fails_closed_instead_of_keeping_the_source_name()
     {
         var partPath = P("Design", "STD-BOLT-M6.ipt"); // no "10073" token
         var scan = Scan(Root(RootPath), new[] { Managed(RootPath, partPath, "cad_bolt", "fv_bolt1") });
@@ -210,8 +214,74 @@ public class CopyDesignPlannerTests
         var plan = Plan(scan, classification: classification);
 
         var bolt = Assert.Single(plan.Nodes, n => n.CadDocumentId == "cad_bolt");
-        Assert.Equal(CopyDesignAction.Copy, bolt.ProposedAction); // COPY (classified project-specific)
-        Assert.Equal("STD-BOLT-M6.ipt", bolt.ProposedDestinationFileName); // unchanged name
+        Assert.Equal(CopyDesignAction.NeedsDecision, bolt.ProposedAction);
+        Assert.Null(bolt.ProposedDestinationFileName);
+        Assert.Null(bolt.ProposedDestinationAbsolutePath);
+        Assert.Contains(bolt.Reasons, r => r.StartsWith(CopyDesignPlanner.UnmatchedRenameRuleReasonPrefix, StringComparison.Ordinal)
+            && r.Contains("STD-BOLT-M6.ipt", StringComparison.Ordinal));
+        Assert.False(plan.IsExecutable);
+    }
+
+    [Fact]
+    public void An_unmatched_ROOT_fails_closed_too_so_the_live_ARCH_TEST_001_plan_is_never_READY()
+    {
+        var rootPath = P("Design", "ARCH-TEST-001.ipt");
+        var scan = Scan(Root(rootPath, "cad_root", "fv_root1", CadDocumentType.Ipt), Array.Empty<CadReference>());
+
+        var plan = Plan(scan, rule: new TokenReplaceNameRule("arch-test-001", "ARCH-TEST-003")); // case-sensitive: no match
+
+        var root = Assert.Single(plan.Nodes);
+        Assert.Equal(CopyDesignAction.NeedsDecision, root.ProposedAction);
+        Assert.Contains(root.Reasons, r => r.StartsWith(CopyDesignPlanner.UnmatchedRenameRuleReasonPrefix, StringComparison.Ordinal));
+        Assert.False(plan.IsExecutable);
+    }
+
+    [Fact]
+    public void A_matching_rule_on_the_same_ROOT_is_READY_with_the_renamed_destination()
+    {
+        var rootPath = P("Design", "ARCH-TEST-001.ipt");
+        var scan = Scan(Root(rootPath, "cad_root", "fv_root1", CadDocumentType.Ipt), Array.Empty<CadReference>());
+
+        var plan = Plan(scan, rule: new TokenReplaceNameRule("ARCH-TEST-001", "ARCH-TEST-003"));
+
+        var root = Assert.Single(plan.Nodes);
+        Assert.Equal(CopyDesignAction.Copy, root.ProposedAction);
+        Assert.Equal("ARCH-TEST-003.ipt", root.ProposedDestinationFileName);
+        Assert.True(plan.IsExecutable);
+    }
+
+    [Fact]
+    public void An_explicit_COPY_decision_cannot_bypass_an_unmatched_rename_rule()
+    {
+        var partPath = P("Design", "STD-BOLT-M6.ipt"); // classification-unknown AND no "10073" token
+        var scan = Scan(Root(RootPath), new[] { Managed(RootPath, partPath, "cad_bolt", "fv_bolt1") });
+        var decisions = new Dictionary<string, CopyDesignAction> { ["cad_bolt"] = CopyDesignAction.Copy };
+
+        var plan = Plan(scan, explicitDecisions: decisions);
+
+        var bolt = Assert.Single(plan.Nodes, n => n.CadDocumentId == "cad_bolt");
+        Assert.Equal(CopyDesignAction.NeedsDecision, bolt.ProposedAction);
+        Assert.Contains(bolt.Reasons, r => r.StartsWith(CopyDesignPlanner.UnmatchedRenameRuleReasonPrefix, StringComparison.Ordinal));
+        // ...and it is NOT re-offered as a decision a user could click through.
+        Assert.False(CopyDesignExplicitDecisionEligibility.IsEligibleForExplicitDecision(bolt));
+        Assert.False(plan.IsExecutable);
+    }
+
+    [Fact]
+    public void A_REUSE_node_never_needs_a_matching_rename_rule()
+    {
+        var partPath = P("Design", "STD-BOLT-M6.ipt"); // no "10073" token, but REUSE
+        var scan = Scan(Root(RootPath), new[] { Managed(RootPath, partPath, "cad_bolt", "fv_bolt1") });
+        var classification = new StubClassification(new Dictionary<string, ComponentClassification>
+        {
+            ["cad_bolt"] = ComponentClassification.LibraryOrShared,
+        });
+
+        var plan = Plan(scan, classification: classification);
+
+        var bolt = Assert.Single(plan.Nodes, n => n.CadDocumentId == "cad_bolt");
+        Assert.Equal(CopyDesignAction.Reuse, bolt.ProposedAction);
+        Assert.DoesNotContain(bolt.Reasons, r => r.StartsWith(CopyDesignPlanner.UnmatchedRenameRuleReasonPrefix, StringComparison.Ordinal));
     }
 
     // ---- 8. duplicate destination collision -----------------------------
@@ -693,7 +763,7 @@ public class CopyDesignPlannerTests
     public void Identical_observations_of_the_SAME_cadDocumentId_reconcile_into_one_node_with_all_edges_retained()
     {
         var subIamPath = P("Design", "10073-SUB100.iam");
-        var sharedPartPath = P("Design", "SHARED.ipt");
+        var sharedPartPath = P("Design", "10073-SHARED.ipt");
         var scan = Scan(Root(RootPath), new[]
         {
             Managed(RootPath, subIamPath, "cad_sub", "fv_sub1", CadDocumentType.Iam),
@@ -900,7 +970,7 @@ public class CopyDesignPlannerTests
     public void Compatible_same_path_same_identity_from_multiple_parents_still_succeeds()
     {
         var subIamPath = P("Design", "10073-SUB100.iam");
-        var sharedPath = P("Design", "SHARED.ipt");
+        var sharedPath = P("Design", "10073-SHARED.ipt");
         var scan = Scan(Root(RootPath), new[]
         {
             Managed(RootPath, subIamPath, "cad_sub", "fv_sub1", CadDocumentType.Iam),
@@ -1407,9 +1477,9 @@ public class CopyDesignPlannerTests
     [Fact]
     public void A_drawing_with_TWO_COPY_owners_is_forced_to_COPY()
     {
-        var pathA = P("Design", "A.ipt");
-        var pathB = P("Design", "B.ipt");
-        var drawingPath = P("Design", "SHARED.idw");
+        var pathA = P("Design", "10073-A.ipt");
+        var pathB = P("Design", "10073-B.ipt");
+        var drawingPath = P("Design", "10073-SHARED.idw");
         var drawing = new AssociatedDrawing("cad_dwg", "fv_dwg1", drawingPath, CadDocumentType.Idw, IsVerified: true);
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
@@ -1904,8 +1974,8 @@ public class CopyDesignPlannerTests
     public void A_drawing_ROOT_with_two_COPY_model_owners_via_SCANNER_edges_is_COPY()
     {
         var rootIdentity = new PlmIdentity("cad_root", null, "fv_root1");
-        var modelAPath = P("Design", "A.ipt");
-        var modelBPath = P("Design", "B.ipt");
+        var modelAPath = P("Design", "10073-A.ipt");
+        var modelBPath = P("Design", "10073-B.ipt");
         var scan = Scan(Root(RootPath, type: CadDocumentType.Idw), new[]
         {
             Managed(RootPath, modelAPath, "cad_a", "fv_a1", kind: CadRelationshipKind.DrawingModel, parentIdentity: rootIdentity),
@@ -2024,8 +2094,8 @@ public class CopyDesignPlannerTests
         // reports the SAME (drawingX, ModelA) pair when queried for ModelA's
         // cadDocumentId - redundant evidence for the SAME relationship via
         // two different mechanisms.
-        var drawingXPath = P("Design", "X.idw");
-        var modelAPath = P("Design", "A.ipt");
+        var drawingXPath = P("Design", "10073-X.idw");
+        var modelAPath = P("Design", "10073-A.ipt");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_a"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found,
@@ -2103,7 +2173,7 @@ public class CopyDesignPlannerTests
     public void Associated_drawing_type_validation_accepts_only_IDW_or_DWG(CadDocumentType claimedType, bool expectedAccepted)
     {
         var partPath = P("Design", "10073-P001.ipt");
-        var drawingPath = P("Design", "SOMETHING.ext");
+        var drawingPath = P("Design", "10073-SOMETHING.ext");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_p1"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found,
@@ -2206,7 +2276,7 @@ public class CopyDesignPlannerTests
     public void A_valid_absolute_path_is_accepted_as_resolved()
     {
         var partPath = P("Design", "10073-P001.ipt");
-        var drawingPath = P("Design", "SHEET.idw");
+        var drawingPath = P("Design", "10073-SHEET.idw");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_p1"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found,
@@ -2450,10 +2520,10 @@ public class CopyDesignPlannerTests
     [Fact]
     public void A_rejected_claim_for_a_DIFFERENT_drawing_id_does_not_taint_an_unrelated_valid_drawing()
     {
-        var partAPath = P("Design", "A.ipt");
-        var partBPath = P("Design", "B.ipt");
-        var validDrawingPath = P("Design", "SHARED.idw");
-        var otherDrawingPath = P("Design", "OTHER.idw");
+        var partAPath = P("Design", "10073-A.ipt");
+        var partBPath = P("Design", "10073-B.ipt");
+        var validDrawingPath = P("Design", "10073-SHARED.idw");
+        var otherDrawingPath = P("Design", "10073-OTHER.idw");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_a"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found,
@@ -2545,10 +2615,10 @@ public class CopyDesignPlannerTests
     [Fact]
     public void A_rejected_claim_with_NO_usable_cadDocumentId_fails_closed_globally_without_tainting_any_existing_drawing()
     {
-        var partAPath = P("Design", "A.ipt");
-        var partBPath = P("Design", "B.ipt");
-        var validDrawingPath = P("Design", "SHARED.idw");
-        var noIdDrawingPath = P("Design", "NOID.idw");
+        var partAPath = P("Design", "10073-A.ipt");
+        var partBPath = P("Design", "10073-B.ipt");
+        var validDrawingPath = P("Design", "10073-SHARED.idw");
+        var noIdDrawingPath = P("Design", "10073-NOID.idw");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_a"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found,
@@ -2786,8 +2856,8 @@ public class CopyDesignPlannerTests
     [Fact]
     public void All_eligible_model_lookups_Found_keeps_drawing_association_complete()
     {
-        var partAPath = P("Design", "A.ipt");
-        var partBPath = P("Design", "B.ipt");
+        var partAPath = P("Design", "10073-A.ipt");
+        var partBPath = P("Design", "10073-B.ipt");
         var drawingSource = new StubDrawingSource(new Dictionary<string, DrawingAssociationResult>
         {
             ["cad_root"] = new DrawingAssociationResult(DrawingAssociationOutcome.Found, Array.Empty<AssociatedDrawing>()),
@@ -3419,8 +3489,8 @@ public class CopyDesignPlannerTests
     public void Round8_A_scanner_discovered_drawing_node_is_never_dropped_when_model_only_mode_makes_the_plan_executable()
     {
         var rootIdentity = new PlmIdentity("cad_root", null, "fv_root1");
-        var modelAPath = P("Design", "A.ipt");
-        var modelBPath = P("Design", "B.ipt");
+        var modelAPath = P("Design", "10073-A.ipt");
+        var modelBPath = P("Design", "10073-B.ipt");
         var scan = Scan(Root(RootPath, type: CadDocumentType.Idw), new[]
         {
             Managed(RootPath, modelAPath, "cad_a", "fv_a1", kind: CadRelationshipKind.DrawingModel, parentIdentity: rootIdentity),

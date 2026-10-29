@@ -342,7 +342,12 @@ internal sealed class InventorCopyDesignPhysicalCopier(InventorApi.Application a
             return Task.FromResult(new CopyDesignPhysicalCopyResult(
                 false, "The copy was promoted without an exception, but the destination file does not exist - refusing to report success."));
         }
-        return Task.FromResult(new CopyDesignPhysicalCopyResult(true, null));
+        // P6 METADATA FIX: report the temp NAME the final was promoted from -
+        // Inventor derives a default Part Number from the name a file is
+        // SAVED under (the temp name), and the rename above never touches
+        // iProperties. InventorCopyDesignMetadataNormalizer undoes that on the
+        // FINAL path (this class still never saves anything itself).
+        return Task.FromResult(new CopyDesignPhysicalCopyResult(true, null, PromotedFromTempFileName: Path.GetFileName(tempPath)));
     }
 
     /// <summary>P6D: IDW and Inventor DWG both report

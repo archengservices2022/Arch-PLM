@@ -23,6 +23,22 @@ public sealed class CopyDesignExecutionJournal
     ///  this ONLY after the physical copy actually succeeded.</summary>
     public void RecordCreated(string cadDocumentId, string destinationAbsolutePath, DateTimeOffset? nowUtc = null) =>
         _entries.Add(new CopyDesignJournalEntry(cadDocumentId, destinationAbsolutePath, nowUtc ?? DateTimeOffset.UtcNow));
+
+    private readonly List<CopyDesignOwnedBackup> _ownedBackups = new();
+
+    /// <summary>P6 Milestone 3: Inventor OldVersions backups this attempt
+    ///  PROVED it created (see <see cref="CopyDesignBackupOwnershipEvaluator"/>)
+    ///  and that still exist - the ONLY backups cleanup may ever delete.</summary>
+    public IReadOnlyList<CopyDesignOwnedBackup> OwnedBackups => _ownedBackups;
+
+    public void RecordOwnedBackup(string cadDocumentId, CopyDesignBackupFile backup) =>
+        _ownedBackups.Add(new CopyDesignOwnedBackup(cadDocumentId, backup.AbsolutePath, backup.Sha256));
+
+    /// <summary>Inventor's rotation already removed this owned backup.</summary>
+    public void ForgetOwnedBackup(string absolutePath) =>
+        _ownedBackups.RemoveAll(b => string.Equals(b.AbsolutePath, absolutePath, StringComparison.OrdinalIgnoreCase));
+
+    internal void ClearOwnedBackups() => _ownedBackups.Clear();
 }
 
 public sealed record CopyDesignCleanupOutcome(string AbsolutePath, bool Deleted, string? FailureReason);

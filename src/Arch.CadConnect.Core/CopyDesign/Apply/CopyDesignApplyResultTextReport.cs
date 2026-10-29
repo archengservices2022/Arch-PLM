@@ -57,6 +57,17 @@ public static class CopyDesignApplyResultTextReport
             sb.AppendLine();
         }
 
+        if (result.BackupCleanup is { Outcomes.Count: > 0 })
+        {
+            sb.AppendLine("Cleanup of Inventor OldVersions backups created by this attempt:");
+            foreach (var outcome in result.BackupCleanup.Outcomes)
+            {
+                sb.AppendLine($"  {(outcome.Deleted ? "removed" : "LEFT IN PLACE - REVIEW")}: {outcome.AbsolutePath}"
+                    + (outcome.FailureReason is null ? "" : $" ({outcome.FailureReason})"));
+            }
+            sb.AppendLine();
+        }
+
         if (result.ReservedButUnmaterialized)
         {
             sb.AppendLine(Rule);

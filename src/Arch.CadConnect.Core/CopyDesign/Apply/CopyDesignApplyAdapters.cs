@@ -28,7 +28,13 @@ public sealed record CopyDesignPhysicalCopyResult(
     ///  could NOT confirm was removed - the exact path, so it can be
     ///  reported for manual cleanup. Always <c>null</c> on success, and
     ///  always <c>null</c> on a failure where no temp artifact remains.</summary>
-    string? UnremovedTempPath = null);
+    string? UnremovedTempPath = null,
+    /// <summary>P6 METADATA FIX: on SUCCESS, the file NAME (no directory) of
+    ///  the operation-owned temp file the final destination was promoted
+    ///  from - what <see cref="ICopyDesignMetadataNormalizer"/> needs to
+    ///  recognize a Part Number Inventor derived from it. Always <c>null</c>
+    ///  on failure.</summary>
+    string? PromotedFromTempFileName = null);
 
 public interface ICopyDesignPhysicalCopier
 {

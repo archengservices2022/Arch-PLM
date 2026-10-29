@@ -23,10 +23,18 @@ public static class RibbonCommandPolicy
         string? userRole = null,
         bool hasRememberedUndoTarget = false,
         bool hasResumableCopyDesignAttempt = false,
-        bool hasUncertainCopyDesignAttempt = false)
+        bool hasUncertainCopyDesignAttempt = false,
+        bool copyDesignRunning = false)
     {
         // Not built yet -> visible but disabled, everywhere.
         if (!command.IsImplemented())
+        {
+            return false;
+        }
+
+        // P6 M4.1a: while Copy Design Apply / Resume / Recover runs, nothing
+        // that could change the connection or touch the same documents.
+        if (copyDesignRunning && !IsAllowedWhileCopyDesignRuns(command))
         {
             return false;
         }
@@ -136,6 +144,17 @@ public static class RibbonCommandPolicy
         };
     }
 
+    /// <summary>P6 M4.1a: the ONLY commands usable while a Copy Design Apply /
+    ///  Resume / Recover is running - local, read-only inspection. An
+    ///  ALLOW-list, so a command added later is blocked until someone decides
+    ///  otherwise. Sign In / Sign Out / Server Status (a connection change),
+    ///  Get Latest / Checkout / Check In / Undo / Repair (document mutation)
+    ///  and every other Copy Design command are refused. The controller
+    ///  enforces the same rule in its command handler - the ribbon alone is
+    ///  not relied on.</summary>
+    public static bool IsAllowedWhileCopyDesignRuns(ArchCommand command) =>
+        command is ArchCommand.ScanReferences or ArchCommand.ReferenceHealth;
+
     /// <summary>Supported P5A/P5B-A scan roots: an Inventor assembly, part or
     ///  drawing that exists on disk. Managed status is irrelevant - an
     ///  unmanaged document still has references worth reporting.</summary>
@@ -156,13 +175,14 @@ public static class RibbonCommandPolicy
         string? userRole = null,
         bool hasRememberedUndoTarget = false,
         bool hasResumableCopyDesignAttempt = false,
-        bool hasUncertainCopyDesignAttempt = false)
+        bool hasUncertainCopyDesignAttempt = false,
+        bool copyDesignRunning = false)
     {
         var map = new Dictionary<ArchCommand, bool>();
         foreach (var command in ArchCommands.All)
         {
             map[command] = IsEnabled(command, connection, document, userRole, hasRememberedUndoTarget,
-                hasResumableCopyDesignAttempt, hasUncertainCopyDesignAttempt);
+                hasResumableCopyDesignAttempt, hasUncertainCopyDesignAttempt, copyDesignRunning);
         }
         return map;
     }

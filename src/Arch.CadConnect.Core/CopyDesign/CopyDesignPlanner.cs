@@ -104,6 +104,13 @@ namespace Arch.CadConnect.Core.CopyDesign;
 /// </summary>
 public static class CopyDesignPlanner
 {
+    /// <summary>P6 Milestone 1: the stable prefix of the NeedsDecision reason
+    ///  written when the destination name rule does not match a COPY node's
+    ///  file name. Deliberately NOT <see cref="CopyDesignExplicitDecisionEligibility.ClassificationUnknownReasonPrefix"/> -
+    ///  an explicit engineer decision cannot resolve it; only a rename rule
+    ///  that actually matches can.</summary>
+    public const string UnmatchedRenameRuleReasonPrefix = "The destination rename rule does not match the file name";
+
     /// <param name="explicitDecisions">Keyed by STABLE cadDocumentId.
     ///  Consulted ONLY at the one classification-unknown decision point -
     ///  see the class doc comment. Never mutates, never guesses; an id with
@@ -186,7 +193,8 @@ public static class CopyDesignPlanner
             // Copy Design root action.
             IsVerified: scan.Root.Identity is not null && scan.Root.IsVerified,
             IsResolved: true,
-            IsRoot: true));
+            IsRoot: true,
+            SourceDocumentNumber: scan.Root.Identity?.DocumentNumber));
 
         foreach (var reference in scan.References)
         {
@@ -212,7 +220,8 @@ public static class CopyDesignPlanner
                 IsManaged: reference.ManifestIdentity is not null,
                 IsVerified: reference.ManifestIdentity?.IsVerified == true,
                 IsResolved: isResolved,
-                IsRoot: false));
+                IsRoot: false,
+                SourceDocumentNumber: reference.ManifestIdentity?.DocumentNumber));
 
             var parentKey = KeyFor(reference.ParentIdentity?.CadDocumentId, reference.ParentAbsolutePath);
             // Scanner-native edges keep whatever relationship kind the P5A
@@ -898,9 +907,24 @@ public static class CopyDesignPlanner
 
         string? destFileName = null;
         string? destPath = null;
+        // P6 Milestone 1: a COPY is a NEW identity, so it never silently keeps
+        // the source file name. Every route into COPY passes through here -
+        // the selected root, a project-specific classification, an explicit
+        // engineer decision, and a drawing mirroring its model - so no
+        // decision can bypass this check. (The server independently rejects
+        // a destination number that canonically collides with any existing
+        // document, including the source itself.)
+        var renamedFileName = action == CopyDesignAction.Copy ? nameRule.Rename(draft.SourceFileName) : null;
+        if (action == CopyDesignAction.Copy && renamedFileName is null)
+        {
+            action = CopyDesignAction.NeedsDecision;
+            reasons.Add(UnmatchedRenameRuleReasonPrefix + $" \"{draft.SourceFileName}\" - refusing to silently keep the "
+                + "source file name for a new identity. Fail closed: adjust the rename rule so it matches this file.");
+        }
         if (action == CopyDesignAction.Copy)
         {
-            destFileName = nameRule.Rename(draft.SourceFileName) ?? draft.SourceFileName;
+            // Non-null: a COPY whose rule did not match was demoted above.
+            destFileName = renamedFileName!;
             try
             {
                 destPath = SafeWorkspacePath.ResolveWithinRoot(destinationWorkspaceRoot, destFileName);
@@ -940,7 +964,8 @@ public static class CopyDesignPlanner
             action == CopyDesignAction.Copy ? destFileName : null,
             action == CopyDesignAction.Copy ? destPath : null,
             reasons,
-            draft.IsRoot);
+            draft.IsRoot,
+            draft.SourceDocumentNumber);
     }
 
     /// <summary>
@@ -974,7 +999,8 @@ public static class CopyDesignPlanner
             ProposedDestinationFileName: null,
             ProposedDestinationAbsolutePath: null,
             reasons,
-            draft.IsRoot);
+            draft.IsRoot,
+            draft.SourceDocumentNumber);
     }
 
     /// <summary>
@@ -1146,6 +1172,7 @@ public static class CopyDesignPlanner
             .ThenBy(o => o.IsVerified)
             .ThenBy(o => o.IsResolved)
             .ThenBy(o => o.SourceFileName, StringComparer.Ordinal)
+            .ThenBy(o => o.SourceDocumentNumber, StringComparer.Ordinal)
             .First();
         // RelationshipToParent is deliberately NOT set here - see the
         // post-construction, edge-derived computation in Plan().
@@ -1263,5 +1290,6 @@ public static class CopyDesignPlanner
         bool IsManaged,
         bool IsVerified,
         bool IsResolved,
-        bool IsRoot);
+        bool IsRoot,
+        string? SourceDocumentNumber = null);
 }

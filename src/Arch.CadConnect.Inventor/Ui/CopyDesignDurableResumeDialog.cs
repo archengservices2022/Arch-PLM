@@ -171,9 +171,9 @@ internal sealed class CopyDesignDurableResumeDialog : Form
         SourceWorkspaceRoot = sourceRoot;
         DestinationFolder = destinationFolder;
 
-        // Remember the folder (non-secret) for next time, keeping other prefs.
-        (ConnectSettings.Load() with { LastCopyDesignDestinationFolder = destinationFolder }).Save();
-
+        // The folder is NOT remembered here: the controller remembers it only
+        // after the M4.1 server-origin check allows the source workspace (a
+        // refused workspace must leave connect.json untouched).
         DialogResult = DialogResult.OK;
         Close();
     }

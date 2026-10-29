@@ -22,7 +22,8 @@ namespace Arch.CadConnect.Inventor.Ui;
 /// The workspace directory is remembered (non-secret) in
 /// <see cref="ConnectSettings.LastWorkspaceRoot"/> only as a convenience
 /// default - the user confirms it every time and it is never treated as
-/// authority for anything.
+/// authority for anything. The dialog only reads it; the controller saves the
+/// chosen folder once the server-origin check has allowed it.
 /// </summary>
 internal sealed class GetLatestDialog : Form
 {
@@ -157,9 +158,9 @@ internal sealed class GetLatestDialog : Form
         RootDocumentType = documentType;
         WorkspaceRoot = folder;
 
-        // Remember the folder (non-secret) for next time, keeping other prefs.
-        (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save();
-
+        // The folder is NOT remembered here: the controller remembers it only
+        // after the M4.1 server-origin check allows it (a refused folder must
+        // leave connect.json untouched).
         DialogResult = DialogResult.OK;
         Close();
     }
