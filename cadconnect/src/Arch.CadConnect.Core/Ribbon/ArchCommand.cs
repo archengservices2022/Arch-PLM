@@ -1,0 +1,169 @@
+namespace Arch.CadConnect.Core.Ribbon;
+
+/// <summary>
+/// Every ribbon button the add-in defines. Split into two groups:
+///
+///   * <see cref="IsImplemented"/> == true  - the command actually performs a
+///     real operation (CONNECTION commands since P4A; Get Latest since P4B);
+///   * everything else - declared so the ribbon is complete, but wired to a
+///     handler that tells the user the operation is not implemented yet. The
+///     add-in NEVER reports a fake successful PDM result.
+/// </summary>
+public enum ArchCommand
+{
+    // CONNECTION panel
+    SignIn,
+    SignOut,
+    ServerStatus,
+
+    // PDM panel  (Get Latest: P4B; the rest: P4C)
+    GetLatest,
+    Checkout,
+    CheckIn,
+    UndoCheckout,
+
+    // INFORMATION panel
+    ScanReferences, // P5A
+    ReferenceHealth, // P5B-A
+    RepairReference, // P5C
+    CopyDesignPreview, // P6A - read-only plan + preview only, zero mutation
+    CopyDesignResume, // P6D ROUND 2 - deliberate, explicit retry of the LAST partially-failed Apply Copy Design attempt
+    CopyDesignRecover, // P6D ROUND 3 - deliberate, explicit retry of the LAST Apply Copy Design attempt whose reservation call itself never returned an answer (UNCERTAIN, never merely "unmaterialized")
+    CopyDesignVerify, // P6E-D - independent, read-only re-verification of an existing (by operationId) Copy Design operation. No copy, no rewire, no save, no materialize, no repair, no reservation.
+    Status,
+    Version,
+    Revision,
+    WhereUsed,
+}
+
+public static class ArchCommands
+{
+    /// <summary>Internal-id namespace for every ribbon control this add-in creates.</summary>
+    public const string InternalIdPrefix = "Arch.CadConnect";
+
+    /// <summary>The ribbon tab label.</summary>
+    public const string RibbonTabName = "ARCH ENGINEERING";
+
+    /// <summary>True when the command performs a real operation today (vs.
+    ///  "declared but not implemented yet").</summary>
+    public static bool IsImplemented(this ArchCommand command) => command switch
+    {
+        ArchCommand.SignIn => true,
+        ArchCommand.SignOut => true,
+        ArchCommand.ServerStatus => true,
+        ArchCommand.GetLatest => true, // P4B
+        ArchCommand.Checkout => true, // P4C
+        ArchCommand.CheckIn => true, // P4C
+        ArchCommand.UndoCheckout => true, // P4C
+        ArchCommand.ScanReferences => true, // P5A
+        ArchCommand.ReferenceHealth => true, // P5B-A
+        ArchCommand.RepairReference => true, // P5C
+        ArchCommand.CopyDesignPreview => true, // P6A (preview only - no execution command exists)
+        ArchCommand.CopyDesignResume => true, // P6D ROUND 2
+        ArchCommand.CopyDesignRecover => true, // P6D ROUND 3
+        ArchCommand.CopyDesignVerify => true, // P6E-D
+        _ => false,
+    };
+
+    /// <summary>True when the command only makes sense with an active, eligible document.</summary>
+    public static bool RequiresActiveDocument(this ArchCommand command) => command switch
+    {
+        ArchCommand.GetLatest => true,
+        ArchCommand.Checkout => true,
+        ArchCommand.CheckIn => true,
+        ArchCommand.UndoCheckout => true,
+        ArchCommand.ScanReferences => true,
+        ArchCommand.ReferenceHealth => true,
+        ArchCommand.RepairReference => true,
+        ArchCommand.CopyDesignPreview => true,
+        // CopyDesignResume/CopyDesignRecover/CopyDesignVerify deliberately do
+        // NOT require an active document - the remembered attempt (Resume/
+        // Recover) or the explicitly-typed operationId (Verify) already
+        // carries its own identity; each command reports "nothing to
+        // resume/recover/verify" or fails closed on bad input, rather than
+        // being gated on document context.
+        ArchCommand.Status => true,
+        ArchCommand.Version => true,
+        ArchCommand.Revision => true,
+        ArchCommand.WhereUsed => true,
+        _ => false,
+    };
+
+    /// <summary>True when the command needs a live connection to the server.</summary>
+    public static bool RequiresConnection(this ArchCommand command) =>
+        command != ArchCommand.SignIn;
+
+    public static string DisplayName(this ArchCommand command) => command switch
+    {
+        ArchCommand.SignIn => "Sign In",
+        ArchCommand.SignOut => "Sign Out",
+        ArchCommand.ServerStatus => "Server Status",
+        ArchCommand.GetLatest => "Get Latest",
+        ArchCommand.Checkout => "Checkout",
+        ArchCommand.CheckIn => "Check In",
+        ArchCommand.UndoCheckout => "Undo Checkout",
+        ArchCommand.ScanReferences => "Scan References",
+        ArchCommand.ReferenceHealth => "Reference Health",
+        ArchCommand.RepairReference => "Repair Reference",
+        ArchCommand.CopyDesignPreview => "Copy Design Preview",
+        ArchCommand.CopyDesignResume => "Resume Copy Design",
+        ArchCommand.CopyDesignRecover => "Recover Copy Design",
+        ArchCommand.CopyDesignVerify => "Verify Copy Design",
+        ArchCommand.Status => "Status",
+        ArchCommand.Version => "Version",
+        ArchCommand.Revision => "Revision",
+        ArchCommand.WhereUsed => "Where Used",
+        _ => command.ToString(),
+    };
+
+    public static string InternalName(this ArchCommand command) =>
+        $"{InternalIdPrefix}.Cmd.{command}";
+
+    public static string Panel(this ArchCommand command) => command switch
+    {
+        ArchCommand.SignIn or ArchCommand.SignOut or ArchCommand.ServerStatus => "CONNECTION",
+        ArchCommand.GetLatest or ArchCommand.Checkout or ArchCommand.CheckIn or ArchCommand.UndoCheckout => "PDM",
+        _ => "INFORMATION",
+    };
+
+    // ScanReferences (P5A), ReferenceHealth (P5B-A) and RepairReference (P5C)
+    // fall through to INFORMATION - the reference-intelligence workflow. Repair
+    // mutates the in-memory CAD reference graph, but only ever after an explicit
+    // preview + confirmation, and never touches PLM state (no save / checkout /
+    // check-in / Get Latest).
+
+    public static string ToolTip(this ArchCommand command) =>
+        command.IsImplemented()
+            ? command switch
+            {
+                ArchCommand.SignIn => "Sign in to an Arch PLM server.",
+                ArchCommand.SignOut => "Sign out and revoke this machine's session.",
+                ArchCommand.ServerStatus => "Check the Arch PLM connection.",
+                ArchCommand.GetLatest => "Download the latest version of a managed CAD document and its dependencies into a local workspace.",
+                ArchCommand.Checkout => "Take an exclusive server checkout of the active managed document and make its local file editable.",
+                ArchCommand.CheckIn => "Upload the saved local file as the next version and release your checkout.",
+                ArchCommand.UndoCheckout => "Release your checkout and restore the local file to the checked-out version, discarding local changes.",
+                ArchCommand.ScanReferences => "Report the references Inventor knows about for the active document. Read-only - never changes, saves, or repairs anything.",
+                ArchCommand.ReferenceHealth => "Diagnose the local health of each reference: resolved / missing, inside / outside the workspace, managed / unmanaged. Read-only - never changes or repairs anything.",
+                ArchCommand.RepairReference => "Repair ONE stale managed reference of the active document by repointing it to the authoritative latest version - with an explicit preview and confirmation. Never saves, checks out, or checks in.",
+                ArchCommand.CopyDesignPreview => "Preview a Copy Design plan for the active document: discovers its dependency structure and proposes COPY / REUSE for each node. Read-only - never copies, renames, saves, or replaces anything.",
+                ArchCommand.CopyDesignResume => "Deliberately retry the LAST Apply Copy Design attempt that was reserved but did not fully materialize, continuing with the SAME operation - never re-copies or re-materializes anything already done, and never creates a new CadDocument.",
+                ArchCommand.CopyDesignRecover => "Deliberately retry the LAST Apply Copy Design attempt whose outcome is UNKNOWN (the reservation call itself never returned an answer) - replays the SAME idempotency key/request; returns the SAME operation if the server already committed it, or safely creates it if not. Never mints a new key, never auto-retries on its own.",
+                ArchCommand.CopyDesignVerify => "Independently re-verify an existing Copy Design operation by its operation id: source integrity, destination integrity, and reference topology. Read-only - never copies, rewires, saves, materializes, repairs, or triggers Apply/Resume.",
+                _ => command.DisplayName(),
+            }
+            : $"{command.DisplayName()} is not available yet. Coming in a later release.";
+
+    /// <summary>Deterministic panel order.</summary>
+    public static readonly IReadOnlyList<string> PanelOrder = new[] { "CONNECTION", "PDM", "INFORMATION" };
+
+    /// <summary>All commands, in ribbon layout order.</summary>
+    public static readonly IReadOnlyList<ArchCommand> All = new[]
+    {
+        ArchCommand.SignIn, ArchCommand.SignOut, ArchCommand.ServerStatus,
+        ArchCommand.GetLatest, ArchCommand.Checkout, ArchCommand.CheckIn, ArchCommand.UndoCheckout,
+        ArchCommand.ScanReferences, ArchCommand.ReferenceHealth, ArchCommand.RepairReference,
+        ArchCommand.CopyDesignPreview, ArchCommand.CopyDesignResume, ArchCommand.CopyDesignRecover, ArchCommand.CopyDesignVerify,
+        ArchCommand.Status, ArchCommand.Version, ArchCommand.Revision, ArchCommand.WhereUsed,
+    };
+}

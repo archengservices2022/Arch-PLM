@@ -1,0 +1,2527 @@
+using System.Windows.Forms;
+
+using Arch.CadConnect.Api;
+using Arch.CadConnect.Api.Workspace;
+using Arch.CadConnect.Core;
+using Arch.CadConnect.Core.Connection;
+using Arch.CadConnect.Core.CopyDesign;
+using Arch.CadConnect.Core.Documents;
+using Arch.CadConnect.Core.Files;
+using Arch.CadConnect.Core.References;
+using Arch.CadConnect.Core.Ribbon;
+using Arch.CadConnect.Core.Session;
+using Arch.CadConnect.Core.Workspace;
+using Arch.CadConnect.Inventor.Documents;
+using Arch.CadConnect.Inventor.References;
+using Arch.CadConnect.Inventor.Ribbon;
+using Arch.CadConnect.Inventor.Ui;
+
+using InventorApi = Inventor;
+
+namespace Arch.CadConnect.Inventor;
+
+/// <summary>
+/// The add-in's brain. Owns the connection manager, the ribbon, and the
+/// document observer, and keeps the ribbon in sync with
+/// <see cref="ConnectionState"/> + active document via the pure
+/// <see cref="RibbonCommandPolicy"/>.
+///
+/// All Inventor/COM/UI work happens on Inventor's UI thread. Network work runs
+/// on the thread pool and its results are marshalled back through a hidden
+/// WinForms control created on the UI thread.
+/// </summary>
+internal sealed class ArchAddInController : IDisposable
+{
+    private readonly InventorApi.Application _application;
+    private readonly ActiveDocumentTracker _tracker = new();
+    private readonly Control _uiMarshal = new();
+    private readonly ArchConnectionManager _connection;
+    private readonly RibbonFactory _ribbon;
+    private readonly InventorDocumentObserver _documents;
+
+    /// <summary>P4C: the most-recently-active exact checkout target, kept so
+    ///  Undo stays reachable after its document is closed. Re-validated on
+    ///  every ribbon refresh; the destructive path re-checks it fully.</summary>
+    private readonly UndoTargetMemory _undoTarget = new();
+
+    /// <summary>P6C: ONE guard for the controller's whole lifetime - a
+    ///  double-click or a second "Apply Copy Design" invocation while one is
+    ///  already running must be refused, not queued. In-process only; see
+    ///  <see cref="Core.CopyDesign.Apply.CopyDesignApplyOperationGuard"/>'s own
+    ///  doc comment for why a single global guard is sufficient here.</summary>
+    private readonly Core.CopyDesign.Apply.CopyDesignApplyOperationGuard _copyDesignApplyGuard = new();
+
+    /// <summary>P6 M4.1a: 1 while a Copy Design Apply / Resume / Recover is
+    ///  running (set on the UI thread BEFORE the background work starts,
+    ///  cleared in that work's <c>finally</c>). While set, the ribbon AND
+    ///  <see cref="OnCommandInvoked"/> refuse every command outside
+    ///  <see cref="RibbonCommandPolicy.IsAllowedWhileCopyDesignRuns"/> -
+    ///  in particular Sign In / Sign Out / Server Status.</summary>
+    private int _copyDesignRunning;
+
+    private bool CopyDesignRunning => Volatile.Read(ref _copyDesignRunning) == 1;
+
+    /// <summary>P6D ROUND 2 (RESUME): the LAST Apply Copy Design attempt that
+    ///  ended <see cref="Core.CopyDesign.Apply.CopyDesignApplyOperationResult.ReservedButUnmaterialized"/>
+    ///  - i.e. genuinely resumable - remembered ONLY in this add-in
+    ///  session's memory (never persisted to disk; does not survive an
+    ///  Inventor restart - see the P6D report's "remaining limitations").
+    ///  <see cref="ArchCommand.CopyDesignResume"/> is the ONLY thing that
+    ///  ever reads this, and ONLY on an explicit, deliberate user action -
+    ///  an ordinary "Apply Copy Design" never silently reinterprets itself
+    ///  as a resume. Cleared once an attempt (fresh or resumed) fully
+    ///  succeeds.</summary>
+    private (Core.CopyDesign.CopyDesignPlan Plan, string IdempotencyKey, string? Label)? _resumableCopyDesignAttempt;
+
+    /// <summary>P6D ROUND 3, item F: the LAST Apply Copy Design attempt whose
+    ///  reservation call itself never returned a trustworthy answer (the
+    ///  server may or may not have committed it - genuinely UNKNOWN),
+    ///  remembered ONLY in this session's memory, exactly like
+    ///  <see cref="_resumableCopyDesignAttempt"/> but for a CATEGORICALLY
+    ///  DIFFERENT situation: here there is no confirmed
+    ///  <c>copyDesignOperationId</c> at all, so the idempotency key ALONE is
+    ///  the recovery handle. <see cref="ArchCommand.CopyDesignRecover"/> is
+    ///  the ONLY thing that ever reads this, and ONLY on an explicit,
+    ///  deliberate user action - never auto-retried beyond the orchestrator's
+    ///  own existing bounded transport retry. Mutually exclusive with
+    ///  <see cref="_resumableCopyDesignAttempt"/> for the SAME attempt (an
+    ///  attempt is either "reservation confirmed, something later failed" or
+    ///  "reservation itself unconfirmed" - never both); see
+    ///  <see cref="ExecuteCopyDesignAttempt"/>'s <c>onDone</c> for the single
+    ///  place both are written. Cleared once an attempt (fresh, resumed, or
+    ///  recovered) fully succeeds, OR once a retry establishes a confirmed
+    ///  reservation (which then becomes resumable instead, if still
+    ///  unmaterialized).</summary>
+    private (Core.CopyDesign.CopyDesignPlan Plan, string IdempotencyKey, string? Label)? _uncertainCopyDesignAttempt;
+
+    private bool _disposed;
+
+    /// <summary>P6 M4.2: the local diagnostics log (JSON Lines, one file per
+    ///  attempt under %LOCALAPPDATA%\ArchEngineering\CadConnect\logs).
+    ///  Best-effort - it never changes an operation's outcome, and nothing
+    ///  ever reads it back.</summary>
+    private readonly Core.Diagnostics.IDiagnosticsSink _diagnostics =
+        new Core.Diagnostics.JsonLinesDiagnosticsSink(Core.Diagnostics.JsonLinesDiagnosticsSink.DefaultDirectory);
+
+    /// <summary>P6 M4.4 MULTI-INSTANCE LOCKS: every mutating command (Get
+    ///  Latest, Checkout, Check In, Undo Checkout, Copy Design Apply / Resume /
+    ///  Recover) takes its workspace / operation / destination locks here -
+    ///  after its M4.1 origin check, before its first server request - and
+    ///  holds them until its background work has completely finished. See
+    ///  <see cref="AcquireCommandLock"/>.</summary>
+    private readonly Core.Workspace.Locking.CommandLockGate _locks;
+
+    public ArchAddInController(InventorApi.Application application)
+    {
+        _application = application;
+        _locks = new Core.Workspace.Locking.CommandLockGate(
+            new Core.Workspace.Locking.WorkspaceLockAcquirer(
+                Core.Workspace.Locking.WindowsLockPathSystem.Instance,
+                Core.Workspace.Locking.WindowsLockHandleFactory.Instance),
+            _diagnostics);
+
+        // Force the hidden control's handle so BeginInvoke works.
+        _ = _uiMarshal.Handle;
+
+        _connection = new ArchConnectionManager(
+            apiFactory: server => ArchApiClient.Create(server, new ArchApiClientOptions
+            {
+                ClientLabel = ClientLabel(),
+                Timeout = TimeSpan.FromSeconds(30),
+                EditorProbe = new InventorEditorDocumentProbe(_application),
+            }),
+            store: new DpapiSessionStore());
+        _connection.Diagnostics = _diagnostics;
+
+        _connection.StateChanged += _ => OnUi(RefreshEnablement);
+        _connection.SessionChanged += session => OnUi(() =>
+        {
+            // Sign-out (null session) forgets any remembered Undo target.
+            if (session is null)
+            {
+                if (_undoTarget.Current is { } forgotten)
+                {
+                    LogUndoTarget("dropped", "signed-out", "session", forgotten, forgotten.File.WorkspaceRoot, checkoutCount: null, manifestStep: null);
+                }
+                _undoTarget.Clear();
+            }
+            RefreshEnablement();
+        });
+
+        _ribbon = new RibbonFactory(_application);
+        _ribbon.CommandInvoked += OnCommandInvoked;
+        _ribbon.Build();
+
+        _documents = new InventorDocumentObserver(_application, _tracker, KnownWorkspaceRoots);
+        _tracker.Changed += _ => OnUi(RefreshEnablement);
+
+        RefreshEnablement();
+
+        // Try to restore a prior session without blocking start-up.
+        RunBackground(async ct => await _connection.TryRestoreAsync(ct), title: null);
+    }
+
+    // ---- ribbon <-> state --------------------------------------------
+
+    private void RefreshEnablement()
+    {
+        var role = _connection.CurrentSession?.Identity.Role;
+        var doc = _tracker.Current;
+
+        // P4C: remember an exact checked-out target while it is active, and
+        // drop it the moment it is no longer a live checkout in the current
+        // workspace (successful check-in / undo clear the manifest marker;
+        // a workspace change / identity drift / missing file also invalidate).
+        var previousTarget = _undoTarget.Current;
+        _undoTarget.Observe(doc);
+        if (_undoTarget.Current is { } observed && observed != previousTarget)
+        {
+            LogUndoTarget("remembered", "observed", "refresh", observed, observed.File.WorkspaceRoot, checkoutCount: null, manifestStep: null);
+        }
+
+        var currentRoot = SafeLastWorkspaceRoot();
+        var beforeRevalidate = _undoTarget.Current;
+        string? manifestStep = null;
+        var dropReason = _undoTarget.Revalidate(
+            entryLookup: file =>
+            {
+                var (entry, step) = LoadManifestEntryWithStatus(file);
+                manifestStep = step;
+                return entry;
+            },
+            fileExists: SafeFileExists,
+            currentWorkspaceRoot: currentRoot);
+        if (dropReason is not null)
+        {
+            LogUndoTarget("dropped", dropReason, "refresh", beforeRevalidate, currentRoot, checkoutCount: null, manifestStep);
+        }
+
+        // R10 MA-7: nothing remembered (the target can be lost while the
+        // document is closed) - recover it only when the selected workspace
+        // holds exactly one complete checkout record. Undo re-checks it all.
+        var recovered = _undoTarget.Current is null && _connection.CurrentSession is not null
+            ? RecoverUndoTargetFromWorkspace("refresh")
+            : null;
+
+        var map = RibbonCommandPolicy.Evaluate(
+            _connection.State, doc, role,
+            hasRememberedUndoTarget: _undoTarget.Current is not null || recovered is not null,
+            hasResumableCopyDesignAttempt: _resumableCopyDesignAttempt is not null,
+            hasUncertainCopyDesignAttempt: _uncertainCopyDesignAttempt is not null,
+            copyDesignRunning: CopyDesignRunning);
+        _ribbon.ApplyEnablement(map);
+    }
+
+    /// <summary>P6 M4.1 SERVER-ORIGIN GUARD (UI layer): refuse - with a clear
+    ///  message, before any dialog or server call - when the workspace
+    ///  <paramref name="workspaceRoot"/> was not materialized from EXACTLY the
+    ///  server this session is signed in to. The connection manager enforces
+    ///  the same rule again for every call that carries a workspace; this
+    ///  layer additionally covers the calls that do not (Copy Design apply /
+    ///  resume / recover / verify, latest-version lookups). See
+    ///  <see cref="WorkspaceServerBinding"/>.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName) =>
+        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession);
+
+    /// <summary>P6 M4.1a: the same check against an explicit session - the
+    ///  BOUND one, for a Copy Design attempt.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, IArchSession? session)
+    {
+        var binding = WorkspaceServerBinding.CheckWorkspace(workspaceRoot, session?.Server, session?.Identity.OrganizationId);
+        if (binding.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, commandName, binding);
+        Error($"{commandName} was not run. {binding.Message}");
+        return false;
+    }
+
+    /// <summary>M4.1 T5 finding: the same check against the connected server,
+    ///  for a command whose dialog remembers folders -
+    ///  <paramref name="rememberSettingsWhenAllowed"/> runs ONLY when the
+    ///  workspace is allowed, so a refused workspace leaves connect.json
+    ///  untouched.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, Action rememberSettingsWhenAllowed)
+    {
+        var binding = WorkspaceServerBinding.AdmitWorkspace(
+            workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed, _connection.CurrentSession?.Identity.OrganizationId);
+        if (binding.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, commandName, binding);
+        Error($"{commandName} was not run. {binding.Message}");
+        return false;
+    }
+
+    /// <summary>P6 M4.4: the command's locks, or null - with the refusal shown
+    ///  and logged - when it must not run. <paramref name="originAllowed"/> is
+    ///  the command's M4.1 origin check: run before any lock is touched (so an
+    ///  origin refusal creates no lock artifact) and again while locked. Called
+    ///  after every dialog has closed, before the first server request.</summary>
+    private Core.Workspace.Locking.CommandLock? AcquireCommandLock(
+        Core.Workspace.Locking.WorkspaceLockRequest request, Func<bool> originAllowed)
+    {
+        var admission = _locks.Admit(request, originAllowed);
+        if (admission.Lock is { } held)
+        {
+            return held;
+        }
+        if (admission.LockRefusal is { } refusal)
+        {
+            Error($"{request.Command} was not run. {Core.Workspace.Locking.WorkspaceLockMessages.Describe(refusal)}");
+        }
+        return null;
+    }
+
+    /// <summary>P6 M4.4: <see cref="RunBackground"/> with the command's locks
+    ///  held through EVERY await of <paramref name="work"/> (server requests,
+    ///  file changes, manifest writes, cleanup) and released exactly once in
+    ///  the work's own <c>finally</c> - or at once if it cannot be queued.</summary>
+    private void RunLockedInBackground(
+        Core.Workspace.Locking.CommandLock held,
+        Func<CancellationToken, Task> work,
+        string? title,
+        Action? onDone = null,
+        Action? onSettled = null,
+        TimeSpan? timeout = null) =>
+        held.Queue(locked => RunBackground(locked, title, onDone, onSettled, timeout), work);
+
+    /// <summary>The manifest entry for <paramref name="file"/> (null when it
+    ///  cannot be read - the remembered target is then dropped, as before),
+    ///  plus a diagnostic code for how the manifest load went (R10 MA-7).</summary>
+    private static (WorkspaceManifestEntry? Entry, string Step) LoadManifestEntryWithStatus(ManagedFileRef file)
+    {
+        try
+        {
+            var (manifest, status) = WorkspaceManifest.Load(file.WorkspaceRoot);
+            return (manifest.FindByAbsolutePath(file.AbsoluteFilePath), ManifestStep(status));
+        }
+        catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException)
+        {
+            return (null, "manifest-error");
+        }
+    }
+
+    private static string ManifestStep(WorkspaceManifestLoadStatus status) => status switch
+    {
+        WorkspaceManifestLoadStatus.Loaded => "manifest-loaded",
+        WorkspaceManifestLoadStatus.Missing => "manifest-missing",
+        _ => "manifest-invalid",
+    };
+
+    /// <summary>R10 MA-7 fallback (see <see cref="UndoTargetMemory.ResolveFromWorkspace"/>):
+    ///  the single complete checkout record in the SELECTED workspace
+    ///  (<see cref="ConnectSettings.LastWorkspaceRoot"/>), or null. An
+    ///  unreadable or missing manifest recovers nothing. Never throws.</summary>
+    private RememberedCheckoutTarget? RecoverUndoTargetFromWorkspace(string source)
+    {
+        var root = SafeLastWorkspaceRoot();
+        UndoTargetRecovery recovery;
+        string? manifestStep = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                recovery = UndoTargetMemory.ResolveFromWorkspace(null, root, SafeFileExists);
+            }
+            else
+            {
+                var (manifest, status) = WorkspaceManifest.Load(root);
+                manifestStep = ManifestStep(status);
+                recovery = status == WorkspaceManifestLoadStatus.Loaded
+                    ? UndoTargetMemory.ResolveFromWorkspace(manifest.Entries, root, SafeFileExists)
+                    : new UndoTargetRecovery(null, UndoTargetRecovery.NoCheckout, 0);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException or ArgumentException)
+        {
+            manifestStep = "manifest-error";
+            recovery = new UndoTargetRecovery(null, UndoTargetRecovery.NoCheckout, 0);
+        }
+
+        LogUndoTarget(
+            recovery.Target is null ? "fallback-none" : "fallback-used",
+            recovery.Outcome, source, recovery.Target, root, recovery.CheckoutCount, manifestStep);
+        return recovery.Target;
+    }
+
+    /// <summary>The last undo-target diagnostic written, so a refresh that
+    ///  changes nothing writes nothing (RefreshEnablement runs very often).</summary>
+    private string? _lastUndoTargetLog;
+
+    /// <summary>R10 MA-7 diagnostics: one "pdm.undo-target" event per
+    ///  TRANSITION - remembered, dropped (with the reason), fallback used or
+    ///  not. Ids, codes, counts and sanitized paths only. Best effort: a
+    ///  logging failure never affects the ribbon.</summary>
+    private void LogUndoTarget(
+        string action, string verdict, string source, RememberedCheckoutTarget? target,
+        string? workspaceRoot, int? checkoutCount, string? manifestStep)
+    {
+        var key = string.Join("|", action, verdict, target?.CadDocumentId, target?.CheckoutId, workspaceRoot, checkoutCount, manifestStep);
+        if (string.Equals(key, _lastUndoTargetLog, StringComparison.Ordinal))
+        {
+            return;
+        }
+        _lastUndoTargetLog = key;
+        try
+        {
+            Core.Diagnostics.DiagnosticsAttempt.Start(
+                _diagnostics, "pdm.undo-target",
+                Core.Diagnostics.DiagnosticField.Code("action", action),
+                Core.Diagnostics.DiagnosticField.Code("verdict", verdict),
+                Core.Diagnostics.DiagnosticField.Code("source", source),
+                Core.Diagnostics.DiagnosticField.Code("step", manifestStep),
+                Core.Diagnostics.DiagnosticField.Id("cadDocumentId", target?.CadDocumentId),
+                Core.Diagnostics.DiagnosticField.Path("path", target?.File.AbsoluteFilePath),
+                Core.Diagnostics.DiagnosticField.Path("workspaceRoot", workspaceRoot),
+                Core.Diagnostics.DiagnosticField.Number("entryCount", checkoutCount))
+                .Succeeded();
+        }
+        catch
+        {
+            // diagnostics are best effort
+        }
+    }
+
+    private static bool SafeFileExists(string path)
+    {
+        try { return !string.IsNullOrEmpty(path) && File.Exists(path); }
+        catch { return false; }
+    }
+
+    private static string? SafeLastWorkspaceRoot()
+    {
+        try { return ConnectSettings.Load().LastWorkspaceRoot; }
+        catch { return null; }
+    }
+
+    private void OnCommandInvoked(ArchCommand command)
+    {
+        // P6 M4.1a: enforced HERE, not only by ribbon enablement (which is
+        // refreshed asynchronously and could lag a click).
+        if (CopyDesignRunning && !RibbonCommandPolicy.IsAllowedWhileCopyDesignRuns(command))
+        {
+            Info($"'{command.DisplayName()}' is not available while Copy Design is running. "
+                + "Wait for it to finish - the connection and the documents it uses must not change until then.");
+            return;
+        }
+
+        switch (command)
+        {
+            case ArchCommand.SignIn:
+                ShowSignInDialog();
+                break;
+
+            case ArchCommand.SignOut:
+                RunBackground(async ct => await _connection.SignOutAsync(ct), "Signing out");
+                break;
+
+            case ArchCommand.ServerStatus:
+                RunBackground(
+                    async ct => await _connection.RefreshServerStatusAsync(ct),
+                    "Checking server",
+                    onDone: () => Info(ServerStatusText()));
+                break;
+
+            case ArchCommand.GetLatest:
+                ShowGetLatestDialog();
+                break;
+
+            case ArchCommand.Checkout:
+                RunCheckout();
+                break;
+
+            case ArchCommand.CheckIn:
+                RunCheckIn();
+                break;
+
+            case ArchCommand.UndoCheckout:
+                RunUndoCheckout();
+                break;
+
+            case ArchCommand.ScanReferences:
+                RunScanReferences();
+                break;
+
+            case ArchCommand.ReferenceHealth:
+                RunReferenceHealth();
+                break;
+
+            case ArchCommand.RepairReference:
+                RunRepairReference();
+                break;
+
+            case ArchCommand.CopyDesignPreview:
+                RunCopyDesignPreview();
+                break;
+
+            case ArchCommand.CopyDesignResume:
+                RunCopyDesignResume();
+                break;
+
+            case ArchCommand.CopyDesignRecover:
+                RunCopyDesignRecover();
+                break;
+
+            case ArchCommand.CopyDesignVerify:
+                RunCopyDesignVerify();
+                break;
+
+            default:
+                // Never fake a PDM result. Say plainly it is not built yet.
+                Info($"'{command.DisplayName()}' is not available yet. Coming in a later release.");
+                break;
+        }
+    }
+
+    // ---- P4C: checkout / check-in / undo ----------------------------
+
+    /// <summary>The active document as an exact managed-file reference, or null
+    ///  (with a shown message) when it is not eligible.</summary>
+    private ManagedFileRef? ActiveManagedFile()
+    {
+        var doc = _tracker.Current;
+        if (doc.PlmIdentity is null || string.IsNullOrEmpty(doc.FullPath) || string.IsNullOrEmpty(doc.WorkspaceRoot))
+        {
+            Info("The active document is not a managed CAD document in a known workspace. Run Get Latest first.");
+            return null;
+        }
+        return ManagedFileRef.Create(doc.WorkspaceRoot!, doc.FullPath!);
+    }
+
+    private void RunCheckout()
+    {
+        var file = ActiveManagedFile();
+        if (file is null) return;
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Checkout")) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Checkout", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Checkout")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
+        CheckoutOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckoutOperation, file, _connection.CurrentSession);
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.CheckoutAsync(file, ct);
+                    PdmDiagnostics.RecordCheckout(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
+            "Checking out",
+            onDone: () =>
+            {
+                if (result is not null)
+                {
+                    if (result.ReconcileNeeded) Error(result.Message); else Info(result.Message);
+                }
+            },
+            onSettled: RefreshAfterOperation,
+            timeout: TimeSpan.FromMinutes(2));
+    }
+
+    private void RunCheckIn()
+    {
+        var file = ActiveManagedFile();
+        if (file is null) return;
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Check In")) return;
+
+        if (!_tracker.Current.IsSaved)
+        {
+            Info("Save the document in Inventor before checking it in.");
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            new Win32Owner(SafeMainHwnd()),
+            "Upload the saved local file as a new version and release your checkout?",
+            ArchAddInInfo.DisplayName, MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        if (confirm != DialogResult.OK) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Check In", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Check In")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
+        CheckInOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.CheckInOperation, file, _connection.CurrentSession);
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.CheckInAsync(file, ct);
+                    PdmDiagnostics.RecordCheckIn(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
+            "Checking in",
+            onDone: () =>
+            {
+                if (result is not null)
+                {
+                    if (result.Verified) Info(result.Message); else Error(result.Message);
+                }
+            },
+            onSettled: RefreshAfterOperation,
+            timeout: TimeSpan.FromMinutes(15));
+    }
+
+    private void RunUndoCheckout()
+    {
+        var (file, label) = ResolveUndoTarget();
+        if (file is null)
+        {
+            Info("There is no checked-out managed document to undo. Open the checked-out file, then try again.");
+            return;
+        }
+        if (!EnsureWorkspaceServer(file.WorkspaceRoot, "Undo Checkout")) return;
+
+        var confirm = MessageBox.Show(
+            new Win32Owner(SafeMainHwnd()),
+            $"Undo Checkout of \"{label}\" will DISCARD your local changes and restore the checked-out version. Continue?",
+            ArchAddInInfo.DisplayName, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+        if (confirm != DialogResult.OK) return;
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForDocument("Undo Checkout", file.AbsoluteFilePath),
+                () => EnsureWorkspaceServer(file.WorkspaceRoot, "Undo Checkout")) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
+        UndoOperationResult? result = null;
+        var log = PdmDiagnostics.StartFileCommand(_diagnostics, PdmDiagnostics.UndoCheckoutOperation, file, _connection.CurrentSession);
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
+            async ct =>
+            {
+                try
+                {
+                    result = await _connection.UndoCheckoutAsync(file, reason: null, ct);
+                    PdmDiagnostics.RecordUndo(log, result);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
+            "Undoing checkout",
+            onDone: () =>
+            {
+                if (result is not null)
+                {
+                    if (result.Restored) Info(result.Message); else Error(result.Message);
+                }
+            },
+            onSettled: RefreshAfterOperation,
+            timeout: TimeSpan.FromMinutes(15));
+    }
+
+    /// <summary>Re-derive the active document and re-evaluate the ribbon after
+    ///  any P4C operation (success OR failure). The manifest may have changed -
+    ///  a released checkout marker, an Unverified downgrade - and
+    ///  <see cref="RefreshEnablement"/> revalidates the remembered Undo target.</summary>
+    private void RefreshAfterOperation()
+    {
+        try { _documents.RefreshFromActiveDocument(); } catch { /* COM teardown */ }
+        RefreshEnablement();
+    }
+
+    /// <summary>
+    /// The file Undo should act on: the active document if it is a managed file
+    /// this session holds checked out; otherwise the most-recently-active
+    /// remembered checkout target (so close-then-undo works). Never a filename
+    /// guess - both come from an exact verified manifest binding, and the
+    /// orchestrator re-checks identity + server state before acting.
+    /// </summary>
+    private (ManagedFileRef? File, string Label) ResolveUndoTarget()
+    {
+        var doc = _tracker.Current;
+        if (doc.CheckoutState == LocalCheckoutState.CheckedOutByMe
+            && doc.PlmIdentity is { } id
+            && !string.IsNullOrEmpty(doc.FullPath) && !string.IsNullOrEmpty(doc.WorkspaceRoot))
+        {
+            return (ManagedFileRef.Create(doc.WorkspaceRoot!, doc.FullPath!),
+                string.IsNullOrEmpty(id.DocumentNumber) ? id.CadDocumentId : id.DocumentNumber!);
+        }
+        if (_undoTarget.Current is { } target)
+        {
+            return (target.File, target.DocumentNumber);
+        }
+        // R10 MA-7: the same single-checkout fallback the ribbon used to
+        // enable the command. The confirmation dialog and the orchestrator's
+        // manifest, open-document and server checks still follow.
+        if (RecoverUndoTargetFromWorkspace("resolve") is { } recovered)
+        {
+            return (recovered.File, recovered.DocumentNumber);
+        }
+        return (null, "");
+    }
+
+    // ---- P5A / P5B-A: read-only reference intelligence --------------
+
+    /// <summary>
+    /// Report the references Inventor knows about for the active document
+    /// (P5A). Purely observational: it reads
+    /// <c>ReferencedDocumentDescriptors</c> and the local workspace manifest,
+    /// and shows a text report. It never opens, activates, saves, or repairs
+    /// any document, and never touches the server.
+    /// </summary>
+    private void RunScanReferences()
+    {
+        if (!TryScanActiveDocument("Scan References", out var scan))
+        {
+            return;
+        }
+
+        var text = CadReferenceScanTextReport.Render(scan);
+        var status = scan.IsComplete ? "COMPLETE" : "PARTIAL";
+        using var dialog = new ScanResultDialog(
+            $"{ArchAddInInfo.DisplayName} - Scan References ({status})", text);
+        dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+    }
+
+    /// <summary>
+    /// Diagnose every observed reference of the active document across two
+    /// read-only dimensions:
+    ///
+    ///  - P5B-A LOCAL health: resolved / missing, inside / outside the
+    ///    workspace, managed / unmanaged (exact manifest match only);
+    ///  - P5B-B AUTHORITATIVE version status: CURRENT / STALE / UNKNOWN VERSION,
+    ///    established ONLY by comparing the exact stable cadDocumentId + the
+    ///    pinned local fileVersionId against the authenticated authoritative
+    ///    Arch PLM server. Any unsafe / unavailable case fails closed to
+    ///    UNKNOWN VERSION - CURRENT is never guessed.
+    ///
+    /// Read-only throughout: no document is opened, saved or repaired, no CAD
+    /// reference is changed, nothing is checked out or checked in.
+    /// </summary>
+    private void RunReferenceHealth()
+    {
+        if (!TryScanActiveDocument("Reference Health", out var scan))
+        {
+            return;
+        }
+
+        var local = ReferenceHealthDiagnoser.Diagnose(scan);
+
+        // The distinct stable ids of every exactly-managed reference edge - the
+        // ONLY edges an authoritative version check applies to.
+        var managedIds = local.Entries
+            .Where(e => e.Management == ReferenceManagement.Managed
+                && e.ManagedIdentity is { CadDocumentId.Length: > 0 })
+            .Select(e => e.ManagedIdentity!.CadDocumentId)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (managedIds.Length == 0)
+        {
+            ShowReferenceVersionReport(ReferenceVersionReport.Build(
+                local, LatestVersionLookup.WholeFailure(LatestVersionOutcome.NotAttempted)));
+            return;
+        }
+
+        // P6 M4.1: the managed ids come from the document's workspace (or the
+        // last Get Latest workspace) - never ask a different server about them.
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(_tracker.Current.FullPath), "Reference Health")) return;
+
+        LatestVersionLookup? lookup = null;
+        RunBackground(
+            async ct => lookup = await _connection.GetLatestVersionsAsync(managedIds, ct),
+            "Checking versions",
+            onDone: () => ShowReferenceVersionReport(ReferenceVersionReport.Build(
+                local, lookup ?? LatestVersionLookup.WholeFailure(LatestVersionOutcome.ServerUnavailable))),
+            timeout: TimeSpan.FromMinutes(2));
+    }
+
+    private void ShowReferenceVersionReport(ReferenceVersionReport report)
+    {
+        var text = ReferenceVersionTextReport.Render(report);
+        using var dialog = new ScanResultDialog(
+            $"{ArchAddInInfo.DisplayName} - Reference Health ({report.OverallStatusLabel})", text);
+        dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+    }
+
+    // ---- P6A: Copy Design plan + preview (READ-ONLY, zero mutation) -----
+
+    /// <summary>
+    /// Builds a P6A Copy Design plan for the active document and shows it as a
+    /// read-only preview. This command NEVER copies, renames, saves, replaces
+    /// a reference, checks anything out/in, or creates a FileVersion / CAD
+    /// document - it only reuses the EXISTING P5A scanner (COM read-only) and
+    /// hands the result to the COM-free <see cref="CopyDesignPlanner"/>. There
+    /// is no "Execute Copy Design" command in P6A.
+    /// </summary>
+    private void RunCopyDesignPreview()
+    {
+        if (!TryScanActiveDocument("Copy Design Preview", out var scan))
+        {
+            return;
+        }
+
+        // P6 M4.1: the source must come from a workspace of the CONNECTED
+        // server - checked before the dialog and before any server lookup.
+        if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(_tracker.Current.FullPath), "Copy Design Preview")) return;
+
+        using var input = new CopyDesignPreviewDialog();
+        if (input.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+
+        IDestinationNameRule nameRule;
+        try
+        {
+            nameRule = new TokenReplaceNameRule(input.SourceToken, input.DestinationToken);
+        }
+        catch (ArgumentException ex)
+        {
+            Error($"Copy Design Preview could not build a naming rule: {ex.Message}");
+            return;
+        }
+
+        // P6D DRAWING ASSOCIATION AUTHORITY: fetch the REAL server authority
+        // (DRAWING_REFERENCE rows) for every candidate model BEFORE planning -
+        // CopyDesignPlanner's IDrawingAssociationSource is synchronous, so the
+        // one network round trip must happen here, not inside Plan(). Never
+        // guesses from a scanner-discovered drawing node or a file name; a
+        // network/auth/contract failure fails every candidate closed to
+        // NotAvailable, exactly like the previous NoDrawingAssociationSource
+        // stub - this only REPLACES "always unavailable" with "actually
+        // asked, and unavailable only when the ask itself failed."
+        var candidateIds = CopyDesignDrawingAssociationCandidates.From(scan);
+        var destinationFolder = input.DestinationFolder;
+
+        if (candidateIds.Count == 0)
+        {
+            ContinueCopyDesignPreview(scan, nameRule, destinationFolder,
+                new PrefetchedDrawingAssociationSource(new Dictionary<string, DrawingAssociationResult>()));
+            return;
+        }
+
+        var localManifest = WorkspaceRootLocator.FindRootForFile(_tracker.Current.FullPath) is { } localRoot
+            ? WorkspaceManifest.LoadOrEmpty(localRoot)
+            : null;
+
+        IReadOnlyDictionary<string, DrawingAssociationResult>? associations = null;
+        RunBackground(
+            async ct => associations = await _connection.GetDrawingAssociationsAsync(candidateIds, localManifest, ct),
+            "Checking drawing associations",
+            onDone: () => ContinueCopyDesignPreview(scan, nameRule, destinationFolder,
+                new PrefetchedDrawingAssociationSource(
+                    associations ?? new Dictionary<string, DrawingAssociationResult>())),
+            timeout: TimeSpan.FromSeconds(60));
+    }
+
+    private void ContinueCopyDesignPreview(
+        CadReferenceScan scan,
+        IDestinationNameRule nameRule,
+        string destinationFolder,
+        IDrawingAssociationSource drawingSource)
+    {
+        // The ONLY filesystem read this command performs: a best-effort,
+        // read-only existence check of each proposed destination, scoped to
+        // the destination folder the engineer just chose. Never a write.
+        var plan = CopyDesignPlanner.Plan(
+            scan,
+            nameRule,
+            destinationFolder,
+            drawingSource: drawingSource,
+            destinationExists: SafeFileExists);
+
+        // Round 6: give the engineer the ONLY supported way to resolve a
+        // NeedsDecision node whose sole blocker is an unavailable library/
+        // shared classification signal - never applied automatically, never
+        // pre-selected (see CopyDesignDecisionsDialog). Every OTHER
+        // NeedsDecision reason (unresolved, unmanaged, unverified, a
+        // conflict, an unsafe drawing association, an unsafe destination)
+        // has no eligible node here and stays exactly as before: shown in
+        // the read-only report, with no apply surface.
+        IReadOnlyDictionary<string, CopyDesignAction>? appliedDecisions = null;
+        if (!plan.IsExecutable)
+        {
+            var eligible = plan.Nodes.Where(CopyDesignExplicitDecisionEligibility.IsEligibleForExplicitDecision).ToArray();
+            if (eligible.Length > 0)
+            {
+                using var decisions = new CopyDesignDecisionsDialog(eligible);
+                if (decisions.ShowDialog(new Win32Owner(SafeMainHwnd())) == DialogResult.OK)
+                {
+                    appliedDecisions = decisions.Decisions.AsDictionary();
+                    plan = CopyDesignPlanner.Plan(
+                        scan,
+                        nameRule,
+                        destinationFolder,
+                        drawingSource: drawingSource,
+                        destinationExists: SafeFileExists,
+                        explicitDecisions: appliedDecisions);
+                }
+            }
+        }
+
+        // Round 8: if the ONLY remaining blocker is drawing-association
+        // completeness (drawings cannot be proven), offer the EXPLICIT
+        // "model files only" acknowledgement. Probing with
+        // acknowledgeModelFilesOnly is safe - CopyDesignPlanner.Plan is pure
+        // and performs no mutation - and since it waives ONLY that one
+        // blocker (see CopyDesignPlanner's own doc comment), a probe plan
+        // that becomes executable PROVES completeness was the sole
+        // remaining problem; any OTHER unresolved problem (NeedsDecision, a
+        // collision, an unsafe edge, a missing identity) leaves the probe
+        // non-executable too, and no acknowledgement is offered at all.
+        if (!plan.IsExecutable)
+        {
+            var probe = CopyDesignPlanner.Plan(
+                scan,
+                nameRule,
+                destinationFolder,
+                drawingSource: drawingSource,
+                destinationExists: SafeFileExists,
+                explicitDecisions: appliedDecisions,
+                acknowledgeModelFilesOnly: true);
+            if (probe.IsExecutable)
+            {
+                using var modelOnly = new CopyDesignModelFilesOnlyDialog();
+                if (modelOnly.ShowDialog(new Win32Owner(SafeMainHwnd())) == DialogResult.OK)
+                {
+                    plan = probe;
+                }
+            }
+        }
+
+        var text = CopyDesignPlanTextReport.Render(plan);
+        var status = plan.IsExecutable ? "PREVIEW" : "PREVIEW - NOT EXECUTABLE";
+        using (var dialog = new ScanResultDialog($"{ArchAddInInfo.DisplayName} - Copy Design Preview ({status})", text))
+        {
+            dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+        }
+
+        // P6C: no apply surface at all for a non-executable plan - the
+        // engineer must fix the plan (rename tokens, resolve NeedsDecision,
+        // etc.) and preview again.
+        if (!plan.IsExecutable)
+        {
+            return;
+        }
+
+        RunCopyDesignApply(plan);
+    }
+
+    /// <summary>
+    /// P6C: the MANDATORY explicit confirmation + apply step, reachable ONLY
+    /// from an EXECUTABLE preview (see the caller). Never invoked
+    /// automatically. A fresh idempotency key is minted for THIS confirmed
+    /// attempt (never reused across a genuinely new confirmation) via
+    /// <see cref="Core.CopyDesign.Apply.CopyDesignApplyAttempt.StartNewAttempt"/>.
+    /// All orchestration (mapping, revalidation, reservation, response
+    /// validation, execution order, journal/cleanup, verification,
+    /// materialization) is <see cref="Core.CopyDesign.Apply.CopyDesignApplyOrchestrator"/>
+    /// - this method only wires the REAL Inventor/HTTP adapters to it and
+    /// shows the result. Ends at READY FOR MANUAL INVENTOR TEST (or a clear
+    /// failure/cleanup report) - it never auto-accepts or releases anything.
+    /// </summary>
+    private void RunCopyDesignApply(CopyDesignPlan plan)
+    {
+        // P6 Milestone 2: the confirmation is built from the SAME mapping the
+        // orchestrator executes; its fingerprint is passed through below so a
+        // plan that changed after confirmation can never run.
+        var confirmation = Core.CopyDesign.Apply.CopyDesignApplyConfirmationBuilder.Build(plan, destinationExists: SafeFileExists);
+        using var confirm = new CopyDesignApplyConfirmDialog(confirmation);
+        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK || !confirmation.CanApply)
+        {
+            return;
+        }
+
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before applying a Copy Design plan.");
+            return;
+        }
+
+        // A fresh, explicit confirmation ALWAYS mints a brand-new
+        // idempotency key - this is precisely what distinguishes an
+        // ordinary Apply from a RESUME/RECOVER (see RunCopyDesignResume /
+        // RunCopyDesignRecover below) and is never silently reinterpreted
+        // either way. P6D ROUND 3: a brand-new key also means a normal Apply
+        // can NEVER accidentally consume an outstanding
+        // _uncertainCopyDesignAttempt's key - that key is only ever reused by
+        // an explicit Recover.
+        var attempt = Core.CopyDesign.Apply.CopyDesignApplyAttempt.StartNewAttempt();
+        ExecuteCopyDesignAttempt(plan, attempt.IdempotencyKey, label: null, CopyDesignAttemptKind.Fresh,
+            confirmedFingerprint: confirmation.Fingerprint);
+    }
+
+    /// <summary>
+    /// P6D ROUND 2, HIGH fix (RESUME): the deliberate, explicit, controlled
+    /// retry of the LAST Apply Copy Design attempt. Two paths, chosen ONLY
+    /// by whether this session still remembers one in memory:
+    ///
+    ///   - <see cref="_resumableCopyDesignAttempt"/> present (the ORIGINAL,
+    ///     unchanged in-session path): reuses the EXACT SAME plan and
+    ///     idempotencyKey as the failed attempt (never a fresh key - see
+    ///     <see cref="Core.CopyDesign.Apply.CopyDesignApplyAttempt.Resume"/>).
+    ///
+    ///   - P6D PRODUCTION RECOVERY: no in-memory attempt (e.g. Inventor was
+    ///     restarted since the failure) - <see cref="RunDurableCopyDesignResume"/>
+    ///     offers a DURABLE resume by explicit operation id, reconstructing
+    ///     the SAME attempt from the server's own authoritative status (see
+    ///     <see cref="Core.CopyDesign.Apply.CopyDesignResumeAttemptReconstructor"/>'s
+    ///     own doc comment) rather than being lost with the session.
+    ///
+    /// Either way, the server's already-idempotent reservation resolves to
+    /// the SAME operation/entries/resultingCadDocumentIds, never a duplicate
+    /// CadDocument - see <see cref="Core.CopyDesign.Apply.CopyDesignApplyOrchestrator"/>'s
+    /// own class doc comment ("RESUME") for the full mechanism.
+    /// </summary>
+    private void RunCopyDesignResume()
+    {
+        if (_resumableCopyDesignAttempt is not { } resumable)
+        {
+            RunDurableCopyDesignResume();
+            return;
+        }
+
+        using var confirm = new CopyDesignResumeConfirmDialog(resumable.Plan, resumable.IdempotencyKey);
+        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before resuming a Copy Design attempt.");
+            return;
+        }
+
+        ExecuteCopyDesignAttempt(resumable.Plan, resumable.IdempotencyKey, resumable.Label, CopyDesignAttemptKind.Resume);
+    }
+
+    /// <summary>
+    /// P6D PRODUCTION RECOVERY: the DURABLE resume path - reachable ONLY
+    /// when this session has no in-memory <see cref="_resumableCopyDesignAttempt"/>.
+    /// Collects an EXPLICIT operation id + source workspace + destination
+    /// folder (never a silent scan of every operation, never a guess - see
+    /// <see cref="CopyDesignDurableResumeDialog"/>'s own doc comment), then
+    /// queries the server's authoritative status for EXACTLY that operation
+    /// id and hands it to <see cref="Core.CopyDesign.Apply.CopyDesignResumeAttemptReconstructor"/>.
+    /// Fails closed (a plain, honest message - never a guess, never a
+    /// partial reconstruction) at any point the server status, the source
+    /// workspace, or the drawing-dependency authority cannot fully prove the
+    /// attempt is safe to continue.
+    /// </summary>
+    private void RunDurableCopyDesignResume()
+    {
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before resuming a Copy Design attempt.");
+            return;
+        }
+
+        using var input = new CopyDesignDurableResumeDialog();
+        if (input.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+
+        // Load the SOURCE workspace manifest up front - local, synchronous,
+        // read-only I/O - so an obviously wrong folder fails fast, before
+        // any network call at all.
+        WorkspaceManifest sourceManifest;
+        try
+        {
+            sourceManifest = WorkspaceManifest.LoadOrEmpty(input.SourceWorkspaceRoot);
+        }
+        catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException)
+        {
+            Error($"Could not read the source workspace folder: {ex.Message}");
+            return;
+        }
+        if (sourceManifest.Entries.Count == 0)
+        {
+            Error("The source workspace folder has no recognized managed workspace manifest "
+                + "(.arch\\workspace.json) - choose the folder Get Latest originally materialized these "
+                + "documents into.");
+            return;
+        }
+        if (!EnsureWorkspaceServer(input.SourceWorkspaceRoot, "Resume Copy Design",
+                rememberSettingsWhenAllowed: () => (ConnectSettings.Load() with { LastCopyDesignDestinationFolder = input.DestinationFolder }).Save())) return;
+
+        var operationId = input.OperationId;
+        var destinationFolder = input.DestinationFolder;
+
+        Core.CopyDesign.Apply.CopyDesignDurableResumeStatusResult? status = null;
+        RunBackground(
+            async ct => status = await _connection.GetDurableCopyDesignOperationStatusAsync(operationId, ct),
+            "Looking up Copy Design operation",
+            onDone: () => ContinueDurableCopyDesignResume(status, sourceManifest, destinationFolder),
+            timeout: TimeSpan.FromSeconds(60));
+    }
+
+    /// <summary>Second step of the durable resume: the operation's
+    ///  authoritative status is now known - fetch the AUTHORITATIVE drawing
+    ///  dependency mapping (the SAME drawing-association authority the P6D
+    ///  live-blocker fix already uses) for whichever model entries this
+    ///  operation actually reserved, so a pending drawing entry's rewiring
+    ///  target is never guessed from a file name.</summary>
+    private void ContinueDurableCopyDesignResume(
+        Core.CopyDesign.Apply.CopyDesignDurableResumeStatusResult? status,
+        WorkspaceManifest sourceManifest,
+        string destinationFolder)
+    {
+        if (status is null || !status.Success)
+        {
+            Error("Could not obtain the authoritative status of this Copy Design operation "
+                + $"({status?.Outcome.ToString() ?? "unknown"}) - nothing was resumed. Confirm the operation id and "
+                + "try again.");
+            return;
+        }
+
+        var modelSourceIds = (status.Entries ?? Array.Empty<Core.CopyDesign.Apply.CopyDesignDurableResumeEntry>())
+            .Where(e => e.Action == "COPY" && e.SourceCadDocumentId is not null && e.OriginalDocumentType is "IAM" or "IPT")
+            .Select(e => e.SourceCadDocumentId!)
+            .Distinct()
+            .ToArray();
+
+        IReadOnlyDictionary<string, Core.CopyDesign.DrawingAssociationResult>? associations = null;
+        RunBackground(
+            async ct => associations = modelSourceIds.Length == 0
+                ? new Dictionary<string, Core.CopyDesign.DrawingAssociationResult>()
+                : await _connection.GetDrawingAssociationsAsync(modelSourceIds, sourceManifest, ct),
+            "Checking drawing associations",
+            onDone: () => FinishDurableCopyDesignResume(status, sourceManifest, destinationFolder, associations),
+            timeout: TimeSpan.FromSeconds(60));
+    }
+
+    /// <summary>Final step: reconstruct the exact original attempt (fails
+    ///  closed with an honest reason on anything unsafe/ambiguous) and, on
+    ///  success, run it through the EXACT SAME confirmation + execution path
+    ///  as an in-session resume - never a separate, less-safe path.</summary>
+    private void FinishDurableCopyDesignResume(
+        Core.CopyDesign.Apply.CopyDesignDurableResumeStatusResult status,
+        WorkspaceManifest sourceManifest,
+        string destinationFolder,
+        IReadOnlyDictionary<string, Core.CopyDesign.DrawingAssociationResult>? associations)
+    {
+        var operationModelSourceIds = new HashSet<string>(
+            (status.Entries ?? Array.Empty<Core.CopyDesign.Apply.CopyDesignDurableResumeEntry>())
+                .Where(e => e.Action == "COPY" && e.SourceCadDocumentId is not null && e.OriginalDocumentType is "IAM" or "IPT")
+                .Select(e => e.SourceCadDocumentId!));
+
+        // Invert "model -> its drawings" (what the authority answers) into
+        // "drawing -> the models (from THIS operation only) it depends on" -
+        // what the reconstructor needs. A drawing/model pair the authority
+        // names that is NOT part of this operation is silently excluded
+        // here (never trusted) - the reconstructor itself still fails
+        // closed if a PENDING drawing ends up with no confirmed dependency.
+        var dependencies = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        if (associations is not null)
+        {
+            foreach (var (modelSourceId, result) in associations)
+            {
+                if (result.Outcome != Core.CopyDesign.DrawingAssociationOutcome.Found
+                    || !operationModelSourceIds.Contains(modelSourceId))
+                {
+                    continue;
+                }
+                foreach (var drawing in result.Drawings)
+                {
+                    if (drawing.CadDocumentId is null)
+                    {
+                        continue;
+                    }
+                    if (!dependencies.TryGetValue(drawing.CadDocumentId, out var set))
+                    {
+                        set = new HashSet<string>(StringComparer.Ordinal);
+                        dependencies[drawing.CadDocumentId] = set;
+                    }
+                    set.Add(modelSourceId);
+                }
+            }
+        }
+
+        var reconstruction = Core.CopyDesign.Apply.CopyDesignResumeAttemptReconstructor.Reconstruct(
+            status, sourceManifest, destinationFolder,
+            dependencies.ToDictionary(kv => kv.Key, kv => (IReadOnlySet<string>)kv.Value, StringComparer.Ordinal));
+        if (!reconstruction.Success)
+        {
+            Error($"Could not safely reconstruct this Copy Design attempt: {reconstruction.FailureReason}");
+            return;
+        }
+
+        // P6D DURABLE RESUME LIVE BLOCKER fix: an EARLY, clear, itemized
+        // check for the single most common way a durable resume fails -
+        // the destination folder the user just typed does not actually
+        // hold the file(s) the server already reports MATERIALIZED. Left
+        // to the real orchestrator alone, this surfaces later as a single,
+        // terse UnexpectedMaterializationState reason for only the FIRST
+        // such entry, inside a result dialog whose text box does not wrap
+        // long lines - easy to misread as truncated. This check changes
+        // NOTHING about what is allowed to proceed: it is purely additive,
+        // read-only, and the orchestrator's own authoritative destination +
+        // hash/size re-verification (immediately before any mutation) still
+        // runs completely unchanged right after this.
+        var missingMaterialized = Core.CopyDesign.Apply.CopyDesignResumeAttemptReconstructor.FindMissingMaterializedDestinations(
+            status, destinationFolder, File.Exists);
+        if (missingMaterialized.Count > 0)
+        {
+            var list = string.Join(Environment.NewLine, missingMaterialized.Select(m => $"  - {m.OriginalFileName}"
+                + Environment.NewLine + $"      expected at: {m.ExpectedPath}"));
+            Error("The server already reports the following file(s) as materialized by this Copy Design operation, "
+                + $"but they were not found in the destination folder you entered (\"{destinationFolder}\"):"
+                + Environment.NewLine + Environment.NewLine + list
+                + Environment.NewLine + Environment.NewLine
+                + "This almost always means the destination folder does not match the one the original attempt "
+                + "copied into. Re-enter the exact original destination folder and try again - nothing was changed.");
+            return;
+        }
+
+        using var confirm = new CopyDesignResumeConfirmDialog(reconstruction.Plan!, reconstruction.IdempotencyKey!);
+        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before resuming a Copy Design attempt.");
+            return;
+        }
+
+        ExecuteCopyDesignAttempt(reconstruction.Plan!, reconstruction.IdempotencyKey!, label: null, CopyDesignAttemptKind.Resume);
+    }
+
+    // ---- P6E-D: Verify Copy Design (independent, read-only) -------------
+
+    /// <summary>
+    /// P6E-D: "Verify Copy Design" - an INDEPENDENT, READ-ONLY re-verification
+    /// of an EXISTING Copy Design operation, by operationId. No copy, no
+    /// rewire, no save, no materialize, no repair, no reservation, no
+    /// release/lifecycle action - this method (and its two continuations)
+    /// never constructs or calls <c>InventorCopyDesignPhysicalCopier</c>,
+    /// <c>InventorCopyDesignReferenceRewirer</c>,
+    /// <c>InventorCopyDesignDrawingReferenceRewirer</c>, any Copy Design
+    /// materialization client, or any Apply/Resume/Recover/lifecycle method.
+    ///
+    /// Staged flow, mirroring <see cref="RunDurableCopyDesignResume"/>'s own
+    /// proven 3-step shape (dialog -> verification-support lookup -> drawing
+    /// association authority -> build + verify):
+    ///   1. Validate dialog input (the dialog itself already fails closed on
+    ///      a blank id or a folder that does not exist).
+    ///   2. Load the source workspace manifest (local, synchronous, read-only).
+    ///   3. Fetch the P6E-A/P6E-C verification-support data for operationId.
+    ///   4. Fetch drawing associations via the EXISTING P6D authority.
+    ///   5. Build the P6E-B verification topology.
+    ///   6. If it cannot be safely built: show an INCOMPLETE result - zero
+    ///      COM verification (the orchestrator/verifiers are never even
+    ///      constructed on this path).
+    ///   7. Otherwise construct the UNMODIFIED <c>InventorCopyDesignVerifier</c>/
+    ///      <c>InventorCopyDesignDrawingVerifier</c> and run
+    ///      <see cref="Core.CopyDesign.Apply.CopyDesignVerificationOrchestrator.VerifyAsync"/>.
+    ///   8/9. Aggregate + display the report.
+    /// </summary>
+    private void RunCopyDesignVerify()
+    {
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before verifying a Copy Design operation.");
+            return;
+        }
+
+        using var input = new CopyDesignVerifyDialog();
+        if (input.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+
+        // Load the SOURCE workspace manifest up front - local, synchronous,
+        // read-only I/O - so an obviously wrong folder fails fast, before any
+        // network call at all. The dialog already proved the folder exists;
+        // this proves it holds a recognized managed workspace.
+        WorkspaceManifest sourceManifest;
+        try
+        {
+            sourceManifest = WorkspaceManifest.LoadOrEmpty(input.SourceWorkspaceRoot);
+        }
+        catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException)
+        {
+            Error($"Could not read the source workspace folder: {ex.Message}");
+            return;
+        }
+        if (sourceManifest.Entries.Count == 0)
+        {
+            Error("The source workspace folder has no recognized managed workspace manifest "
+                + "(.arch\\workspace.json) - choose the folder Get Latest originally materialized these "
+                + "documents into.");
+            return;
+        }
+        if (!EnsureWorkspaceServer(input.SourceWorkspaceRoot, "Verify Copy Design",
+                rememberSettingsWhenAllowed: () => (ConnectSettings.Load() with { LastWorkspaceRoot = input.SourceWorkspaceRoot, LastCopyDesignDestinationFolder = input.DestinationFolder }).Save())) return;
+
+        var operationId = input.OperationId;
+        var destinationFolder = input.DestinationFolder;
+
+        Core.CopyDesign.Apply.CopyDesignVerificationSupportResult? support = null;
+        RunBackground(
+            async ct => support = await _connection.GetCopyDesignVerificationSupportAsync(operationId, ct),
+            "Looking up Copy Design operation",
+            onDone: () => ContinueCopyDesignVerify(support, sourceManifest, destinationFolder),
+            timeout: TimeSpan.FromSeconds(60));
+    }
+
+    /// <summary>Second step: the operation's authoritative verification-
+    ///  support data is now known - fetch the AUTHORITATIVE drawing
+    ///  dependency mapping (the SAME drawing-association authority the P6D
+    ///  live-blocker fix already uses - no second HTTP client) for whichever
+    ///  model entries this operation actually reserved, so a drawing's
+    ///  expected reference set is never guessed from a file name.</summary>
+    private void ContinueCopyDesignVerify(
+        Core.CopyDesign.Apply.CopyDesignVerificationSupportResult? support,
+        WorkspaceManifest sourceManifest,
+        string destinationFolder)
+    {
+        if (support is null || !support.Success)
+        {
+            Error("Could not obtain the authoritative verification-support data for this Copy Design operation "
+                + $"({support?.Outcome.ToString() ?? "unknown"}) - nothing was verified. Confirm the operation id and "
+                + "try again.");
+            return;
+        }
+
+        var modelSourceIds = (support.Entries ?? Array.Empty<Core.CopyDesign.Apply.CopyDesignDurableResumeEntry>())
+            .Where(e => e.Action == "COPY" && e.SourceCadDocumentId is not null && e.OriginalDocumentType is "IAM" or "IPT")
+            .Select(e => e.SourceCadDocumentId!)
+            .Distinct()
+            .ToArray();
+
+        IReadOnlyDictionary<string, Core.CopyDesign.DrawingAssociationResult>? associations = null;
+        RunBackground(
+            async ct => associations = modelSourceIds.Length == 0
+                ? new Dictionary<string, Core.CopyDesign.DrawingAssociationResult>()
+                : await _connection.GetDrawingAssociationsAsync(modelSourceIds, sourceManifest, ct),
+            "Checking drawing associations",
+            onDone: () => FinishCopyDesignVerify(support, sourceManifest, destinationFolder, associations),
+            timeout: TimeSpan.FromSeconds(60));
+    }
+
+    /// <summary>Final step: build the expected P6E-B verification topology
+    ///  from durable data - if that structurally fails, show INCOMPLETE with
+    ///  ZERO COM verification (the verifiers below are never constructed on
+    ///  this path); otherwise construct the UNMODIFIED, read-only Inventor
+    ///  verifiers and run the real independent re-verification.</summary>
+    private void FinishCopyDesignVerify(
+        Core.CopyDesign.Apply.CopyDesignVerificationSupportResult support,
+        WorkspaceManifest sourceManifest,
+        string destinationFolder,
+        IReadOnlyDictionary<string, Core.CopyDesign.DrawingAssociationResult>? associations)
+    {
+        var operationModelSourceIds = new HashSet<string>(
+            (support.Entries ?? Array.Empty<Core.CopyDesign.Apply.CopyDesignDurableResumeEntry>())
+                .Where(e => e.Action == "COPY" && e.SourceCadDocumentId is not null && e.OriginalDocumentType is "IAM" or "IPT")
+                .Select(e => e.SourceCadDocumentId!));
+
+        // Invert "model -> its drawings" (what the authority answers) into
+        // "drawing's own source identity -> the models (from THIS operation
+        // only) it depends on" - what CopyDesignVerificationTopologyBuilder
+        // needs. Preserves the authority distinction: a model the authority
+        // never answered for (or answered NotAvailable/Unrecognized) simply
+        // never contributes a key here - MISSING is never treated as
+        // "authoritatively zero" (see CopyDesignVerificationTopologyBuilder.Build's
+        // own "empty vs unknown" doc comment) - it surfaces downstream as a
+        // Required NotProvable check -> INCOMPLETE for that drawing entry,
+        // never inferred from a filename.
+        var dependencies = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        if (associations is not null)
+        {
+            foreach (var (modelSourceId, associationResult) in associations)
+            {
+                if (associationResult.Outcome != Core.CopyDesign.DrawingAssociationOutcome.Found
+                    || !operationModelSourceIds.Contains(modelSourceId))
+                {
+                    continue;
+                }
+                foreach (var drawing in associationResult.Drawings)
+                {
+                    if (drawing.CadDocumentId is null)
+                    {
+                        continue;
+                    }
+                    if (!dependencies.TryGetValue(drawing.CadDocumentId, out var set))
+                    {
+                        set = new HashSet<string>(StringComparer.Ordinal);
+                        dependencies[drawing.CadDocumentId] = set;
+                    }
+                    set.Add(modelSourceId);
+                }
+            }
+        }
+        var modelSourceIdsByDrawingSourceId = dependencies.ToDictionary(
+            kv => kv.Key, kv => (IReadOnlySet<string>)kv.Value, StringComparer.Ordinal);
+
+        // Step 5/6: build the topology FIRST, as its own explicit step - ONLY
+        // to guarantee zero COM CONSTRUCTION (neither Inventor verifier nor
+        // the orchestrator is ever instantiated on this path) when it cannot
+        // be safely built - never to reinterpret the outcome. The result
+        // itself is built through the SAME shared Core factory
+        // (CopyDesignOperationVerificationResult.StructuralFailure) the
+        // orchestrator's own internal fallback uses, so the semantic
+        // (INCOMPLETE - "verification cannot legitimately conclude", never
+        // "proven wrong") comes from Core alone, never a separately invented
+        // UI-only interpretation.
+        var topology = Core.CopyDesign.Apply.CopyDesignVerificationTopologyBuilder.Build(
+            support, sourceManifest, destinationFolder, modelSourceIdsByDrawingSourceId);
+        if (!topology.Success)
+        {
+            var incompleteResult = Core.CopyDesign.Apply.CopyDesignOperationVerificationResult.StructuralFailure(
+                topology.FailureReason!, support.OperationId);
+            var incompleteText = Core.CopyDesign.Apply.CopyDesignVerificationResultTextReport.Render(incompleteResult);
+            var incompleteTitle = $"{ArchAddInInfo.DisplayName} - Verify Copy Design ({incompleteResult.Outcome})";
+            using var incompleteDialog = new CopyDesignVerificationResultDialog(incompleteTitle, incompleteText);
+            incompleteDialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+            return;
+        }
+
+        // Step 7: the SAME UNMODIFIED, read-only Inventor verifiers P6D's own
+        // mutating apply orchestrator already uses for its own verification
+        // step (see ExecuteCopyDesignAttempt) - GatherFactsAsync is their
+        // ONLY public entry point; neither has a Save/SaveAs/ReplaceReference
+        // call anywhere in its body (each opens OpenVisible:false, under
+        // SilentOperation, and always closes with SkipSave:true in a
+        // finally). No mutation adapter (copier/rewirer/materializer/
+        // reservation client) is constructed anywhere in this flow.
+        var verifier = new Inventor.CopyDesign.InventorCopyDesignVerifier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher());
+        var drawingVerifier = new Inventor.CopyDesign.InventorCopyDesignDrawingVerifier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher());
+        var orchestrator = new Core.CopyDesign.Apply.CopyDesignVerificationOrchestrator(
+            verifier,
+            new Core.CopyDesign.Apply.CopyDesignFileHasher(),
+            localFileExists: File.Exists,
+            drawingVerifier: drawingVerifier);
+
+        Core.CopyDesign.Apply.CopyDesignOperationVerificationResult? result = null;
+        RunBackground(
+            async ct => result = await orchestrator.VerifyAsync(support, sourceManifest, destinationFolder, modelSourceIdsByDrawingSourceId, ct),
+            "Verifying Copy Design",
+            onDone: () =>
+            {
+                if (result is null)
+                {
+                    return;
+                }
+                var text = Core.CopyDesign.Apply.CopyDesignVerificationResultTextReport.Render(result);
+                var title = $"{ArchAddInInfo.DisplayName} - Verify Copy Design ({result.Outcome})";
+                using var dialog = new CopyDesignVerificationResultDialog(title, text);
+                dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+            },
+            // Verification opens/hashes every COPY/REUSE entry's document in
+            // turn (potentially many, each a real Inventor open) - a longer
+            // bound than the metadata-only lookups above, but still a fixed
+            // timeout, exactly like ExecuteCopyDesignAttempt's own bound for
+            // the mutating path. A timeout here reports plainly via
+            // RunBackground's existing OperationCanceledException handling -
+            // never a fabricated VERIFIED/FAILED/INCOMPLETE outcome.
+            timeout: TimeSpan.FromMinutes(15));
+    }
+
+    /// <summary>
+    /// P6D ROUND 3, item F: the deliberate, explicit, controlled RETRY of the
+    /// LAST Apply Copy Design attempt whose reservation call itself never
+    /// returned a trustworthy answer (<see cref="_uncertainCopyDesignAttempt"/>) -
+    /// reachable ONLY via its own dedicated ribbon command, NEVER offered or
+    /// triggered automatically. Replays the EXACT SAME plan and
+    /// idempotencyKey (never a fresh key - the idempotency key alone is the
+    /// recovery handle even though no operationId was ever confirmed): if the
+    /// server had already committed the reservation, the SAME operation is
+    /// returned; if not, it is safely created now. A normal Apply never
+    /// consumes this key (it always mints its own), so recovering never
+    /// collides with unrelated work.
+    /// </summary>
+    private void RunCopyDesignRecover()
+    {
+        if (_uncertainCopyDesignAttempt is not { } uncertain)
+        {
+            Info("There is no Copy Design attempt to recover in this session. Recover is only offered after an "
+                + "Apply Copy Design attempt's reservation call itself failed without a confirmed answer from the "
+                + "server (the outcome is genuinely unknown).");
+            return;
+        }
+
+        using var confirm = new CopyDesignRecoverConfirmDialog(uncertain.Plan, uncertain.IdempotencyKey);
+        if (confirm.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (_connection.State != ConnectionState.Connected)
+        {
+            Error("Sign in to Arch PLM before recovering a Copy Design attempt.");
+            return;
+        }
+
+        ExecuteCopyDesignAttempt(uncertain.Plan, uncertain.IdempotencyKey, uncertain.Label, CopyDesignAttemptKind.Recover);
+    }
+
+    /// <summary>Distinguishes the THREE ways <see cref="ExecuteCopyDesignAttempt"/>
+    ///  can be entered - purely for status text / dialog titles and for
+    ///  choosing which of <see cref="_resumableCopyDesignAttempt"/> /
+    ///  <see cref="_uncertainCopyDesignAttempt"/> the triggering command read
+    ///  from; the orchestration itself is IDENTICAL for all three (same
+    ///  idempotency-key-based safety).</summary>
+    private enum CopyDesignAttemptKind { Fresh, Resume, Recover }
+
+    /// <summary>Shared orchestration for a fresh Apply, an explicit Resume,
+    ///  and an explicit Recover - the ONLY difference between them is which
+    ///  <paramref name="idempotencyKey"/> is supplied (fresh vs. reused) and
+    ///  which confirmation dialog the caller already showed. Wires the REAL
+    ///  Inventor/HTTP adapters (including, since P6D ROUND 2/3, the
+    ///  operation-status client that makes RESUME/RECOVER safe for EVERY
+    ///  call - a fresh attempt's reservation has nothing materialized yet, so
+    ///  a well-formed status response naturally finds nothing to skip) and
+    ///  shows the result. Ends at READY FOR MANUAL INVENTOR TEST (or a clear
+    ///  failure/cleanup report) - it never auto-accepts or releases
+    ///  anything.</summary>
+    private void ExecuteCopyDesignAttempt(
+        CopyDesignPlan plan, string idempotencyKey, string? label, CopyDesignAttemptKind kind, string? confirmedFingerprint = null)
+    {
+        // P6 M4.1: re-checked at EXECUTION time for Apply, Resume and Recover
+        // alike - the connection may have changed since Preview / since the
+        // attempt was remembered. A Resume/Recover against a DIFFERENT server
+        // would send the same idempotency key to a database that has never
+        // seen it and create a second, unrelated reservation.
+        var commandName = kind switch
+        {
+            CopyDesignAttemptKind.Resume => "Resume Copy Design",
+            CopyDesignAttemptKind.Recover => "Recover Copy Design",
+            _ => "Apply Copy Design",
+        };
+
+        // P6 M4.1a SESSION BINDING: the EXACT session this attempt runs
+        // under, captured once. The workspace checks below are made against
+        // ITS server, and every reservation / status / materialization
+        // request of the attempt is addressed with it and refused (nothing
+        // sent) once it is no longer the current session - see
+        // ArchConnectionManager's session-bound overloads.
+        if (_connection.CurrentSession is not { } boundSession)
+        {
+            Core.Diagnostics.RefusalDiagnostics.Command(_diagnostics, commandName, Core.Diagnostics.RefusalDiagnostics.NotSignedIn);
+            Error($"{commandName} was not run. Sign in to the Arch PLM server this workspace belongs to first.");
+            return;
+        }
+        if (CopyDesignRunning)
+        {
+            Core.Diagnostics.RefusalDiagnostics.Command(_diagnostics, commandName, Core.Diagnostics.RefusalDiagnostics.AlreadyRunning);
+            Error($"{commandName} was not run. A Copy Design operation is already running.");
+            return;
+        }
+
+        var destinations = plan.Nodes
+            .Where(n => n.ProposedAction == CopyDesignAction.Copy && !string.IsNullOrWhiteSpace(n.ProposedDestinationAbsolutePath))
+            .Select(n => n.ProposedDestinationAbsolutePath!)
+            .ToArray();
+
+        // P6 M4.1: the source workspace and every workspace a destination lies
+        // in must belong to the BOUND session's server. P6 M4.4: run once
+        // here, once more before the locks and once while they are held.
+        bool OriginChecksPass()
+        {
+            if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession)) return false;
+            foreach (var destination in destinations)
+            {
+                // A destination is normally a plain folder; if it lies inside a
+                // workspace, that workspace must belong to the same server too.
+                if (WorkspaceRootLocator.FindRootForFile(destination) is { } destinationRoot
+                    && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (!OriginChecksPass()) return;
+
+        // P6 M4.4: this operation (machine-wide), every unmanaged destination
+        // folder (machine-wide), every destination workspace (exclusive) and
+        // every source workspace (shared) - for the whole attempt.
+        var lockRequest = Core.Workspace.Locking.WorkspaceLockRequest.ForCopyDesign(
+            commandName,
+            boundSession.Server.OriginString,
+            idempotencyKey,
+            plan.Nodes.Where(n => n.IsResolved && !string.IsNullOrWhiteSpace(n.SourceAbsolutePath)).Select(n => n.SourceAbsolutePath).ToArray(),
+            destinations);
+        if (AcquireCommandLock(lockRequest, OriginChecksPass) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
+        // P6 M4.2: one diagnostics log per attempt, started once every guard
+        // above has passed.
+        var log = Core.Diagnostics.CopyDesignDiagnostics.Start(
+            _diagnostics, kind.ToString(), plan, idempotencyKey, boundSession, confirmedFingerprint);
+        held.AttachDiagnostics(log);
+
+        var orchestrator = new Core.CopyDesign.Apply.CopyDesignApplyOrchestrator(
+            _copyDesignApplyGuard,
+            new ApplyCopyDesignReservationAdapter(_connection, boundSession),
+            new Inventor.CopyDesign.InventorCopyDesignPhysicalCopier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher()),
+            new Inventor.CopyDesign.InventorCopyDesignReferenceRewirer(_application),
+            new Inventor.CopyDesign.InventorCopyDesignVerifier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher()),
+            new MaterializeCopyDesignAdapter(_connection, boundSession),
+            new Core.CopyDesign.Apply.CopyDesignFileHasher(),
+            sourceExists: File.Exists,
+            destinationExists: File.Exists,
+            deleteFile: path => File.Delete(path),
+            // HIGH 2 fix: Core has no HTTP dependency, so the ONLY place
+            // that can classify a reservation-call exception as TRANSIENT
+            // (worth the orchestrator's bounded, same-key, same-request
+            // retry) versus a deterministic business/4xx rejection (never
+            // retried) is here, where the real ArchApiException is visible.
+            isTransientReservationFailure: ex => ex is ArchApiException apiEx && apiEx.IsServerUnavailable,
+            maxReservationAttempts: 3,
+            // P6D: the SAME InventorApi.Application drives the drawing
+            // adapters too - the physical copier above already handles
+            // IDW/DWG (see its own doc comment), so only reference rewiring
+            // and verification need drawing-specific adapters (a drawing has
+            // no ComponentOccurrence - see InventorCopyDesignDrawingReferenceRewirer's
+            // doc comment for the exact API used instead).
+            drawingRewirer: new Inventor.CopyDesign.InventorCopyDesignDrawingReferenceRewirer(_application),
+            drawingVerifier: new Inventor.CopyDesign.InventorCopyDesignDrawingVerifier(_application, new Core.CopyDesign.Apply.CopyDesignFileHasher()),
+            // P6D ROUND 3: always wired, for BOTH a fresh apply and an
+            // explicit resume - a fresh reservation's targets have nothing
+            // materialized yet, so a well-formed status response finds
+            // nothing to skip and behavior is unaffected; it is the ONLY
+            // thing that lets a LATER resume of THIS attempt skip already-
+            // completed work. UNLIKE round 2's probe, a failure to obtain
+            // this status now FAILS CLOSED (see
+            // Core.CopyDesign.Apply.CopyDesignApplyOrchestrator's step 6b) -
+            // so an ordinary fresh apply is only ever affected by this if the
+            // status call itself fails immediately after a successful
+            // reservation (a genuine transport/auth problem worth surfacing,
+            // not silently swallowed).
+            operationStatusClient: new CopyDesignOperationStatusAdapter(_connection, boundSession),
+            // P6 METADATA FIX: undoes the Part Number Inventor derives from
+            // the operation-owned temp name, on the FINAL promoted path only
+            // (see InventorCopyDesignMetadataNormalizer's doc comment).
+            metadataNormalizer: new Inventor.CopyDesign.InventorCopyDesignMetadataNormalizer(_application),
+            // P6 Milestone 3: OldVersions backup ownership tracking around
+            // every attempt-owned save (see CopyDesignBackupOwnershipEvaluator).
+            backupFileSystem: new Core.CopyDesign.Apply.CopyDesignBackupFileSystem(),
+            // P6 M4.2: phase boundaries into this attempt's diagnostics log.
+            progress: Core.Diagnostics.CopyDesignDiagnostics.Progress(log));
+
+        Core.CopyDesign.Apply.CopyDesignApplyOperationResult? result = null;
+
+        // P6 M4.1a CONNECTION LOCK: set BEFORE the work is queued (so no click
+        // can slip in between) and cleared in the work's own `finally` - for
+        // success, a refusal, an exception or a timeout alike. A failure to
+        // even queue the work clears it too.
+        Volatile.Write(ref _copyDesignRunning, 1);
+        RefreshEnablement();
+        try
+        {
+            RunCopyDesignAttemptInBackground();
+        }
+        catch
+        {
+            Volatile.Write(ref _copyDesignRunning, 0);
+            RefreshEnablement();
+            throw;
+        }
+
+        void RunCopyDesignAttemptInBackground() => RunLockedInBackground(
+            held,
+            async ct =>
+            {
+                try
+                {
+                    result = await orchestrator.ExecuteAsync(plan, idempotencyKey, label, ct, confirmedFingerprint);
+                    Core.Diagnostics.CopyDesignDiagnostics.RecordResult(log, result);
+                }
+                catch (Exception ex)
+                {
+                    log.Failed(ex);
+                    throw;
+                }
+                finally
+                {
+                    Volatile.Write(ref _copyDesignRunning, 0);
+                }
+            },
+            kind switch
+            {
+                CopyDesignAttemptKind.Resume => "Resuming Copy Design",
+                CopyDesignAttemptKind.Recover => "Recovering Copy Design",
+                _ => "Applying Copy Design",
+            },
+            onDone: () =>
+            {
+                if (result is null)
+                {
+                    return;
+                }
+
+                // P6D ROUND 3, item F: the SINGLE place BOTH recovery fields
+                // are ever written, so they stay mutually exclusive for the
+                // SAME attempt and are never left stale:
+                //   - a CONFIRMED reservation that did not fully materialize
+                //     -> resumable (operationId known, entry-level recovery);
+                //   - the reservation call itself never returned a
+                //     trustworthy answer -> uncertain (no operationId at
+                //     all, idempotency-key-only recovery);
+                //   - anything else (including full success, or a failure
+                //     BEFORE the reservation call was even attempted, which
+                //     has nothing to safely retry via replay) -> clears
+                //     whichever of the two applied to THIS attempt's prior
+                //     state, since a fresh outcome supersedes it.
+                if (result.ReservedButUnmaterialized)
+                {
+                    _resumableCopyDesignAttempt = (plan, idempotencyKey, label);
+                    _uncertainCopyDesignAttempt = null;
+                }
+                else if (result.Outcome == Core.CopyDesign.Apply.CopyDesignApplyOutcome.ReservationCallFailed)
+                {
+                    _uncertainCopyDesignAttempt = (plan, idempotencyKey, label);
+                    _resumableCopyDesignAttempt = null;
+                }
+                else
+                {
+                    _resumableCopyDesignAttempt = null;
+                    _uncertainCopyDesignAttempt = null;
+                }
+
+                var text = Core.CopyDesign.Apply.CopyDesignApplyResultTextReport.Render(result);
+                var verb = kind switch
+                {
+                    CopyDesignAttemptKind.Resume => "Resume Copy Design",
+                    CopyDesignAttemptKind.Recover => "Recover Copy Design",
+                    _ => "Apply Copy Design",
+                };
+                var title = $"{ArchAddInInfo.DisplayName} - {verb} ({result.Outcome})";
+                using var dialog = new ScanResultDialog(title, text);
+                dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+            },
+            // P6D fix: Resume/Recover enablement depends on
+            // _resumableCopyDesignAttempt / _uncertainCopyDesignAttempt,
+            // which onDone above just updated - without this, the ribbon
+            // keeps showing whatever it computed before this attempt ran
+            // (e.g. both disabled) until some UNRELATED event happens to
+            // trigger RefreshEnablement (a document change, a connection
+            // state change). onSettled runs in RunBackground's `finally`, so
+            // this refresh happens for every outcome - success, a thrown
+            // exception, or a timeout - never only the happy path.
+            onSettled: RefreshEnablement,
+            timeout: TimeSpan.FromMinutes(30));
+    }
+
+    /// <summary>Thin adapter: <see cref="ArchConnectionManager"/> already owns
+    ///  the current session/API factory - this just satisfies the Core-level
+    ///  seam without Core ever depending on the Api project's connection
+    ///  machinery. P6 M4.1a: every adapter is BOUND to the session the
+    ///  attempt started with - see <see cref="ExecuteCopyDesignAttempt"/>.</summary>
+    private sealed class ApplyCopyDesignReservationAdapter(ArchConnectionManager connection, IArchSession boundSession)
+        : Core.CopyDesign.Apply.ICopyDesignReservationClient
+    {
+        public Task<Core.CopyDesign.Apply.CopyDesignReservationResponse> ApplyAsync(
+            Core.CopyDesign.Apply.CopyDesignApplyRequest request, CancellationToken ct) =>
+            connection.ApplyCopyDesignAsync(request, boundSession, ct);
+    }
+
+    private sealed class MaterializeCopyDesignAdapter(ArchConnectionManager connection, IArchSession boundSession)
+        : Core.CopyDesign.Apply.ICopyDesignMaterializer
+    {
+        public Task<Core.CopyDesign.Apply.CopyDesignMaterializationResult> MaterializeFirstFileVersionAsync(
+            Core.CopyDesign.Apply.CopyDesignMaterializeRequest request, CancellationToken ct) =>
+            connection.MaterializeFirstFileVersionAsync(request, boundSession, ct);
+    }
+
+    /// <summary>P6D ROUND 3, HIGH fix (items D/E): thin adapter over
+    ///  <see cref="ArchConnectionManager.GetCopyDesignOperationStatusAsync"/> -
+    ///  the ONLY thing that lets the orchestrator's RESUME classification
+    ///  consult the authoritative per-operation status endpoint.</summary>
+    private sealed class CopyDesignOperationStatusAdapter(ArchConnectionManager connection, IArchSession boundSession)
+        : Core.CopyDesign.Apply.ICopyDesignOperationStatusClient
+    {
+        public Task<Core.CopyDesign.Apply.CopyDesignOperationStatusResult> GetStatusAsync(
+            Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation expectation, CancellationToken ct) =>
+            connection.GetCopyDesignOperationStatusAsync(expectation, boundSession, ct);
+    }
+
+    // ---- P5C: controlled reference repair --------------------------
+
+    /// <summary>
+    /// Repair ONE stale managed reference of the active document through an
+    /// explicit preview + confirmation:
+    ///
+    ///   scan -> diagnose (P5B-A) -> authoritative version status (P5B-B)
+    ///     -> pick a STALE managed reference with an exact stable identity
+    ///     -> resolve the authoritative latest FileVersion target from an
+    ///        EXISTING verified managed-workspace copy (never a filename guess,
+    ///        never a broad Get Latest)
+    ///     -> preview -> explicit confirmation -> replace ONE reference via the
+    ///        Inventor API -> rescan -> verify.
+    ///
+    /// P5C never saves, checks out, checks in, undoes, creates a FileVersion or
+    /// revision, or runs a broad Get Latest. If the exact target cannot be
+    /// proven, or the referencing document is not already writable, it fails
+    /// closed and explains what the engineer must do.
+    /// </summary>
+    private void RunRepairReference()
+    {
+        if (!TryScanActiveDocument("Repair Reference", out var scan))
+        {
+            return;
+        }
+
+        var local = ReferenceHealthDiagnoser.Diagnose(scan);
+
+        var managedIds = local.Entries
+            .Where(e => e.Management == ReferenceManagement.Managed
+                && e.ManagedIdentity is { CadDocumentId.Length: > 0 })
+            .Select(e => e.ManagedIdentity!.CadDocumentId)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (managedIds.Length == 0)
+        {
+            Info("Repair Reference found no managed references on this document. Nothing to repair.");
+            return;
+        }
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(_tracker.Current.FullPath), "Repair Reference")) return;
+
+        var activePath = _tracker.Current.FullPath!;
+        var roots = WorkspaceRootsForDocument(activePath).Where(r => r is not null).Select(r => r!).ToList();
+        var parentIds = local.Entries
+            .Select(e => e.Reference.ParentIdentity?.CadDocumentId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id!)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        LatestVersionLookup? lookup = null;
+        IReadOnlyDictionary<string, ServerCheckoutStatus?> checkoutStatuses =
+            new Dictionary<string, ServerCheckoutStatus?>();
+        RunBackground(
+            async ct =>
+            {
+                lookup = await _connection.GetLatestVersionsAsync(managedIds, ct);
+                checkoutStatuses = await LoadCheckoutStatusesAsync(parentIds, ct);
+            },
+            "Checking versions",
+            onDone: () => ContinueRepairReference(
+                local,
+                lookup ?? LatestVersionLookup.WholeFailure(LatestVersionOutcome.ServerUnavailable),
+                roots,
+                checkoutStatuses),
+            timeout: TimeSpan.FromMinutes(2));
+    }
+
+    private void ContinueRepairReference(
+        ReferenceHealthReport local,
+        LatestVersionLookup lookup,
+        IReadOnlyList<string> roots,
+        IReadOnlyDictionary<string, ServerCheckoutStatus?> checkoutStatuses)
+    {
+        var report = ReferenceVersionReport.Build(local, lookup);
+
+        var stale = report.Assessments
+            .Where(a => a.Applicable && a.Status == PlmVersionStatus.Stale)
+            .ToArray();
+
+        if (stale.Length == 0)
+        {
+            Info("Repair Reference: no STALE managed reference was found. "
+                + "Only a reference whose authoritative Arch PLM version is behind the latest can be repaired here.");
+            return;
+        }
+
+        var locator = new WorkspaceManifestRepairTargetLocator(roots);
+        var plans = stale
+            .Select(a => ReferenceRepairPlanner.Plan(
+                a,
+                locator.Locate(
+                    a.CadDocumentId ?? "",
+                    a.AuthoritativeLatestFileVersionId ?? "",
+                    a.AuthoritativeTargetFileSize,
+                    a.AuthoritativeTargetSha256 ?? ""),
+                BuildReferencingContext(a.Entry.Reference.ParentAbsolutePath, roots, checkoutStatuses)))
+            .ToArray();
+
+        ReferenceRepairPlan chosen;
+        using (var dialog = new RepairReferenceDialog(
+            $"{ArchAddInInfo.DisplayName} - Repair Reference", plans))
+        {
+            if (dialog.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK
+                || dialog.SelectedPlan is not { } selected)
+            {
+                return; // cancelled - zero CAD changes
+            }
+            chosen = selected;
+        }
+
+        if (!chosen.CanProceed)
+        {
+            Error(chosen.EligibilityLabel + " - " + chosen.EligibilityDetail);
+            return;
+        }
+
+        BeginFinalRepairPreflight(chosen, roots);
+    }
+
+    private void BeginFinalRepairPreflight(ReferenceRepairPlan previewed, IReadOnlyList<string> roots)
+    {
+        // P6 M4.1: re-checked after the (modal) Repair dialog - the user may
+        // have signed in to another server while it was open.
+        if (!EnsureWorkspaceServer(IdentityWorkspaceRoot(previewed.ReferencingDocumentPath), "Repair Reference")) return;
+
+        var parentEntry = FindManifestEntry(previewed.ReferencingDocumentPath, roots);
+        var parentIds = parentEntry is { CadDocumentId.Length: > 0 }
+            ? new[] { parentEntry.CadDocumentId }
+            : Array.Empty<string>();
+
+        LatestVersionLookup? latest = null;
+        IReadOnlyDictionary<string, ServerCheckoutStatus?> checkoutStatuses =
+            new Dictionary<string, ServerCheckoutStatus?>();
+        RunBackground(
+            async ct =>
+            {
+                latest = await _connection.GetLatestVersionsAsync(new[] { previewed.CadDocumentId! }, ct);
+                checkoutStatuses = await LoadCheckoutStatusesAsync(parentIds, ct);
+            },
+            "Revalidating repair",
+            onDone: () => CompleteFinalRepairPreflight(
+                previewed,
+                roots,
+                latest ?? LatestVersionLookup.WholeFailure(LatestVersionOutcome.ServerUnavailable),
+                checkoutStatuses),
+            timeout: TimeSpan.FromMinutes(2));
+    }
+
+    private void CompleteFinalRepairPreflight(
+        ReferenceRepairPlan previewed,
+        IReadOnlyList<string> roots,
+        LatestVersionLookup latest,
+        IReadOnlyDictionary<string, ServerCheckoutStatus?> checkoutStatuses)
+    {
+        CadReferenceScan freshScan;
+        try
+        {
+            freshScan = new InventorReferenceScanner(_application, roots)
+                .Scan(previewed.ReferencingDocumentPath);
+        }
+        catch
+        {
+            Error("Repair Reference could not freshly re-scan the selected referencing document. No mutation was attempted.");
+            return;
+        }
+
+        var matchingEdges = freshScan.References.Where(r =>
+            PathEquals(r.ParentAbsolutePath, previewed.ReferencingDocumentPath)
+            && PathEquals(r.ResolvedAbsolutePath, previewed.CurrentReferencePath)
+            && r.RelationshipKind == previewed.RelationshipKind
+            && r.ManifestIdentity is { IsVerified: true } identity
+            && string.Equals(identity.CadDocumentId, previewed.CadDocumentId, StringComparison.Ordinal)
+            && string.Equals(identity.FileVersionId, previewed.CurrentPinnedFileVersionId, StringComparison.Ordinal))
+            .ToArray();
+
+        if (matchingEdges.Length != 1)
+        {
+            Error("Repair Reference detected preview drift or an ambiguous reference. The exact parent/reference "
+                + "relationship and stable identity no longer match; no mutation was attempted.");
+            return;
+        }
+
+        var local = ReferenceHealthDiagnoser.Diagnose(freshScan);
+        var freshEntry = local.Entries.Single(e => Equals(e.Reference, matchingEdges[0]));
+        var assessment = ReferenceVersionClassifier.Assess(freshEntry, latest);
+        if (assessment.Status != PlmVersionStatus.Stale
+            || !string.Equals(assessment.AuthoritativeLatestFileVersionId,
+                previewed.AuthoritativeTargetFileVersionId, StringComparison.Ordinal))
+        {
+            Error("Repair Reference detected an authoritative version change since preview. No mutation was attempted.");
+            return;
+        }
+
+        // Re-read the manifest (stable local path mapping only) and re-hash the
+        // target's current bytes against the SERVER-authoritative integrity
+        // metadata immediately before the final confirmation. Persisted Verified
+        // state and the mutable manifest checksum are never enough.
+        var target = new WorkspaceManifestRepairTargetLocator(roots).Locate(
+            assessment.CadDocumentId ?? "",
+            assessment.AuthoritativeLatestFileVersionId ?? "",
+            assessment.AuthoritativeTargetFileSize,
+            assessment.AuthoritativeTargetSha256 ?? "");
+        var freshPlan = ReferenceRepairPlanner.Plan(
+            assessment,
+            target,
+            BuildReferencingContext(previewed.ReferencingDocumentPath, roots, checkoutStatuses));
+
+        if (!freshPlan.CanProceed || !SamePreviewIdentity(previewed, freshPlan))
+        {
+            Error("Repair Reference final authorization failed or the previewed operation changed. "
+                + freshPlan.EligibilityLabel + " - " + freshPlan.EligibilityDetail);
+            return;
+        }
+
+        var result = ReferenceRepairCoordinator.Execute(
+            freshPlan,
+            new MessageBoxRepairConfirmation(this),
+            new InventorRepairPreflight(_application, _connection, roots),
+            new InventorReferenceReplacer(_application, roots),
+            () => new InventorReferenceScanner(_application, roots).Scan(freshPlan.ReferencingDocumentPath));
+
+        // The reference graph / dirty state may have changed - re-derive even
+        // for an uncertain/failed mutation result.
+        try { _documents.RefreshFromActiveDocument(); } catch { /* COM teardown */ }
+        RefreshEnablement();
+
+        if (result.Succeeded)
+        {
+            Info(result.Message);
+        }
+        else if (result.Outcome != ReferenceRepairOutcome.CancelledByUser)
+        {
+            Error(result.Message);
+        }
+    }
+
+    private async Task<IReadOnlyDictionary<string, ServerCheckoutStatus?>> LoadCheckoutStatusesAsync(
+        IEnumerable<string> cadDocumentIds, CancellationToken ct)
+    {
+        var statuses = new Dictionary<string, ServerCheckoutStatus?>(StringComparer.Ordinal);
+        foreach (var id in cadDocumentIds.Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                statuses[id] = await _connection.GetCheckoutStatusAsync(id, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                statuses[id] = null; // unavailable/rejected is fail-closed
+            }
+        }
+        return statuses;
+    }
+
+    /// <summary>
+    /// Whether the document that OWNS the reference may already be modified +
+    /// saved under existing Arch rules. Derived from the verified workspace
+    /// manifest binding (checked out by me?) + the on-disk read-only attribute.
+    /// P5C never checks a document out and never clears read-only protection.
+    /// </summary>
+    private static RepairReferencingContext BuildReferencingContext(
+        string parentAbsolutePath,
+        IReadOnlyList<string> roots,
+        IReadOnlyDictionary<string, ServerCheckoutStatus?> checkoutStatuses)
+    {
+        var entry = FindManifestEntry(parentAbsolutePath, roots);
+        ServerCheckoutStatus? serverStatus = null;
+        if (entry is { CadDocumentId.Length: > 0 })
+        {
+            checkoutStatuses.TryGetValue(entry.CadDocumentId, out serverStatus);
+        }
+
+        // Fail-closed writability: only an AFFIRMATIVE Writable result (file
+        // present, no read-only attribute, can actually be opened for write)
+        // authorizes repair. A missing file, an attribute-probe failure, an
+        // access-denied error, or any inability to establish write access is
+        // NOT writable - never authorize by negating a helper whose failure
+        // also returns "not read-only".
+        var writability = LocalWritabilityProbe.Probe(parentAbsolutePath);
+        var state = CheckoutStateMachine.Evaluate(
+            entry, fileExists: writability != LocalWritability.Missing, serverStatus);
+        return ReferenceRepairWritability.Evaluate(
+            parentAbsolutePath,
+            state,
+            onDiskWritable: LocalWritabilityProbe.IsAffirmativelyWritable(writability),
+            ReferenceRepairWritability.AuthoritativeCheckoutMatches(entry, serverStatus));
+    }
+
+    private static WorkspaceManifestEntry? FindManifestEntry(string absolutePath, IReadOnlyList<string> roots)
+    {
+        foreach (var root in roots)
+        {
+            try
+            {
+                var entry = WorkspaceManifest.LoadOrEmpty(root).FindByAbsolutePath(absolutePath);
+                if (entry is not null) return entry;
+            }
+            catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException)
+            {
+                // Try the next known root; no binding means unmanaged/fail-closed.
+            }
+        }
+        return null;
+    }
+
+    private static bool SamePreviewIdentity(ReferenceRepairPlan previewed, ReferenceRepairPlan fresh) =>
+        PathEquals(previewed.ReferencingDocumentPath, fresh.ReferencingDocumentPath)
+        && PathEquals(previewed.CurrentReferencePath, fresh.CurrentReferencePath)
+        && PathEquals(previewed.ProposedTargetPath, fresh.ProposedTargetPath)
+        && previewed.RelationshipKind == fresh.RelationshipKind
+        && string.Equals(previewed.CadDocumentId, fresh.CadDocumentId, StringComparison.Ordinal)
+        && string.Equals(previewed.CurrentPinnedFileVersionId, fresh.CurrentPinnedFileVersionId, StringComparison.Ordinal)
+        && string.Equals(previewed.AuthoritativeTargetFileVersionId,
+            fresh.AuthoritativeTargetFileVersionId, StringComparison.Ordinal);
+
+    private static bool PathEquals(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The explicit engineer confirmation gate, shown IMMEDIATELY
+    ///  before any Inventor mutation. Declining makes zero CAD changes.</summary>
+    private sealed class MessageBoxRepairConfirmation(ArchAddInController owner) : IReferenceRepairConfirmation
+    {
+        public bool Confirm(ReferenceRepairPlan plan)
+        {
+            // Disclosure-only, READ-ONLY, best-effort live occurrence count -
+            // NEVER an authorization input (Prepare's fail-closed enumeration
+            // and the pre-mutation live-set equality check are the sole
+            // authorities for what actually gets mutated). Codex round-3
+            // finding: the old fixed wording ("Only this one reference will
+            // change") reads as "one occurrence" and is misleading whenever
+            // the same file backs more than one placement in the assembly.
+            var occurrenceCount = InventorReferenceReplacer.TryCountLiveMatchingOccurrencesForDisclosure(
+                owner._application, plan.ReferencingDocumentPath, plan.CurrentReferencePath);
+            var scopeLine = RepairOccurrenceDisclosureText.ScopeSentence(occurrenceCount);
+
+            var message =
+                "Replace this reference now?" + Environment.NewLine + Environment.NewLine
+                + "Reference : " + plan.ObservedReferenceName + Environment.NewLine
+                + "New target: " + plan.ProposedTargetPath + Environment.NewLine + Environment.NewLine
+                + scopeLine + Environment.NewLine + Environment.NewLine
+                + "The document will become MODIFIED in memory - you must Save it yourself. "
+                + "P5C will not save, check in, or check out.";
+            return MessageBox.Show(
+                new Win32Owner(owner.SafeMainHwnd()),
+                message,
+                ArchAddInInfo.DisplayName,
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning) == DialogResult.OK;
+        }
+    }
+
+    /// <summary>
+    /// Validate the active document and run the P5A reference scan on it.
+    /// COM reads run inline on the UI thread (the caller is already on it); a
+    /// local metadata scan needs no background work.
+    /// </summary>
+    private bool TryScanActiveDocument(string commandLabel, out CadReferenceScan scan)
+    {
+        scan = null!;
+        var doc = _tracker.Current;
+
+        if (string.IsNullOrEmpty(doc.FullPath) || !doc.HasBeenSavedToDisk)
+        {
+            Info($"Open and save an assembly, part or drawing before running {commandLabel}.");
+            return false;
+        }
+        if (doc.DocumentType is not (CadDocumentType.Iam or CadDocumentType.Ipt
+            or CadDocumentType.Idw or CadDocumentType.Dwg))
+        {
+            Info($"{commandLabel} supports Inventor assemblies (.iam), parts (.ipt) and drawings (.idw / .dwg).");
+            return false;
+        }
+
+        try
+        {
+            var scanner = new InventorReferenceScanner(_application, WorkspaceRootsForDocument(doc.FullPath!));
+            scan = scanner.Scan(doc.FullPath!);
+            return true;
+        }
+        catch (Exception)
+        {
+            Error($"{commandLabel} could not be completed.");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The managed-workspace roots to diagnose an active document against. The
+    /// authoritative one is the workspace that ACTUALLY contains the document,
+    /// discovered from its own <c>.arch/workspace.json</c> marker
+    /// (<see cref="WorkspaceRootLocator"/>) - not whatever folder was last typed
+    /// into the Get Latest dialog. The last Get Latest target is still included
+    /// as an extra root so a reference resolved into a different managed
+    /// workspace is also recognised; the scanner de-duplicates.
+    /// </summary>
+    private static IEnumerable<string?> WorkspaceRootsForDocument(string? activeDocumentPath)
+    {
+        var containing = WorkspaceRootLocator.FindRootForFile(activeDocumentPath);
+        if (!string.IsNullOrWhiteSpace(containing))
+        {
+            yield return containing;
+        }
+
+        var lastGetLatest = SafeLastWorkspaceRoot();
+        if (!string.IsNullOrWhiteSpace(lastGetLatest))
+        {
+            yield return lastGetLatest;
+        }
+    }
+
+    private void ShowGetLatestDialog()
+    {
+        string documentNumber;
+        string documentType;
+        string workspaceRoot;
+        using (var dialog = new GetLatestDialog())
+        {
+            if (dialog.ShowDialog(new Win32Owner(SafeMainHwnd())) != DialogResult.OK)
+            {
+                return;
+            }
+            documentNumber = dialog.RootDocumentNumber;
+            documentType = dialog.RootDocumentType;
+            workspaceRoot = dialog.WorkspaceRoot;
+        }
+
+        // P6 M4.1: a folder that already belongs to another server is never
+        // refreshed (and silently re-bound) from this one. The connection
+        // manager enforces this again before any request. Only an allowed
+        // folder is remembered as the last workspace.
+        var target = WorkspaceServerBinding.AdmitGetLatestTarget(
+            workspaceRoot,
+            _connection.CurrentSession?.Server,
+            rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save(),
+            connectedOrganization: _connection.CurrentSession?.Identity.OrganizationId);
+        if (!target.Allowed)
+        {
+            Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, "Get Latest", target);
+            Error($"Get Latest was not run. {target.Message}");
+            return;
+        }
+
+        // P6 M4.4: the target workspace, exclusively, for the whole run - the
+        // downloads AND the final manifest write. The origin is checked again
+        // (without remembering anything) before and while locked.
+        if (AcquireCommandLock(
+                Core.Workspace.Locking.WorkspaceLockRequest.ForGetLatest("Get Latest", workspaceRoot),
+                () => GetLatestTargetAllowed(workspaceRoot)) is not { } held) return;
+        using var releaseIfNotQueued = held.ReleaseUnlessQueued();
+
+        var request = new GetLatestRequest
+        {
+            Root = CadDocumentLookup.ByNumber(documentNumber: documentNumber, documentType: documentType),
+            WorkspaceRoot = workspaceRoot,
+        };
+
+        MaterializationReport? report = null;
+        var log = PdmDiagnostics.StartGetLatest(_diagnostics, request, _connection.CurrentSession);
+        held.AttachDiagnostics(log);
+        RunLockedInBackground(
+            held,
+            async ct =>
+            {
+                try
+                {
+                    report = await _connection.GetLatestAsync(request, ct);
+                    PdmDiagnostics.RecordGetLatest(log, report);
+                }
+                catch (Exception ex)
+                {
+                    PdmDiagnostics.RecordException(log, ex);
+                    throw;
+                }
+            },
+            "Getting latest",
+            onDone: () =>
+            {
+                // A now-managed open document should pick up its identity.
+                _documents.RefreshFromActiveDocument();
+                RefreshEnablement();
+                if (report is not null)
+                {
+                    ShowGetLatestResult(report);
+                }
+            },
+            timeout: TimeSpan.FromMinutes(15));
+    }
+
+    /// <summary>P6 M4.4: the Get Latest origin check again - like
+    ///  <see cref="WorkspaceServerBinding.AdmitGetLatestTarget"/> but remembering
+    ///  nothing.</summary>
+    private bool GetLatestTargetAllowed(string workspaceRoot)
+    {
+        var target = WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server, _connection.CurrentSession?.Identity.OrganizationId);
+        if (target.Allowed)
+        {
+            return true;
+        }
+        Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, "Get Latest", target);
+        Error($"Get Latest was not run. {target.Message}");
+        return false;
+    }
+
+    private void ShowGetLatestResult(MaterializationReport report)
+    {
+        var lines = new List<string> { report.ToSummaryLine() };
+
+        var problems = report.Results
+            .Where(r => r.Status is MaterializationStatus.Blocked or MaterializationStatus.Failed)
+            .ToList();
+        if (problems.Count > 0)
+        {
+            lines.Add("");
+            foreach (var p in problems)
+            {
+                var name = p.RelativePath ?? p.DocumentNumber ?? p.CadDocumentId;
+                lines.Add($"- {name}: {p.Status.ToString().ToLowerInvariant()}"
+                    + (string.IsNullOrWhiteSpace(p.Reason) ? "" : $" ({p.Reason})"));
+            }
+        }
+
+        var text = string.Join(Environment.NewLine, lines);
+        if (report.ReachedValidState)
+        {
+            Info(text);
+        }
+        else
+        {
+            Error(text);
+        }
+    }
+
+    /// <summary>P6 M4.1: the workspace whose manifest supplied the managed
+    ///  identities a reference command is about to send to the server - the
+    ///  active document's own workspace, or (for a document outside any
+    ///  workspace) the last Get Latest workspace, mirroring
+    ///  <see cref="WorkspaceRootsForDocument"/>.</summary>
+    private static string? IdentityWorkspaceRoot(string? activeDocumentPath) =>
+        WorkspaceRootLocator.FindRootForFile(activeDocumentPath) ?? SafeLastWorkspaceRoot();
+
+    private static IEnumerable<string?> KnownWorkspaceRoots()
+    {
+        var last = ConnectSettings.Load().LastWorkspaceRoot;
+        return string.IsNullOrWhiteSpace(last) ? Array.Empty<string?>() : new[] { last };
+    }
+
+    private void ShowSignInDialog()
+    {
+        using var dialog = new SignInDialog(_connection);
+        dialog.ShowDialog(new Win32Owner(SafeMainHwnd()));
+        RefreshEnablement();
+        if (_connection.State == ConnectionState.Connected)
+        {
+            Info($"Connected to {_connection.CurrentSession?.Identity.OrganizationName} as {_connection.CurrentSession?.Identity.Name}.");
+        }
+    }
+
+    private string ServerStatusText() => _connection.State switch
+    {
+        ConnectionState.Connected =>
+            $"Connected to {_connection.CurrentSession?.Server} as {_connection.CurrentSession?.Identity.Email}.",
+        ConnectionState.Unauthorized => "Your session is no longer valid. Sign in again.",
+        ConnectionState.ServerUnavailable => "The Arch PLM server could not be reached. Try again later.",
+        _ => "Not signed in.",
+    };
+
+    // ---- threading helpers ------------------------------------------
+
+    private void OnUi(Action action)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_uiMarshal.InvokeRequired)
+            {
+                _uiMarshal.BeginInvoke(action);
+            }
+            else
+            {
+                action();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // Add-in unloaded mid-flight.
+        }
+        catch (InvalidOperationException)
+        {
+            // Handle not created / message loop gone.
+        }
+    }
+
+    private void RunBackground(
+        Func<CancellationToken, Task> work,
+        string? title,
+        Action? onDone = null,
+        Action? onSettled = null,
+        TimeSpan? timeout = null)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(45));
+                await work(cts.Token).ConfigureAwait(false);
+                if (onDone is not null)
+                {
+                    OnUi(onDone);
+                }
+            }
+            catch (ArchApiException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (CheckoutConflictException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (NotManagedException ex)
+            {
+                OnUi(() => Info(ex.Message));
+            }
+            catch (NotVerifiedException ex)
+            {
+                OnUi(() => Info(ex.Message));
+            }
+            catch (NotCheckedOutLocallyException ex)
+            {
+                OnUi(() => Info(ex.Message));
+            }
+            catch (StaleCheckoutException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (DocumentOpenException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (UndoTargetMissingException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (RestoreVerificationException ex)
+            {
+                OnUi(() => Error("Undo Checkout was NOT performed - the base version could not be verified for restore. "
+                    + "Your checkout is still active. (" + ex.Message + ")"));
+            }
+            catch (ContentDownloadRedirectException)
+            {
+                OnUi(() => Error("The server redirected a download request; refusing to follow. Your checkout is unchanged."));
+            }
+            catch (ContentDownloadHttpException ex)
+            {
+                OnUi(() => Error($"A download failed (HTTP {ex.Status}). Your checkout is unchanged."));
+            }
+            catch (ContentDownloadTimeoutException)
+            {
+                OnUi(() => Error("A download timed out. Your checkout is unchanged."));
+            }
+            catch (ArchServerUriException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (UnsafeWorkspacePlanException ex)
+            {
+                var detail = ex.Problems.Count > 0
+                    ? Environment.NewLine + string.Join(Environment.NewLine, ex.Problems.Take(10).Select(p => $"- {p.Message}"))
+                    : "";
+                OnUi(() => Error(ex.Message + detail));
+            }
+            catch (UnsupportedWorkspaceContractException)
+            {
+                OnUi(() => Error("This Arch PLM server is a different version than this add-in supports."));
+            }
+            catch (WorkspaceRootException ex)
+            {
+                OnUi(() => Error(ex.Message));
+            }
+            catch (OperationCanceledException)
+            {
+                OnUi(() => Error("The operation timed out."));
+            }
+            catch (Exception)
+            {
+                OnUi(() => Error("Something went wrong. Please try again."));
+            }
+            finally
+            {
+                if (onSettled is not null)
+                {
+                    OnUi(onSettled);
+                }
+            }
+        });
+    }
+
+    // ---- message boxes --------------------------------------------
+
+    private void Info(string message) =>
+        MessageBox.Show(new Win32Owner(SafeMainHwnd()), message, ArchAddInInfo.DisplayName,
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+    private void Error(string message) =>
+        MessageBox.Show(new Win32Owner(SafeMainHwnd()), message, ArchAddInInfo.DisplayName,
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+    private IntPtr SafeMainHwnd()
+    {
+        try
+        {
+            return new IntPtr(_application.MainFrameHWND);
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    private static string ClientLabel()
+    {
+        try
+        {
+            return $"Inventor add-in on {Environment.MachineName}";
+        }
+        catch
+        {
+            return "Inventor add-in";
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+
+        try { _documents.Dispose(); } catch { /* teardown */ }
+        try { _ribbon.CommandInvoked -= OnCommandInvoked; _ribbon.Dispose(); } catch { /* teardown */ }
+        try { _uiMarshal.Dispose(); } catch { /* teardown */ }
+    }
+
+    /// <summary>Wraps a Win32 HWND as an <see cref="IWin32Window"/> for dialog ownership.</summary>
+    private sealed class Win32Owner(IntPtr handle) : IWin32Window
+    {
+        public IntPtr Handle { get; } = handle;
+    }
+}

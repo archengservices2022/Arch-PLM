@@ -1,0 +1,240 @@
+using Arch.CadConnect.Api.Dtos;
+using Arch.CadConnect.Api.Workspace;
+using Arch.CadConnect.Core.CopyDesign;
+using Arch.CadConnect.Core.References;
+using Arch.CadConnect.Core.Session;
+using Arch.CadConnect.Core.Workspace;
+
+namespace Arch.CadConnect.Api;
+
+/// <summary>
+/// The typed boundary between the Inventor add-in and the Arch PLM server.
+/// Every server interaction the add-in will ever need is declared here so the
+/// rest of the client codes against one seam.
+///
+/// P4A IMPLEMENTS: <see cref="SignInAsync"/>, <see cref="SignOutAsync"/>,
+/// <see cref="GetSessionAsync"/> (the desktop-auth endpoints).
+///
+/// P4B IMPLEMENTS: <see cref="ResolveCadDocumentAsync"/>,
+/// <see cref="GetLatestAsync"/> (real, via the existing P3B workspace-plan +
+/// content endpoints, bearer-authenticated).
+///
+/// P4C IMPLEMENTS: <see cref="CheckoutAsync"/>, <see cref="CheckInAsync"/>,
+/// <see cref="UndoCheckoutAsync"/> (real, via the existing P3C checkout /
+/// check-in / undo endpoints, bearer-authenticated). Each acts on an EXACT
+/// manifest-bound local file; the entry's cadDocumentId is authoritative.
+///
+/// Still declared-not-implemented (future scope): document status / version /
+/// revision / where-used.
+/// </summary>
+public interface IArchApi
+{
+    ArchServerUri Server { get; }
+
+    // ---- Authentication (P4A) --------------------------------------------
+
+    /// <summary>
+    /// Exchange credentials for a bearer session. The password is used once,
+    /// for this request body, and never stored or logged.
+    /// </summary>
+    Task<IArchSession> SignInAsync(
+        string email,
+        string password,
+        string? clientLabel,
+        CancellationToken ct = default);
+
+    /// <summary>Revoke <paramref name="session"/> server-side. Never throws for an already-dead session.</summary>
+    Task SignOutAsync(IArchSession session, CancellationToken ct = default);
+
+    /// <summary>
+    /// Validate a session and fetch current identity + server clock. Throws
+    /// <see cref="ArchApiException"/> (<see cref="ArchApiFailureKind.Unauthorized"/>)
+    /// if the session is no longer valid.
+    /// </summary>
+    Task<SessionResponseDto> GetSessionAsync(IArchSession session, CancellationToken ct = default);
+
+    // ---- Get Latest (P4B) ----------------------------------------------
+
+    /// <summary>
+    /// Resolve an explicit selection (a tenant document number, or a stable
+    /// id from a verified workspace manifest) to its authoritative
+    /// <see cref="ResolvedCadDocument"/>. Throws
+    /// <see cref="ArchApiException"/> (<see cref="ArchApiFailureKind.NotFound"/>)
+    /// when nothing matches in the caller's organization.
+    /// </summary>
+    Task<ResolvedCadDocument> ResolveCadDocumentAsync(IArchSession session, CadDocumentLookup lookup, CancellationToken ct = default);
+
+    /// <summary>
+    /// Perform a real Get Latest: resolve -> fetch the version-pinned
+    /// workspace plan -> download the exact FileVersions (size + SHA-256
+    /// verified) -> materialize a safe managed local workspace -> update the
+    /// workspace manifest. Never overwrites an existing user file; an unsafe
+    /// plan is refused wholesale (<see cref="Workspace.UnsafeWorkspacePlanException"/>).
+    /// Per-entry outcomes are in the returned report, never thrown.
+    /// P6 M4.4 Package C: refuses, before any request, a workspace that needs
+    /// recovery or is bound to another server or organization. So do the three
+    /// file commands below. Calls that carry no workspace (Copy Design apply,
+    /// materialize, drawing associations) cannot check one: their CONTRACT is that
+    /// the caller has already passed the workspace through
+    /// <see cref="Core.Workspace.WorkspaceServerBinding"/>, as
+    /// <see cref="ArchConnectionManager"/> and the add-in controller do, which
+    /// <c>PackageCGuardWiringTests</c> enforces.
+    /// </summary>
+    Task<MaterializationReport> GetLatestAsync(IArchSession session, GetLatestRequest request, CancellationToken ct = default);
+
+    // ---- PDM checkout / check-in / undo (P4C) --------------------------
+
+    /// <summary>
+    /// Take an exclusive server checkout of the managed file at
+    /// <paramref name="file"/> and make its local copy writable. The file must
+    /// be bound in the verified workspace manifest and Verified. Throws
+    /// <see cref="Workspace.CheckoutConflictException"/> when another user holds
+    /// it, <see cref="Workspace.NotManagedException"/> /
+    /// <see cref="Workspace.NotVerifiedException"/> for an ineligible target.
+    /// If the server succeeds but the local update partially fails, the result
+    /// carries <c>ReconcileNeeded</c> - it NEVER reports the checkout as failed.
+    /// </summary>
+    Task<CheckoutOperationResult> CheckoutAsync(IArchSession session, ManagedFileRef file, CancellationToken ct = default);
+
+    /// <summary>
+    /// Upload the saved local file as the next immutable FileVersion and
+    /// release the checkout, then rebind the workspace manifest and set the
+    /// file read-only. Creates a FileVersion ONLY - never an Engineering
+    /// Revision. A pre-201 failure leaves the checkout and the writable file
+    /// untouched; a 201 whose bytes cannot be verified returns
+    /// <c>Verified == false</c> (manifest rebound as Unverified).
+    /// </summary>
+    Task<CheckInOperationResult> CheckInAsync(IArchSession session, ManagedFileRef file, CancellationToken ct = default);
+
+    /// <summary>
+    /// Release the checkout and restore the working file to the exact base
+    /// FileVersion (discarding local changes). The base version is downloaded
+    /// and fully verified WHILE the checkout is still held - a bad download
+    /// throws and the checkout is NEVER released.
+    /// </summary>
+    Task<UndoOperationResult> UndoCheckoutAsync(IArchSession session, ManagedFileRef file, string? reason, CancellationToken ct = default);
+
+    /// <summary>Read the server-authoritative checkout state for one stable CAD
+    /// document id. Used by P5C as a fail-closed pre-mutation authorization
+    /// gate; it does not acquire or alter a checkout.</summary>
+    Task<ServerCheckoutStatus> GetCheckoutStatusAsync(
+        IArchSession session, string cadDocumentId, CancellationToken ct = default);
+
+    // ---- Authoritative version intelligence (P5B-B) ------------------
+
+    /// <summary>
+    /// Fetch the AUTHORITATIVE latest FileVersion identity for each of
+    /// <paramref name="cadDocumentIds"/> (stable server ids only). READ-ONLY -
+    /// no file bytes, no mutation, no checkout.
+    ///
+    /// Never throws for an unreachable server, a rejected session, an unknown
+    /// id, an unsupported endpoint, or a malformed body - those are per-id (or
+    /// whole-lookup) outcomes in the returned <see cref="LatestVersionLookup"/>
+    /// so P5B-B version classification fails closed to UNKNOWN VERSION.
+    /// </summary>
+    Task<LatestVersionLookup> GetLatestVersionsAsync(
+        IArchSession session, IReadOnlyCollection<string> cadDocumentIds, CancellationToken ct = default);
+
+    /// <summary>
+    /// P6D DRAWING ASSOCIATION AUTHORITY: fetch, in ONE batched request, the
+    /// AUTHORITATIVE drawing set (server <c>DRAWING_REFERENCE</c> rows) for
+    /// each of <paramref name="modelCadDocumentIds"/> (stable server ids
+    /// only - never a documentNumber or file name). READ-ONLY.
+    ///
+    /// <paramref name="manifest"/>, when supplied, lets each returned
+    /// <see cref="AssociatedDrawing"/> carry the LOCAL absolute path it
+    /// already sits at, when a prior Get Latest already materialized it -
+    /// this never proves the association itself, only enriches it.
+    ///
+    /// Never throws for an unreachable server, a rejected session, an
+    /// unrecognized id, an unsupported endpoint, or a malformed body - every
+    /// such case fails that (or every) id closed to
+    /// <see cref="DrawingAssociationOutcome.NotAvailable"/>, the exact same
+    /// "authority unavailable" state Copy Design Preview already handles for
+    /// the P6A stub - so the caller can wrap the result in a
+    /// <see cref="PrefetchedDrawingAssociationSource"/> and pass it directly
+    /// to <c>CopyDesignPlanner.Plan</c>.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, DrawingAssociationResult>> GetDrawingAssociationsAsync(
+        IArchSession session,
+        IReadOnlyCollection<string> modelCadDocumentIds,
+        WorkspaceManifest? manifest,
+        CancellationToken ct = default);
+
+    // ---- Copy Design apply / materialization (P6C) ---------------------
+
+    /// <summary>
+    /// Reserve server-side identities + immutable lineage for a confirmed P6A
+    /// Copy Design plan, via the EXISTING P6B contract
+    /// (<c>POST /api/desktop/copy-design/apply</c>). Never accesses
+    /// PostgreSQL directly. The caller's <paramref name="request"/> already
+    /// carries the SAME idempotency key for every retry of one logical
+    /// attempt - this method never mints one itself.
+    /// </summary>
+    Task<Core.CopyDesign.Apply.CopyDesignReservationResponse> ApplyCopyDesignAsync(
+        IArchSession session, Core.CopyDesign.Apply.CopyDesignApplyRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// Attempt to materialize the FIRST FileVersion for a P6B-reserved,
+    /// zero-FileVersion CadDocument from a verified local file, via the
+    /// dedicated <see cref="CopyDesign.CopyDesignMaterializeHttpClient"/>.
+    /// </summary>
+    Task<Core.CopyDesign.Apply.CopyDesignMaterializationResult> MaterializeFirstFileVersionAsync(
+        IArchSession session, Core.CopyDesign.Apply.CopyDesignMaterializeRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// P6D ROUND 3, HIGH fix (items D/E): the AUTHORITATIVE, dedicated,
+    /// READ-ONLY status of ONE Copy Design operation - REPLACES round 2's
+    /// reuse of <see cref="GetLatestVersionsAsync"/> for RESUME classification
+    /// (see <see cref="Core.CopyDesign.Apply.ICopyDesignOperationStatusClient"/>'s
+    /// own doc comment for why). P6D ROUND 4 (item D): validated against the
+    /// caller's own confirmed reservation `expectation`. Never throws for a
+    /// transport/auth/contract/validation failure - reported via the
+    /// result's Outcome instead.
+    /// </summary>
+    Task<Core.CopyDesign.Apply.CopyDesignOperationStatusResult> GetCopyDesignOperationStatusAsync(
+        IArchSession session, Core.CopyDesign.Apply.CopyDesignOperationStatusExpectation expectation, CancellationToken ct = default);
+
+    /// <summary>
+    /// P6D PRODUCTION RECOVERY: a RAW, structurally-validated (NOT
+    /// expectation-cross-validated) lookup of ONE Copy Design operation's
+    /// authoritative status, by id alone - used ONLY for DURABLE RESUME
+    /// DISCOVERY (<see cref="Core.CopyDesign.Apply.CopyDesignResumeAttemptReconstructor"/>)
+    /// when this session has no in-memory resumable attempt (e.g. after an
+    /// Inventor restart). Hits the SAME endpoint as
+    /// <see cref="GetCopyDesignOperationStatusAsync"/>; see
+    /// <see cref="Core.CopyDesign.Apply.IDurableCopyDesignOperationStatusClient"/>'s
+    /// own doc comment for why this is a separate, narrower client. Never
+    /// throws for a transport/auth/contract failure - reported via the
+    /// result's Outcome instead.
+    /// </summary>
+    Task<Core.CopyDesign.Apply.CopyDesignDurableResumeStatusResult> GetDurableCopyDesignOperationStatusAsync(
+        IArchSession session, string operationId, CancellationToken ct = default);
+
+    /// <summary>
+    /// P6E-C: the RAW, structurally-validated verification-support payload
+    /// for ONE Copy Design operation - source FileVersion integrity evidence
+    /// plus the operation's own COMPONENT topology - via the dedicated
+    /// <see cref="CopyDesign.HttpCopyDesignVerificationSupportClient"/>. See
+    /// <see cref="Core.CopyDesign.Apply.ICopyDesignVerificationSupportClient"/>'s
+    /// own doc comment for why this is a separate, additive client. Never
+    /// throws for a transport/auth/contract failure - reported via the
+    /// result's Outcome instead.
+    /// </summary>
+    Task<Core.CopyDesign.Apply.CopyDesignVerificationSupportResult> GetCopyDesignVerificationSupportAsync(
+        IArchSession session, string operationId, CancellationToken ct = default);
+
+    // ---- future scope (declared, not implemented) ---------------------
+
+    Task<PlmDocumentStatusDto> GetDocumentStatusAsync(IArchSession session, string cadDocumentId, CancellationToken ct = default);
+
+    Task<WhereUsedDto> GetWhereUsedAsync(IArchSession session, string cadDocumentId, CancellationToken ct = default);
+
+    Task<ReleaseInfoDto> GetReleaseInfoAsync(IArchSession session, string itemRevisionId, CancellationToken ct = default);
+}
+
+// Placeholder DTOs for the not-yet-implemented operations. Shaped now so the
+// interface is stable; filled in when the operations land.
+public sealed record PlmDocumentStatusDto(string CadDocumentId, string Status);
+public sealed record WhereUsedDto(IReadOnlyList<string> ParentDocumentIds);
+public sealed record ReleaseInfoDto(string ItemRevisionId, string Lifecycle);
