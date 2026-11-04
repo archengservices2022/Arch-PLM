@@ -139,6 +139,10 @@ internal sealed class ArchAddInController : IDisposable
             // Sign-out (null session) forgets any remembered Undo target.
             if (session is null)
             {
+                if (_undoTarget.Current is { } forgotten)
+                {
+                    LogUndoTarget("dropped", "signed-out", "session", forgotten, forgotten.File.WorkspaceRoot, checkoutCount: null, manifestStep: null);
+                }
                 _undoTarget.Clear();
             }
             RefreshEnablement();
@@ -168,15 +172,40 @@ internal sealed class ArchAddInController : IDisposable
         // drop it the moment it is no longer a live checkout in the current
         // workspace (successful check-in / undo clear the manifest marker;
         // a workspace change / identity drift / missing file also invalidate).
+        var previousTarget = _undoTarget.Current;
         _undoTarget.Observe(doc);
-        _undoTarget.Revalidate(
-            entryLookup: LoadManifestEntry,
+        if (_undoTarget.Current is { } observed && observed != previousTarget)
+        {
+            LogUndoTarget("remembered", "observed", "refresh", observed, observed.File.WorkspaceRoot, checkoutCount: null, manifestStep: null);
+        }
+
+        var currentRoot = SafeLastWorkspaceRoot();
+        var beforeRevalidate = _undoTarget.Current;
+        string? manifestStep = null;
+        var dropReason = _undoTarget.Revalidate(
+            entryLookup: file =>
+            {
+                var (entry, step) = LoadManifestEntryWithStatus(file);
+                manifestStep = step;
+                return entry;
+            },
             fileExists: SafeFileExists,
-            currentWorkspaceRoot: SafeLastWorkspaceRoot());
+            currentWorkspaceRoot: currentRoot);
+        if (dropReason is not null)
+        {
+            LogUndoTarget("dropped", dropReason, "refresh", beforeRevalidate, currentRoot, checkoutCount: null, manifestStep);
+        }
+
+        // R10 MA-7: nothing remembered (the target can be lost while the
+        // document is closed) - recover it only when the selected workspace
+        // holds exactly one complete checkout record. Undo re-checks it all.
+        var recovered = _undoTarget.Current is null && _connection.CurrentSession is not null
+            ? RecoverUndoTargetFromWorkspace("refresh")
+            : null;
 
         var map = RibbonCommandPolicy.Evaluate(
             _connection.State, doc, role,
-            hasRememberedUndoTarget: _undoTarget.Current is not null,
+            hasRememberedUndoTarget: _undoTarget.Current is not null || recovered is not null,
             hasResumableCopyDesignAttempt: _resumableCopyDesignAttempt is not null,
             hasUncertainCopyDesignAttempt: _uncertainCopyDesignAttempt is not null,
             copyDesignRunning: CopyDesignRunning);
@@ -259,15 +288,100 @@ internal sealed class ArchAddInController : IDisposable
         TimeSpan? timeout = null) =>
         held.Queue(locked => RunBackground(locked, title, onDone, onSettled, timeout), work);
 
-    private static WorkspaceManifestEntry? LoadManifestEntry(ManagedFileRef file)
+    /// <summary>The manifest entry for <paramref name="file"/> (null when it
+    ///  cannot be read - the remembered target is then dropped, as before),
+    ///  plus a diagnostic code for how the manifest load went (R10 MA-7).</summary>
+    private static (WorkspaceManifestEntry? Entry, string Step) LoadManifestEntryWithStatus(ManagedFileRef file)
     {
         try
         {
-            return WorkspaceManifest.LoadOrEmpty(file.WorkspaceRoot).FindByAbsolutePath(file.AbsoluteFilePath);
+            var (manifest, status) = WorkspaceManifest.Load(file.WorkspaceRoot);
+            return (manifest.FindByAbsolutePath(file.AbsoluteFilePath), ManifestStep(status));
         }
         catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException)
         {
-            return null;
+            return (null, "manifest-error");
+        }
+    }
+
+    private static string ManifestStep(WorkspaceManifestLoadStatus status) => status switch
+    {
+        WorkspaceManifestLoadStatus.Loaded => "manifest-loaded",
+        WorkspaceManifestLoadStatus.Missing => "manifest-missing",
+        _ => "manifest-invalid",
+    };
+
+    /// <summary>R10 MA-7 fallback (see <see cref="UndoTargetMemory.ResolveFromWorkspace"/>):
+    ///  the single complete checkout record in the SELECTED workspace
+    ///  (<see cref="ConnectSettings.LastWorkspaceRoot"/>), or null. An
+    ///  unreadable or missing manifest recovers nothing. Never throws.</summary>
+    private RememberedCheckoutTarget? RecoverUndoTargetFromWorkspace(string source)
+    {
+        var root = SafeLastWorkspaceRoot();
+        UndoTargetRecovery recovery;
+        string? manifestStep = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                recovery = UndoTargetMemory.ResolveFromWorkspace(null, root, SafeFileExists);
+            }
+            else
+            {
+                var (manifest, status) = WorkspaceManifest.Load(root);
+                manifestStep = ManifestStep(status);
+                recovery = status == WorkspaceManifestLoadStatus.Loaded
+                    ? UndoTargetMemory.ResolveFromWorkspace(manifest.Entries, root, SafeFileExists)
+                    : new UndoTargetRecovery(null, UndoTargetRecovery.NoCheckout, 0);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or WorkspaceRootException or UnauthorizedAccessException or ArgumentException)
+        {
+            manifestStep = "manifest-error";
+            recovery = new UndoTargetRecovery(null, UndoTargetRecovery.NoCheckout, 0);
+        }
+
+        LogUndoTarget(
+            recovery.Target is null ? "fallback-none" : "fallback-used",
+            recovery.Outcome, source, recovery.Target, root, recovery.CheckoutCount, manifestStep);
+        return recovery.Target;
+    }
+
+    /// <summary>The last undo-target diagnostic written, so a refresh that
+    ///  changes nothing writes nothing (RefreshEnablement runs very often).</summary>
+    private string? _lastUndoTargetLog;
+
+    /// <summary>R10 MA-7 diagnostics: one "pdm.undo-target" event per
+    ///  TRANSITION - remembered, dropped (with the reason), fallback used or
+    ///  not. Ids, codes, counts and sanitized paths only. Best effort: a
+    ///  logging failure never affects the ribbon.</summary>
+    private void LogUndoTarget(
+        string action, string verdict, string source, RememberedCheckoutTarget? target,
+        string? workspaceRoot, int? checkoutCount, string? manifestStep)
+    {
+        var key = string.Join("|", action, verdict, target?.CadDocumentId, target?.CheckoutId, workspaceRoot, checkoutCount, manifestStep);
+        if (string.Equals(key, _lastUndoTargetLog, StringComparison.Ordinal))
+        {
+            return;
+        }
+        _lastUndoTargetLog = key;
+        try
+        {
+            Core.Diagnostics.DiagnosticsAttempt.Start(
+                _diagnostics, "pdm.undo-target",
+                Core.Diagnostics.DiagnosticField.Code("action", action),
+                Core.Diagnostics.DiagnosticField.Code("verdict", verdict),
+                Core.Diagnostics.DiagnosticField.Code("source", source),
+                Core.Diagnostics.DiagnosticField.Code("step", manifestStep),
+                Core.Diagnostics.DiagnosticField.Id("cadDocumentId", target?.CadDocumentId),
+                Core.Diagnostics.DiagnosticField.Path("path", target?.File.AbsoluteFilePath),
+                Core.Diagnostics.DiagnosticField.Path("workspaceRoot", workspaceRoot),
+                Core.Diagnostics.DiagnosticField.Number("entryCount", checkoutCount))
+                .Succeeded();
+        }
+        catch
+        {
+            // diagnostics are best effort
         }
     }
 
@@ -549,6 +663,13 @@ internal sealed class ArchAddInController : IDisposable
         if (_undoTarget.Current is { } target)
         {
             return (target.File, target.DocumentNumber);
+        }
+        // R10 MA-7: the same single-checkout fallback the ribbon used to
+        // enable the command. The confirmation dialog and the orchestrator's
+        // manifest, open-document and server checks still follow.
+        if (RecoverUndoTargetFromWorkspace("resolve") is { } recovered)
+        {
+            return (recovered.File, recovered.DocumentNumber);
         }
         return (null, "");
     }
