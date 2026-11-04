@@ -24,6 +24,24 @@ public enum MaterializationStatus
     Failed,
 }
 
+/// <summary>P6 M4.4 Package C: what <see cref="WorkspaceManifest.ApplyRun"/> does
+///  with the entry's existing checkout marker. Only set when a Get Latest
+///  decided something about a checkout; otherwise <see cref="Default"/>.</summary>
+public enum MaterializationManifestAction
+{
+    /// <summary>The ordinary rules for the entry's status.</summary>
+    Default,
+
+    /// <summary>Leave the existing entry exactly as it is.</summary>
+    PreserveEntry,
+
+    /// <summary>The server proved the checkout: carry the marker over.</summary>
+    KeepCheckout,
+
+    /// <summary>The server proved the marker stale: remove it.</summary>
+    ClearCheckout,
+}
+
 public sealed record MaterializationEntryResult
 {
     /// <summary>Authoritative identity.</summary>
@@ -39,9 +57,15 @@ public sealed record MaterializationEntryResult
 
     public required MaterializationStatus Status { get; init; }
 
-    /// <summary>Human-readable detail for Blocked / Failed. Never contains a
+    /// <summary>Human-readable detail for Blocked / Failed, or for a Downloaded
+    ///  entry that left a <see cref="RetainedRecoveryCopy"/>. Never contains a
     ///  server filesystem path.</summary>
     public string? Reason { get; init; }
+
+    /// <summary>P6 M4.4 Package C: the file was replaced, but its previous
+    ///  version could not be cleaned up and stays here, relative to the
+    ///  workspace root. Null when nothing was left behind.</summary>
+    public string? RetainedRecoveryCopy { get; init; }
 
     /// <summary>Bytes written for a fresh download; 0 for AlreadyCurrent.</summary>
     public long BytesWritten { get; init; }
@@ -51,6 +75,8 @@ public sealed record MaterializationEntryResult
 
     public bool IsRoot { get; init; }
     public string? DocumentNumber { get; init; }
+
+    public MaterializationManifestAction ManifestAction { get; init; } = MaterializationManifestAction.Default;
 }
 
 public sealed record MaterializationSummary(int Downloaded, int AlreadyCurrent, int Blocked, int Failed);
@@ -70,22 +96,36 @@ public sealed record MaterializationReport
     /// <summary>Deterministic - same order as the plan's entries.</summary>
     public required IReadOnlyList<MaterializationEntryResult> Results { get; init; }
 
+    /// <summary>P6 M4.4 Package C: the manifest was saved, but its old copy stayed
+    ///  behind here, relative to the workspace root. Null when nothing did.</summary>
+    public string? RetainedManifestArtifact { get; init; }
+
     public MaterializationSummary Summary => new(
         Downloaded: Results.Count(r => r.Status == MaterializationStatus.Downloaded),
         AlreadyCurrent: Results.Count(r => r.Status == MaterializationStatus.AlreadyCurrent),
         Blocked: Results.Count(r => r.Status == MaterializationStatus.Blocked),
         Failed: Results.Count(r => r.Status == MaterializationStatus.Failed));
 
-    /// <summary>True when nothing failed and nothing was blocked - the local
-    ///  workspace is a complete, verified copy of the pinned package.</summary>
+    /// <summary>True when nothing failed, nothing was blocked and nothing is left
+    ///  for a person to sort out - the local workspace is a complete, verified
+    ///  copy of the pinned package.</summary>
     public bool ReachedValidState =>
-        Results.All(r => r.Status is MaterializationStatus.Downloaded or MaterializationStatus.AlreadyCurrent);
+        Results.All(r => r.Status is MaterializationStatus.Downloaded or MaterializationStatus.AlreadyCurrent
+            && r.RetainedRecoveryCopy is null)
+        && RetainedManifestArtifact is null;
 
-    /// <summary>A one-line summary for the ribbon result dialog.</summary>
+    /// <summary>A one-line summary for the ribbon result dialog. It is the one
+    ///  line always shown, so it carries any retained recovery copy.</summary>
     public string ToSummaryLine()
     {
         var s = Summary;
+        var retained = Results.Where(r => r.RetainedRecoveryCopy is not null).Select(r => " " + r.Reason);
+        var manifest = RetainedManifestArtifact is { } artifact ? " " + GetLatestCheckoutPolicy.ManifestArtifactRetainedReason(artifact) : "";
+        var notChecked = Results.Count(r => GetLatestCheckoutPolicy.IsNotChecked(r.Reason));
+        var incomplete = notChecked > 0
+            ? $" {notChecked} not checked: this workspace is not confirmed current. Run Get Latest again."
+            : "";
         return $"{s.Downloaded} downloaded, {s.AlreadyCurrent} already current, "
-             + $"{s.Blocked} blocked, {s.Failed} failed.";
+             + $"{s.Blocked} blocked, {s.Failed} failed." + incomplete + string.Concat(retained) + manifest;
     }
 }

@@ -71,6 +71,14 @@ public interface IArchApi
     /// workspace manifest. Never overwrites an existing user file; an unsafe
     /// plan is refused wholesale (<see cref="Workspace.UnsafeWorkspacePlanException"/>).
     /// Per-entry outcomes are in the returned report, never thrown.
+    /// P6 M4.4 Package C: refuses, before any request, a workspace that needs
+    /// recovery or is bound to another server or organization. So do the three
+    /// file commands below. Calls that carry no workspace (Copy Design apply,
+    /// materialize, drawing associations) cannot check one: their CONTRACT is that
+    /// the caller has already passed the workspace through
+    /// <see cref="Core.Workspace.WorkspaceServerBinding"/>, as
+    /// <see cref="ArchConnectionManager"/> and the add-in controller do, which
+    /// <c>PackageCGuardWiringTests</c> enforces.
     /// </summary>
     Task<MaterializationReport> GetLatestAsync(IArchSession session, GetLatestRequest request, CancellationToken ct = default);
 

@@ -12,6 +12,9 @@ public sealed class FakeHttpHandler : HttpMessageHandler
 
     public List<HttpRequestMessage> Requests { get; } = new();
 
+    /// <summary>What this handler would answer, without recording a request.</summary>
+    public HttpResponseMessage Respond(HttpRequestMessage request) => _responder(request);
+
     /// <summary>The request bodies, captured as strings BEFORE the client disposes them.</summary>
     public List<string> RequestBodies { get; } = new();
 
@@ -19,11 +22,17 @@ public sealed class FakeHttpHandler : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        RequestBodies.Add(request.Content is null
+        var body = request.Content is null
             ? string.Empty
-            : await request.Content.ReadAsStringAsync(cancellationToken));
-        LastAuthorizationHeader = request.Headers.Authorization?.ToString();
-        Requests.Add(request);
+            : await request.Content.ReadAsStringAsync(cancellationToken);
+
+        // Status requests arrive concurrently, and a List loses entries otherwise.
+        lock (Requests)
+        {
+            RequestBodies.Add(body);
+            LastAuthorizationHeader = request.Headers.Authorization?.ToString();
+            Requests.Add(request);
+        }
         return _responder(request);
     }
 

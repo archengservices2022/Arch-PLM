@@ -63,7 +63,15 @@ public readonly record struct FileIdentity(uint VolumeSerial, ulong FileIndex);
 ///  changing anything (the same fields the M4.1 origin guard reads).</summary>
 public sealed record WorkspaceBindingSnapshot(bool ManifestPresent, string? Schema, string? ServerOrigin, string? OrganizationId)
 {
+    private const string RecoveryRequiredSchema = "[recovery-required]";
+
     public static readonly WorkspaceBindingSnapshot None = new(false, null, null, null);
+
+    /// <summary>P6 M4.4 Package C: no binding can be read from this workspace;
+    ///  see <see cref="WorkspaceRecoveryState"/>.</summary>
+    public static readonly WorkspaceBindingSnapshot RecoveryRequired = new(true, RecoveryRequiredSchema, null, null);
+
+    public bool IsRecoveryRequired => Schema == RecoveryRequiredSchema;
 }
 
 /// <summary>Everything that must still be true after a lock is acquired.
@@ -120,6 +128,8 @@ public static class WorkspaceLockErrorCodes
     public const string OperationKeyMissing = "operation-key-missing";
     public const string PathChanged = "path-changed";
     public const string WorkspaceChanged = "workspace-changed";
+    public const string WorkspaceRecoveryRequired = "workspace-recovery-required";
+    public const string LockScopeRefused = "lock-scope-refused";
 
     /// <summary>The code for "someone else holds it", per scope.</summary>
     public static string LockedFor(LockScope scope) => scope switch

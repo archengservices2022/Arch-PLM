@@ -15,7 +15,7 @@ public class CheckoutHttpClientsTests
     public async Task RequestCheckout_201_created_returns_the_base_binding_over_bearer()
     {
         var handler = new FakeHttpHandler(_ => FakeHttpHandler.Json(HttpStatusCode.Created,
-            """{"status":"created","checkout":{"id":"co_1","cadDocumentId":"cad_1","baseFileVersionId":"fv_9","baseVersionNumber":4,"checkedOutBy":{"name":"Me","email":"me@x.com"}}}"""));
+            """{"status":"created","checkout":{"id":"co_1","cadDocumentId":"cad_1","baseFileVersionId":"fv_9","baseVersionNumber":4,"checkedOutById":"u1","checkedOutAt":"2026-09-05T12:00:00.000Z","checkedOutBy":{"name":"Me","email":"me@x.com"}}}"""));
 
         var result = await Client(handler).RequestCheckoutAsync("cad_1");
 
@@ -33,7 +33,7 @@ public class CheckoutHttpClientsTests
     public async Task RequestCheckout_200_already_mine()
     {
         var handler = new FakeHttpHandler(_ => FakeHttpHandler.Json(HttpStatusCode.OK,
-            """{"status":"already-mine","checkout":{"id":"co_1","cadDocumentId":"cad_1","baseFileVersionId":"fv_9","baseVersionNumber":4}}"""));
+            """{"status":"already-mine","checkout":{"id":"co_1","cadDocumentId":"cad_1","baseFileVersionId":"fv_9","baseVersionNumber":4,"checkedOutById":"u1","checkedOutAt":"2026-09-05T12:00:00.000Z"}}"""));
         var result = await Client(handler).RequestCheckoutAsync("cad_1");
         Assert.Equal(CheckoutOutcome.AlreadyMine, result.Kind);
     }

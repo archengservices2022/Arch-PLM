@@ -118,6 +118,134 @@ public class PdmDiagnosticsTests
         Assert.Equal(2000L, sink.Field(e, "durationMs"));
     }
 
+    [Fact]
+    public void Get_Latest_that_retained_a_recovery_copy_is_not_logged_as_a_success()
+    {
+        var sink = new Sink();
+        var request = new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ARCH-TEST-001.ipt", "IPT"), WorkspaceRoot = @"D:\ws" };
+        var attempt = PdmDiagnostics.StartGetLatest(sink, request, "http://localhost:3100", "user-1", TimeProvider.System);
+
+        PdmDiagnostics.RecordGetLatest(attempt, new MaterializationReport
+        {
+            WorkspaceRoot = @"D:\ws",
+            RootCadDocumentId = "cad-root",
+            StartedAtUtc = DateTimeOffset.UnixEpoch,
+            FinishedAtUtc = DateTimeOffset.UnixEpoch.AddSeconds(2),
+            RequestedEntries = 1,
+            Results = [Entry(MaterializationStatus.Downloaded) with { RetainedRecoveryCopy = @".arch\.recovery\a.recovery-1.ipt" }],
+        });
+
+        var e = sink.Events.Last();
+        Assert.Equal(DiagnosticOutcome.Failed, e.Outcome);
+        Assert.Equal(1L, sink.Field(e, "retainedRecoveryCopies"));
+        Assert.DoesNotContain(e.Fields, f => (f.Value as string)?.Contains("recovery") == true);
+    }
+
+    [Fact]
+    public void A_retained_recovery_copy_reaches_the_production_log_as_a_count_and_never_as_a_path()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "arch-m44-diag-" + Guid.NewGuid().ToString("N"));
+        const string copy = @".arch\.recovery\secret-part.recovery-1.ipt";
+        try
+        {
+            var sink = new JsonLinesDiagnosticsSink(directory, null, userProfile: @"C:\Users\Someone");
+            var request = new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ARCH-TEST-001.ipt", "IPT"), WorkspaceRoot = @"D:\ws" };
+            var attempt = PdmDiagnostics.StartGetLatest(sink, request, "http://localhost:3100", "user-1", TimeProvider.System);
+
+            PdmDiagnostics.RecordGetLatest(attempt, new MaterializationReport
+            {
+                WorkspaceRoot = @"D:\ws",
+                RootCadDocumentId = "cad-root",
+                StartedAtUtc = DateTimeOffset.UnixEpoch,
+                FinishedAtUtc = DateTimeOffset.UnixEpoch.AddSeconds(2),
+                RequestedEntries = 1,
+                Results = [Entry(MaterializationStatus.Downloaded) with
+                {
+                    RetainedRecoveryCopy = copy,
+                    Reason = GetLatestCheckoutPolicy.RecoveryCopyRetainedReason(copy),
+                }],
+            });
+
+            using var log = new FileStream(System.IO.Directory.GetFiles(directory).Single(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var lines = new StreamReader(log).ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            using var terminal = System.Text.Json.JsonDocument.Parse(lines.Last());
+            Assert.Equal("failed", terminal.RootElement.GetProperty("outcome").GetString());
+            Assert.Equal(1, terminal.RootElement.GetProperty("data").GetProperty("retainedRecoveryCopies").GetInt64());
+            Assert.False(terminal.RootElement.TryGetProperty("droppedFields", out var dropped) && dropped.GetInt32() > 0);
+            Assert.DoesNotContain(lines, l => l.Contains("secret-part", StringComparison.Ordinal) || l.Contains(".recovery", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    private static System.Text.Json.JsonElement LastLoggedLine(string directory)
+    {
+        using var log = new FileStream(System.IO.Directory.GetFiles(directory).Single(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var lines = new StreamReader(log).ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        return System.Text.Json.JsonDocument.Parse(lines.Last()).RootElement.Clone();
+    }
+
+    [Fact]
+    public void A_retained_manifest_reaches_the_production_log_as_a_count_and_never_as_a_path()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "arch-m44-diag-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var sink = new JsonLinesDiagnosticsSink(directory, null, userProfile: @"C:\Users\Someone");
+            var request = new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ARCH-TEST-001.ipt", "IPT"), WorkspaceRoot = @"D:\ws" };
+            var attempt = PdmDiagnostics.StartGetLatest(sink, request, "http://localhost:3100", "user-1", TimeProvider.System);
+
+            PdmDiagnostics.RecordGetLatest(attempt, new MaterializationReport
+            {
+                WorkspaceRoot = @"D:\ws",
+                RootCadDocumentId = "cad-root",
+                StartedAtUtc = DateTimeOffset.UnixEpoch,
+                FinishedAtUtc = DateTimeOffset.UnixEpoch.AddSeconds(2),
+                RequestedEntries = 1,
+                Results = [Entry(MaterializationStatus.Downloaded)],
+                RetainedManifestArtifact = @".arch\workspace.json.secret.previous",
+            });
+
+            var terminal = LastLoggedLine(directory);
+            Assert.Equal("failed", terminal.GetProperty("outcome").GetString());
+            Assert.Equal(1, terminal.GetProperty("data").GetProperty("retainedManifestArtifacts").GetInt64());
+            Assert.False(terminal.TryGetProperty("droppedFields", out var dropped) && dropped.GetInt32() > 0);
+            Assert.DoesNotContain("secret", terminal.GetRawText());
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory)) System.IO.Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void What_an_exception_left_behind_reaches_the_production_log_as_counts_and_never_as_its_message()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "arch-m44-diag-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var sink = new JsonLinesDiagnosticsSink(directory, null, userProfile: @"C:\Users\Someone");
+            var request = new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ARCH-TEST-001.ipt", "IPT"), WorkspaceRoot = @"D:\ws" };
+            var attempt = PdmDiagnostics.StartGetLatest(sink, request, "http://localhost:3100", "user-1", TimeProvider.System);
+
+            PdmDiagnostics.RecordException(attempt, new WorkspaceRootException(@"kept .arch\workspace.json.secret.previous", 2, 1));
+
+            var data = LastLoggedLine(directory).GetProperty("data");
+            Assert.Equal(2, data.GetProperty("retainedRecoveryCopies").GetInt64());
+            Assert.Equal(1, data.GetProperty("retainedManifestArtifacts").GetInt64());
+            Assert.DoesNotContain("secret", data.GetRawText());
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory)) System.IO.Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static MaterializationEntryResult Entry(MaterializationStatus status) => new()
     {
         CadDocumentId = "cad-" + Guid.NewGuid().ToString("N"),

@@ -195,28 +195,59 @@ internal sealed class FakeLockHandleFactory : ILockHandleFactory
     public WorkspaceLockHolderRecord? Holder { get; set; }
     public Action? OnAcquired { get; set; }
 
-    public LockHandleResult AcquireWorkspace(string canonicalRoot, LockMode mode, WorkspaceLockHolderRecord holder) =>
-        Acquire($"W:{mode}:{canonicalRoot}", canonicalRoot);
+    /// <summary>P6 M4.4 Package C: what a held workspace lock says its file's path
+    ///  is, by root and by how many times that handle has been asked (1-based).
+    ///  Null means the handle cannot answer. Unset: where it was taken.</summary>
+    public Func<string, int, string?>? FinalPathOf { get; set; }
 
-    public LockHandleResult AcquireMachine(LockScope scope, string key) => Acquire($"{scope}:{key}", key);
+    /// <summary>Runs as a held workspace lock is asked its path (root, query number).</summary>
+    public Action<string, int>? OnFinalPath { get; set; }
+
+    /// <summary>Workspace roots whose held lock throws when asked its path.</summary>
+    public HashSet<string> ThrowOnFinalPath { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public LockHandleResult AcquireWorkspace(string canonicalRoot, LockMode mode, WorkspaceLockHolderRecord holder) =>
+        Acquire($"W:{mode}:{canonicalRoot}", canonicalRoot, workspace: true);
+
+    public LockHandleResult AcquireMachine(LockScope scope, string key) => Acquire($"{scope}:{key}", key, workspace: false);
 
     public WorkspaceLockHolderRecord? ReadHolder(string canonicalRoot) => Holder;
 
-    private LockHandleResult Acquire(string call, string key)
+    private LockHandleResult Acquire(string call, string key, bool workspace)
     {
         Calls.Add(call);
         if (key == ThrowOnAcquireKey) throw new IOException("planted acquire failure");
         if (RefuseKeys.TryGetValue(key, out var code)) return LockHandleResult.Refused(code);
         OnAcquired?.Invoke();
-        return LockHandleResult.Acquired(new Handle(this, call));
+        return LockHandleResult.Acquired(workspace ? new WorkspaceHandle(this, call, key) : new Handle(this, call));
+    }
+
+    private void Release(string call)
+    {
+        lock (Released)
+        {
+            Released.Add(call);
+        }
+        if (ThrowOnRelease.Contains(call)) throw new IOException("planted release failure");
     }
 
     private sealed class Handle(FakeLockHandleFactory owner, string call) : IDisposable
     {
-        public void Dispose()
+        public void Dispose() => owner.Release(call);
+    }
+
+    private sealed class WorkspaceHandle(FakeLockHandleFactory owner, string call, string root) : IDisposable, IHeldWorkspaceLockFile
+    {
+        private int _asked;
+
+        public void Dispose() => owner.Release(call);
+
+        public string? FinalPath()
         {
-            owner.Released.Add(call);
-            if (owner.ThrowOnRelease.Contains(call)) throw new IOException("planted release failure");
+            var asked = Interlocked.Increment(ref _asked);
+            owner.OnFinalPath?.Invoke(root, asked);
+            if (owner.ThrowOnFinalPath.Contains(root)) throw new IOException("planted path query failure");
+            return owner.FinalPathOf is { } of ? of(root, asked) : LockPaths.WorkspaceLockFile(root);
         }
     }
 }

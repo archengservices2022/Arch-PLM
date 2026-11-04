@@ -172,4 +172,12 @@ public sealed class UnsafeWorkspacePathException : Exception
     }
 }
 
-public sealed class WorkspaceRootException(string message) : Exception(message);
+/// <param name="retainedRecoveryCopies">P6 M4.4 Package C: how many recovery
+///  copies stayed behind, for a caller that logs only numbers.</param>
+/// <param name="retainedManifestArtifacts">The same for old manifests.</param>
+public sealed class WorkspaceRootException(string message, int retainedRecoveryCopies = 0, int retainedManifestArtifacts = 0) : Exception(message)
+{
+    public int RetainedRecoveryCopies { get; } = retainedRecoveryCopies;
+
+    public int RetainedManifestArtifacts { get; } = retainedManifestArtifacts;
+}

@@ -192,13 +192,13 @@ internal sealed class ArchAddInController : IDisposable
     ///  resume / recover / verify, latest-version lookups). See
     ///  <see cref="WorkspaceServerBinding"/>.</summary>
     private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName) =>
-        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession?.Server);
+        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession);
 
-    /// <summary>P6 M4.1a: the same check against an explicit server - the
-    ///  BOUND session's, for a Copy Design attempt.</summary>
-    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, ArchServerUri? server)
+    /// <summary>P6 M4.1a: the same check against an explicit session - the
+    ///  BOUND one, for a Copy Design attempt.</summary>
+    private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, IArchSession? session)
     {
-        var binding = WorkspaceServerBinding.CheckWorkspace(workspaceRoot, server);
+        var binding = WorkspaceServerBinding.CheckWorkspace(workspaceRoot, session?.Server, session?.Identity.OrganizationId);
         if (binding.Allowed)
         {
             return true;
@@ -216,7 +216,7 @@ internal sealed class ArchAddInController : IDisposable
     private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, Action rememberSettingsWhenAllowed)
     {
         var binding = WorkspaceServerBinding.AdmitWorkspace(
-            workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed);
+            workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed, _connection.CurrentSession?.Identity.OrganizationId);
         if (binding.Allowed)
         {
             return true;
@@ -1415,13 +1415,13 @@ internal sealed class ArchAddInController : IDisposable
         // here, once more before the locks and once while they are held.
         bool OriginChecksPass()
         {
-            if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession.Server)) return false;
+            if (!EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession)) return false;
             foreach (var destination in destinations)
             {
                 // A destination is normally a plain folder; if it lies inside a
                 // workspace, that workspace must belong to the same server too.
                 if (WorkspaceRootLocator.FindRootForFile(destination) is { } destinationRoot
-                    && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server))
+                    && !EnsureWorkspaceServer(destinationRoot, commandName, boundSession))
                 {
                     return false;
                 }
@@ -2084,7 +2084,8 @@ internal sealed class ArchAddInController : IDisposable
         var target = WorkspaceServerBinding.AdmitGetLatestTarget(
             workspaceRoot,
             _connection.CurrentSession?.Server,
-            rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save());
+            rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save(),
+            connectedOrganization: _connection.CurrentSession?.Identity.OrganizationId);
         if (!target.Allowed)
         {
             Core.Diagnostics.RefusalDiagnostics.WorkspaceOrigin(_diagnostics, "Get Latest", target);
@@ -2143,7 +2144,7 @@ internal sealed class ArchAddInController : IDisposable
     ///  nothing.</summary>
     private bool GetLatestTargetAllowed(string workspaceRoot)
     {
-        var target = WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server);
+        var target = WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server, _connection.CurrentSession?.Identity.OrganizationId);
         if (target.Allowed)
         {
             return true;

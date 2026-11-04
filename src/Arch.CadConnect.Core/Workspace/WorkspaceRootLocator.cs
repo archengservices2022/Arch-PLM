@@ -5,6 +5,9 @@ namespace Arch.CadConnect.Core.Workspace;
 /// UP from the file's own directory until it reaches a directory that holds a
 /// <c>.arch/workspace.json</c> manifest. The manifest file is the ONLY
 /// workspace marker - never a directory name, a filename, or a document number.
+/// P6 M4.4 Package C: a workspace whose manifest needs recovery is still that
+/// workspace, whatever its record looks like right now; see
+/// <see cref="WorkspaceRecoveryState"/>.
 ///
 /// Deterministic: the NEAREST ancestor with a manifest wins. Bounded: it stops
 /// at the filesystem root. Safe: it only ever looks at ancestor directories of
@@ -63,7 +66,7 @@ public static class WorkspaceRootLocator
     {
         try
         {
-            return File.Exists(Path.Combine(directory, WorkspaceManifest.RelativeManifestPath));
+            return WorkspaceRecoveryState.Inspect(directory).Status != WorkspaceRecoveryStatus.New;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {

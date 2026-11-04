@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -51,22 +52,30 @@ public sealed class CheckoutHttpClient
         if (status is HttpStatusCode.OK or HttpStatusCode.Created)
         {
             var dto = Deserialize<CheckoutEnvelopeDto>(text);
-            if (dto?.Checkout is null || string.IsNullOrEmpty(dto.Checkout.BaseFileVersionId))
+            if (dto?.Checkout is null)
             {
                 throw Server("checkout response failed shape check");
             }
+            // P6 M4.4 Package C: exactly the two answers the server gives, each
+            // with its own status code. An unknown value is not a new checkout.
+            var kind = (status, dto.Status) switch
+            {
+                (HttpStatusCode.Created, "created") => CheckoutOutcome.Created,
+                (HttpStatusCode.OK, "already-mine") => CheckoutOutcome.AlreadyMine,
+                _ => throw Server("checkout response reported an unknown status"),
+            };
             // ROUND 5 (Codex HIGH): this is always a "this checkout is now
             // (or already) mine, for the document I asked about" result -
             // require the server's own echoed cadDocumentId to exactly match
             // the one requested, fail closed otherwise.
             RequireMatchingCadDocumentId(cadDocumentId, dto.Checkout.CadDocumentId);
+            var checkedOutAt = RequireMine(dto.Checkout);
             return new CheckoutResult(
-                Kind: string.Equals(dto.Status, "already-mine", StringComparison.Ordinal)
-                    ? CheckoutOutcome.AlreadyMine
-                    : CheckoutOutcome.Created,
+                Kind: kind,
                 CheckoutId: dto.Checkout.Id,
                 BaseFileVersionId: dto.Checkout.BaseFileVersionId,
-                BaseVersionNumber: dto.Checkout.BaseVersionNumber);
+                BaseVersionNumber: dto.Checkout.BaseVersionNumber,
+                CheckedOutAt: checkedOutAt);
         }
         if (status == HttpStatusCode.Conflict)
         {
@@ -78,7 +87,17 @@ public sealed class CheckoutHttpClient
     }
 
     /// <summary><c>GET /api/cad-documents/:id/checkout</c> - read-only status.</summary>
-    public async Task<ServerCheckoutStatus> GetStatusAsync(string cadDocumentId, CancellationToken ct = default)
+    public Task<ServerCheckoutStatus> GetStatusAsync(string cadDocumentId, CancellationToken ct = default)
+        => ReadStatusAsync(cadDocumentId, strict: false, ct);
+
+    /// <summary>P6 M4.4 Package C: <see cref="GetStatusAsync"/> for a caller that
+    ///  acts on "available" or "locked" as PROOF its local marker is stale - an
+    ///  unknown state, or a "locked" for another document, throws instead of
+    ///  reading as available.</summary>
+    public Task<ServerCheckoutStatus> GetStatusStrictAsync(string cadDocumentId, CancellationToken ct = default)
+        => ReadStatusAsync(cadDocumentId, strict: true, ct);
+
+    private async Task<ServerCheckoutStatus> ReadStatusAsync(string cadDocumentId, bool strict, CancellationToken ct)
     {
         var (status, text) = await SendAsync(HttpMethod.Get, Path(cadDocumentId, "checkout"), null, ct).ConfigureAwait(false);
         if (status != HttpStatusCode.OK)
@@ -86,6 +105,14 @@ public sealed class CheckoutHttpClient
             throw MapFailure((int)status, text);
         }
         var dto = Deserialize<CheckoutStatusDto>(text);
+        if (strict && dto?.State is not ("available" or "mine" or "locked"))
+        {
+            throw Server("checkout status reported an unknown state");
+        }
+        if (strict)
+        {
+            RequireConsistentStatus(cadDocumentId, dto!);
+        }
         var state = dto?.State switch
         {
             "mine" => ServerCheckoutState.Mine,
@@ -120,7 +147,80 @@ public sealed class CheckoutHttpClient
             dto?.Checkout?.CheckedOutBy?.Email,
             CheckoutId: dto?.Checkout?.Id,
             BaseFileVersionId: dto?.Checkout?.BaseFileVersionId,
-            BaseVersionNumber: dto?.Checkout?.BaseVersionNumber ?? 0);
+            BaseVersionNumber: dto?.Checkout?.BaseVersionNumber ?? 0,
+            CheckedOutById: dto?.Checkout?.CheckedOutById,
+            CheckedOutAt: ParseInstant(dto?.Checkout?.CheckedOutAt));
+    }
+
+    /// <summary>P6 M4.4 Package C: a strict status is acted on as proof, so its
+    ///  body must be what its state says: nothing checked out for "available",
+    ///  the caller's own complete checkout for "mine", and someone else's for
+    ///  "locked". Anything contradictory proves nothing.</summary>
+    private void RequireConsistentStatus(string cadDocumentId, CheckoutStatusDto dto)
+    {
+        switch (dto.State)
+        {
+            case "available":
+                if (dto.Checkout is not null)
+                {
+                    throw Server("checkout status reported 'available' with a checkout");
+                }
+                break;
+
+            case "mine":
+                RequireMatchingCadDocumentId(cadDocumentId, dto.Checkout?.CadDocumentId);
+                RequireMine(dto.Checkout!);
+                break;
+
+            default:
+                if (dto.Checkout is null)
+                {
+                    throw Server("checkout status reported 'locked' without a checkout");
+                }
+                RequireMatchingCadDocumentId(cadDocumentId, dto.Checkout.CadDocumentId);
+                RequireOthers(dto.Checkout);
+                break;
+        }
+    }
+
+    /// <summary>R10 correction (MAJOR 3): a "locked" answer clears a local marker,
+    ///  so it must be another user's COMPLETE checkout, exactly as "mine" must be
+    ///  this user's. The holder's name and email are display only and not required.</summary>
+    private void RequireOthers(CheckoutDto checkout)
+    {
+        if (!WorkspaceManifest.IsWellFormedId(checkout.Id)
+            || !WorkspaceManifest.IsWellFormedId(checkout.BaseFileVersionId)
+            || checkout.BaseVersionNumber <= 0
+            || !WorkspaceManifest.IsWellFormedId(checkout.CheckedOutById)
+            || string.Equals(checkout.CheckedOutById, _session.Identity.UserId, StringComparison.Ordinal)
+            || ParseInstant(checkout.CheckedOutAt) is null)
+        {
+            throw Server("checkout status reported 'locked' without another user's complete checkout");
+        }
+    }
+
+    /// <summary>A complete checkout identity, held by this session's user.</summary>
+    /// <returns>When the server says it was taken.</returns>
+    private DateTimeOffset RequireMine(CheckoutDto checkout)
+    {
+        if (!WorkspaceManifest.IsWellFormedId(checkout.Id)
+            || !WorkspaceManifest.IsWellFormedId(checkout.BaseFileVersionId)
+            || checkout.BaseVersionNumber <= 0
+            || !string.Equals(checkout.CheckedOutById, _session.Identity.UserId, StringComparison.Ordinal))
+        {
+            throw Server("checkout response is not this user's complete checkout");
+        }
+        return ParseInstant(checkout.CheckedOutAt) ?? throw Server("checkout response has no valid timestamp");
+    }
+
+    /// <summary>An ISO 8601 instant that says which instant it is: a value with no
+    ///  offset does not, and is not read as local time.</summary>
+    private static DateTimeOffset? ParseInstant(string? value)
+    {
+        var zoned = value is { Length: >= 20 } && (value[^1] == 'Z' || value[^6] is '+' or '-');
+        return zoned && DateTimeOffset.TryParseExact(value, "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed)
+            ? parsed.ToUniversalTime()
+            : null;
     }
 
     /// <summary>
@@ -307,7 +407,9 @@ public sealed class CheckoutHttpClient
         [property: JsonPropertyName("cadDocumentId")] string CadDocumentId,
         [property: JsonPropertyName("baseFileVersionId")] string BaseFileVersionId,
         [property: JsonPropertyName("baseVersionNumber")] int BaseVersionNumber,
-        [property: JsonPropertyName("checkedOutBy")] HolderDto? CheckedOutBy);
+        [property: JsonPropertyName("checkedOutBy")] HolderDto? CheckedOutBy,
+        [property: JsonPropertyName("checkedOutById")] string? CheckedOutById = null,
+        [property: JsonPropertyName("checkedOutAt")] string? CheckedOutAt = null);
 
     private sealed record HolderDto(
         [property: JsonPropertyName("name")] string? Name,
@@ -321,7 +423,7 @@ public sealed class CheckoutHttpClient
 public enum CheckoutOutcome { Created, AlreadyMine }
 
 public sealed record CheckoutResult(
-    CheckoutOutcome Kind, string CheckoutId, string BaseFileVersionId, int BaseVersionNumber);
+    CheckoutOutcome Kind, string CheckoutId, string BaseFileVersionId, int BaseVersionNumber, DateTimeOffset CheckedOutAt);
 
 public sealed record UndoResult(string CheckoutId, string BaseFileVersionId);
 

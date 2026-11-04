@@ -13,6 +13,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Arch.CadConnect.Core\Arch.CadConnect.Core.csproj" />
+    <!-- P6 M4.4 Package C R10: the production Get Latest, for a child killed mid-reconciliation -->
+    <ProjectReference Include="..\..\src\Arch.CadConnect.Api\Arch.CadConnect.Api.csproj" />
   </ItemGroup>
 
 </Project>

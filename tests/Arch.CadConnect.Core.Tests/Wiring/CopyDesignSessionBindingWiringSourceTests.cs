@@ -79,7 +79,7 @@ public class CopyDesignSessionBindingWiringSourceTests
         var body = Body(Controller(), "private void ExecuteCopyDesignAttempt(");
 
         var capture = IndexOrFail(body, "_connection.CurrentSession is not { } boundSession", "session capture");
-        var check = IndexOrFail(body, "commandName, boundSession.Server)", "workspace check");
+        var check = IndexOrFail(body, "commandName, boundSession)", "workspace check");
         var orchestrator = IndexOrFail(body, "new Core.CopyDesign.Apply.CopyDesignApplyOrchestrator(", "orchestrator");
         Assert.True(capture < check && check < orchestrator);
         Assert.Contains("new ApplyCopyDesignReservationAdapter(_connection, boundSession)", body);

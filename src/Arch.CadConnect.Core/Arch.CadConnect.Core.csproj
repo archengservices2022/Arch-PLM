@@ -15,4 +15,12 @@
     <AssemblyName>Arch.CadConnect.Core</AssemblyName>
   </PropertyGroup>
 
+  <!-- Test seams stay internal: Api consumes them to pass a test's seam along. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Arch.CadConnect.Api" />
+    <InternalsVisibleTo Include="Arch.CadConnect.Api.Tests" />
+    <InternalsVisibleTo Include="Arch.CadConnect.Core.Tests" />
+    <InternalsVisibleTo Include="Arch.CadConnect.LockProbe" />
+  </ItemGroup>
+
 </Project>

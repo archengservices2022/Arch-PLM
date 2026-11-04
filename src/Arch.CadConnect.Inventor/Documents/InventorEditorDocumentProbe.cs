@@ -13,8 +13,35 @@ namespace Arch.CadConnect.Inventor.Documents;
 /// working file cannot be safely replaced, so Undo is refused BEFORE the
 /// server checkout is released.
 /// </summary>
-internal sealed class InventorEditorDocumentProbe(InventorApi.Application application) : IEditorDocumentProbe
+internal sealed class InventorEditorDocumentProbe(InventorApi.Application application)
+    : IEditorDocumentProbe, IEditorDocumentStateProbe
 {
+    /// <summary>P6 M4.4 Package C: for Get Latest. Unlike
+    ///  <see cref="IsOpenForEditing"/>, a document or reference that cannot be
+    ///  read makes the answer unknown, never "closed".</summary>
+    public EditorDocumentState GetDocumentState(string absoluteFilePath) =>
+        EditorDocumentScan.Inspect<InventorApi.Document>(
+            absoluteFilePath,
+            OpenDocuments,
+            document => document.FullFileName,
+            ReferencedDocuments);
+
+    private IEnumerable<InventorApi.Document> OpenDocuments()
+    {
+        foreach (InventorApi.Document document in application.Documents)
+        {
+            yield return document;
+        }
+    }
+
+    private static IEnumerable<InventorApi.Document> ReferencedDocuments(InventorApi.Document document)
+    {
+        foreach (InventorApi.Document referenced in document.ReferencedDocuments)
+        {
+            yield return referenced;
+        }
+    }
+
     public bool IsOpenForEditing(string absoluteFilePath)
     {
         if (string.IsNullOrWhiteSpace(absoluteFilePath))

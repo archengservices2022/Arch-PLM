@@ -44,7 +44,9 @@ public sealed record ServerCheckoutStatus(
     string? HolderEmail = null,
     string? CheckoutId = null,
     string? BaseFileVersionId = null,
-    int BaseVersionNumber = 0);
+    int BaseVersionNumber = 0,
+    string? CheckedOutById = null,
+    DateTimeOffset? CheckedOutAt = null);
 
 public enum ServerCheckoutState { Available, Mine, Locked }
 

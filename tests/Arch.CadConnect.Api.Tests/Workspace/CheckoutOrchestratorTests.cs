@@ -10,7 +10,7 @@ using Arch.CadConnect.Core.Workspace;
 
 namespace Arch.CadConnect.Api.Tests.Workspace;
 
-public class CheckoutOrchestratorTests : IDisposable
+public partial class CheckoutOrchestratorTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "arch-cc-orch-co-" + Guid.NewGuid().ToString("N"));
 
@@ -58,8 +58,14 @@ public class CheckoutOrchestratorTests : IDisposable
 
     private static HttpResponseMessage Json(HttpStatusCode s, string body) => FakeHttpHandler.Json(s, body);
 
-    private const string CheckoutCreated =
-        """{"status":"created","checkout":{"id":"co_1","cadDocumentId":"cad_part","baseFileVersionId":"fv_1","baseVersionNumber":1}}""";
+    private const string CheckedOutAt = "2026-09-05T12:00:00.000Z";
+
+    private static string PostBody(
+        string status, string id = "co_1", string baseFv = "fv_1", int baseVersion = 1, string owner = "u1", string at = CheckedOutAt) =>
+        "{\"status\":\"" + status + "\",\"checkout\":{\"id\":\"" + id + "\",\"cadDocumentId\":\"cad_part\",\"baseFileVersionId\":\"" + baseFv
+        + "\",\"baseVersionNumber\":" + baseVersion + ",\"checkedOutById\":\"" + owner + "\",\"checkedOutAt\":\"" + at + "\"}}";
+
+    private static readonly string CheckoutCreated = PostBody("created");
 
     private static string StatusBody(string state, string checkoutId = "co_1", string baseFv = "fv_1", string? holder = null)
     {
@@ -69,7 +75,8 @@ public class CheckoutOrchestratorTests : IDisposable
         }
         return "{\"state\":\"" + state + "\",\"checkout\":{\"id\":\"" + checkoutId
             + "\",\"cadDocumentId\":\"cad_part\",\"baseFileVersionId\":\"" + baseFv
-            + "\",\"baseVersionNumber\":1,\"checkedOutBy\":{\"name\":\"" + (holder ?? "Me")
+            + "\",\"baseVersionNumber\":" + (baseFv == "fv_1" ? 1 : 2) + ",\"checkedOutById\":\"" + (state == "mine" ? "u1" : "u2")
+            + "\",\"checkedOutAt\":\"" + CheckedOutAt + "\",\"checkedOutBy\":{\"name\":\"" + (holder ?? "Me")
             + "\",\"email\":\"x@x.com\"}}}";
     }
 
@@ -87,14 +94,32 @@ public class CheckoutOrchestratorTests : IDisposable
         HttpStatusCode undoStatus = HttpStatusCode.OK,
         byte[]? contentBytes = null,
         Action? onContentRequest = null,
-        Action? onUndoRequest = null)
+        Action? onUndoRequest = null,
+        bool heldWithoutMarker = false,
+        string latestFileVersionId = "fv_1",
+        int latestVersion = 1,
+        Func<HttpResponseMessage>? latestResponse = null)
     {
         var content = contentBytes ?? V1Bytes;
+        if (heldWithoutMarker && checkoutBody is null && checkoutStatus == HttpStatusCode.Created)
+        {
+            checkoutStatus = HttpStatusCode.OK;
+            checkoutBody = PostBody("already-mine");
+        }
         return new FakeHttpHandler(req =>
         {
             var p = req.RequestUri!.AbsolutePath;
             if (p == "/api/cad-documents/cad_part/checkout" && req.Method == HttpMethod.Get)
-                return Json(HttpStatusCode.OK, StatusBody(statusState, statusCheckoutId, statusBaseFv, statusHolder));
+            {
+                // "mine" describes a checkout this workspace knows about, unless a
+                // test says the marker is what went missing.
+                var state = statusState == "mine" && !heldWithoutMarker && Entry().Checkout is null ? "available" : statusState;
+                return Json(HttpStatusCode.OK, StatusBody(state, statusCheckoutId, statusBaseFv, statusHolder));
+            }
+            if (p == "/api/desktop/cad-documents/latest-versions")
+            {
+                return latestResponse?.Invoke() ?? Json(HttpStatusCode.OK, LatestBody(latestFileVersionId, latestVersion));
+            }
             switch (p)
             {
                 case "/api/cad-documents/cad_part/checkout":
@@ -113,6 +138,10 @@ public class CheckoutOrchestratorTests : IDisposable
             }
         });
     }
+
+    private static string LatestBody(string fileVersionId, int versionNumber) =>
+        "{\"contract\":\"arch-plm.desktop-latest-versions.v1\",\"results\":[{\"cadDocumentId\":\"cad_part\",\"recognized\":true,\"latestFileVersionId\":\""
+        + fileVersionId + "\",\"latestVersionNumber\":" + versionNumber + ",\"fileSize\":" + V1Bytes.Length + ",\"checksum\":\"" + Sha(V1Bytes) + "\"}]}";
 
     private long ReadPartLength() => File.Exists(PartPath) ? new FileInfo(PartPath).Length : 0;
     private string ReadPartSha() => File.Exists(PartPath) ? Sha(File.ReadAllBytes(PartPath)) : "";
@@ -197,7 +226,10 @@ public class CheckoutOrchestratorTests : IDisposable
 
         Assert.True(result.ReconcileNeeded);
         Assert.False(result.ManifestUpdated);
-        Assert.True(result.MadeWritable);                 // server lock acknowledged
+        // R10 correction (MINOR 3): no record, no write access - the file keeps
+        // its read-only attribute; the server checkout is still reported as held.
+        Assert.False(result.MadeWritable);
+        Assert.True(ManagedFileGuard.IsControlled(PartPath));
         Assert.Contains("HELD on the server", result.Message);
     }
 
@@ -314,16 +346,17 @@ public class CheckoutOrchestratorTests : IDisposable
     }
 
     [Fact]
-    public async Task CheckIn_proceeds_on_server_Mine_even_without_a_local_marker()
+    public async Task CheckIn_does_not_proceed_on_server_Mine_without_a_local_marker()
     {
         SeedControlled();
         // no checkout done locally, but the server says this session holds it
         File.SetAttributes(PartPath, FileAttributes.Normal);
         await File.WriteAllBytesAsync(PartPath, Encoding.UTF8.GetBytes("edited"));
 
-        var handler = Server(statusState: "mine");
-        var result = await Orchestrator(handler).CheckInAsync(_root, PartPath);
-        Assert.True(result.Verified);
+        var handler = Server(heldWithoutMarker: true);
+        await Assert.ThrowsAsync<NotCheckedOutLocallyException>(() => Orchestrator(handler).CheckInAsync(_root, PartPath));
+        Assert.Empty(handler.Requests);
+        Assert.Equal(Encoding.UTF8.GetBytes("edited"), await File.ReadAllBytesAsync(PartPath));
     }
 
     // ================================================================

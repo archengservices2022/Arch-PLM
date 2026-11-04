@@ -55,9 +55,11 @@ public static class PdmDiagnostics
                 DiagnosticField.Number("alreadyCurrent", s.AlreadyCurrent),
                 DiagnosticField.Number("blocked", s.Blocked),
                 DiagnosticField.Number("failed", s.Failed),
+                DiagnosticField.Number("retainedRecoveryCopies", report.Results.Count(r => r.RetainedRecoveryCopy is not null)),
+                DiagnosticField.Number("retainedManifestArtifacts", report.RetainedManifestArtifact is null ? 0 : 1),
                 DiagnosticField.Number("durationMs", (long)(report.FinishedAtUtc - report.StartedAtUtc).TotalMilliseconds),
             };
-            if (s.Blocked == 0 && s.Failed == 0) attempt.Succeeded(fields); else attempt.Failed(fields);
+            if (report.ReachedValidState) attempt.Succeeded(fields); else attempt.Failed(fields);
         }
         catch
         {
@@ -131,8 +133,11 @@ public static class PdmDiagnostics
     {
         try
         {
+            var workspace = exception as Core.Workspace.WorkspaceRootException;
             attempt.Failed(exception,
-                DiagnosticField.Code("failureKind", (exception as ArchApiException)?.Kind.ToString()));
+                DiagnosticField.Code("failureKind", (exception as ArchApiException)?.Kind.ToString()),
+                DiagnosticField.Number("retainedRecoveryCopies", workspace?.RetainedRecoveryCopies),
+                DiagnosticField.Number("retainedManifestArtifacts", workspace?.RetainedManifestArtifacts));
         }
         catch
         {

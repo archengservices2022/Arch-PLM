@@ -73,7 +73,8 @@ public class GetLatestOrchestratorTests : IDisposable
         WorkspaceTestSession.Server,
         resolve: (s, lu, c) => GetLatestOrchestrator.ResolveViaHttpAsync(WorkspaceTestSession.Server, s, http, lu, TimeSpan.FromSeconds(5), c),
         planClientFactory: s => new WorkspacePlanClient(WorkspaceTestSession.Server, s, http, TimeSpan.FromSeconds(5)),
-        downloaderFactory: s => new HttpContentDownloader(WorkspaceTestSession.Server, s, http));
+        downloaderFactory: s => new HttpContentDownloader(WorkspaceTestSession.Server, s, http),
+        checkoutStatus: (_, _, _) => Task.FromResult(new ServerCheckoutStatus(ServerCheckoutState.Available)));
 
     [Fact]
     public async Task End_to_end_materializes_the_pinned_package_and_writes_the_manifest()
@@ -139,7 +140,7 @@ public class GetLatestOrchestratorTests : IDisposable
                 new GetLatestRequest { Root = CadDocumentLookup.ByNumber("NOPE"), WorkspaceRoot = _root }));
 
         Assert.Equal(ArchApiFailureKind.NotFound, ex.Kind);
-        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+        Assert.False(File.Exists(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
     }
 
     [Fact]
@@ -183,7 +184,7 @@ public class GetLatestOrchestratorTests : IDisposable
                 new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-1"), WorkspaceRoot = _root }));
 
         Assert.Equal(ArchApiFailureKind.Unauthorized, ex.Kind);
-        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+        Assert.False(File.Exists(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
         Assert.Empty(Directory.GetFiles(_root));
         Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
     }
@@ -199,13 +200,14 @@ public class GetLatestOrchestratorTests : IDisposable
         Directory.CreateDirectory(inner);
         var handler = ServerHandler();
 
-        var ex = await Assert.ThrowsAsync<UnsafeWorkspacePlanException>(
+        // Refused by the lock planner now, which every direct run goes through,
+        // before the first request instead of after the plan.
+        var ex = await Assert.ThrowsAsync<WorkspaceRootException>(
             () => Orchestrator(new HttpClient(handler)).RunAsync(WorkspaceTestSession.Make(),
                 new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-1"), WorkspaceRoot = inner }));
 
-        Assert.Equal(2, ex.Problems.Count);
-        Assert.All(ex.Problems, p => Assert.Equal(GetLatestNestingCheck.ProblemKind, p.Kind));
-        Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
+        Assert.Contains("Nested workspaces are not supported", ex.Message);
+        Assert.Empty(handler.Requests);
         Assert.Empty(Directory.GetFileSystemEntries(inner));
         Assert.Equal(outerManifest, await File.ReadAllTextAsync(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
     }
@@ -228,7 +230,7 @@ public class GetLatestOrchestratorTests : IDisposable
         Assert.Equal("cad_part", Assert.Single(ex.Problems).CadDocumentId);
         Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
         Assert.False(File.Exists(Path.Combine(_root, "asm.iam")), "not even the entries outside the nested workspace are downloaded");
-        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+        Assert.False(File.Exists(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
     }
 
     [Fact]
@@ -277,7 +279,7 @@ public class GetLatestOrchestratorTests : IDisposable
         // nothing downstream: no plan fetch, no content, no workspace mutation
         Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.Contains("/workspace-plan"));
         Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
-        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+        Assert.False(File.Exists(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
         Assert.Empty(Directory.GetFiles(_root));
     }
 

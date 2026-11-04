@@ -116,7 +116,7 @@ public sealed class ArchApiClientGetLatestTests : IDisposable
             () => Client(handler).GetLatestAsync(Session(),
                 new GetLatestRequest { Root = CadDocumentLookup.ByNumber("ASM-9"), WorkspaceRoot = _root }));
 
-        Assert.False(Directory.Exists(Path.Combine(_root, ".arch")));
+        Assert.False(File.Exists(Path.Combine(_root, WorkspaceManifest.RelativeManifestPath)));
         Assert.Empty(Directory.GetFiles(_root));
         Assert.DoesNotContain(handler.Requests, r => r.RequestUri!.AbsolutePath.StartsWith("/api/file-versions/"));
     }

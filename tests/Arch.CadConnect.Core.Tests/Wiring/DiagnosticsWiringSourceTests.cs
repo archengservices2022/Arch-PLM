@@ -93,7 +93,7 @@ public class DiagnosticsWiringSourceTests
 
         foreach (var signature in new[]
         {
-            "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, ArchServerUri? server)",
+            "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, IArchSession? session)",
             "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, Action rememberSettingsWhenAllowed)",
         })
         {
@@ -112,7 +112,7 @@ public class DiagnosticsWiringSourceTests
         Assert.Matches(new Regex(@"RefusalDiagnostics\.Command\(_diagnostics, commandName, Core\.Diagnostics\.RefusalDiagnostics\.NotSignedIn\);\s*Error\("), body);
         Assert.Matches(new Regex(@"RefusalDiagnostics\.Command\(_diagnostics, commandName, Core\.Diagnostics\.RefusalDiagnostics\.AlreadyRunning\);\s*Error\("), body);
 
-        var lastGuard = body.LastIndexOf("EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server)", StringComparison.Ordinal);
+        var lastGuard = body.LastIndexOf("EnsureWorkspaceServer(destinationRoot, commandName, boundSession)", StringComparison.Ordinal);
         var start = At(body, "CopyDesignDiagnostics.Start(", "start");
         var orchestrator = At(body, "new Core.CopyDesign.Apply.CopyDesignApplyOrchestrator(", "orchestrator");
         var progress = At(body, "progress: Core.Diagnostics.CopyDesignDiagnostics.Progress(log));", "progress");

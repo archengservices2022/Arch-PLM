@@ -121,6 +121,68 @@ public class WorkspaceLockAcquirerTests
     }
 
     [Fact]
+    public void An_interruption_between_planning_and_acquisition_releases_every_lock_and_refuses()
+    {
+        var fs = new FakeLockPathSystem().Workspace(@"D:\WS").File(@"D:\WS\a.ipt");
+        var factory = new FakeLockHandleFactory();
+        factory.OnAcquired = () => fs.Manifests[@"D:\WS"] = WorkspaceBindingSnapshot.RecoveryRequired;
+
+        var acquisition = new WorkspaceLockAcquirer(fs, factory).TryAcquire(WorkspaceLockRequest.ForDocument("Checkout", @"D:\WS\a.ipt"));
+
+        Assert.False(acquisition.Acquired);
+        Assert.Equal(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, acquisition.Refusal!.ErrorCode);
+        Assert.Equal(factory.Calls, factory.Released);
+    }
+
+    [Fact]
+    public void A_workspace_already_interrupted_at_planning_takes_no_lock_at_all()
+    {
+        var fs = new FakeLockPathSystem().Workspace(@"D:\WS").File(@"D:\WS\a.ipt");
+        fs.Manifests[@"D:\WS"] = WorkspaceBindingSnapshot.RecoveryRequired;
+        var factory = new FakeLockHandleFactory();
+
+        var acquisition = new WorkspaceLockAcquirer(fs, factory).TryAcquire(WorkspaceLockRequest.ForDocument("Checkout", @"D:\WS\a.ipt"));
+
+        Assert.Equal(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, acquisition.Refusal!.ErrorCode);
+        Assert.Empty(factory.Calls);
+    }
+
+    [Fact]
+    public void An_interrupted_destination_workspace_refuses_Copy_Design_before_any_lock()
+    {
+        var (fs, request) = CopyDesignScenario();
+        fs.Manifests[@"D:\DestWS"] = WorkspaceBindingSnapshot.RecoveryRequired;
+        var factory = new FakeLockHandleFactory();
+
+        var acquisition = new WorkspaceLockAcquirer(fs, factory).TryAcquire(request);
+
+        Assert.Equal(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, acquisition.Refusal!.ErrorCode);
+        Assert.Empty(factory.Calls);
+    }
+
+    [Fact]
+    public void An_interrupted_source_workspace_refuses_Copy_Design_before_any_lock()
+    {
+        var (fs, request) = CopyDesignScenario();
+        fs.Manifests[@"D:\Src"] = WorkspaceBindingSnapshot.RecoveryRequired;
+        var factory = new FakeLockHandleFactory();
+
+        var acquisition = new WorkspaceLockAcquirer(fs, factory).TryAcquire(request);
+
+        Assert.Equal(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, acquisition.Refusal!.ErrorCode);
+        Assert.Empty(factory.Calls);
+    }
+
+    [Fact]
+    public void The_recovery_refusal_says_what_it_needs_and_that_nothing_happened()
+    {
+        var message = WorkspaceLockMessages.Describe(new WorkspaceLockRefusal(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, Path: @"D:\WS"));
+
+        Assert.Contains("manual recovery", message);
+        Assert.Contains("Nothing was sent to the server", message);
+    }
+
+    [Fact]
     public void A_planning_refusal_takes_no_lock_at_all()
     {
         var fs = new FakeLockPathSystem().File(@"D:\loose\a.ipt");

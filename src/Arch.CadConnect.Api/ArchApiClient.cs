@@ -26,7 +26,11 @@ public sealed class ArchApiClientOptions
     /// <summary>P4C: lets the Inventor layer supply an
     ///  <see cref="Core.Documents.IEditorDocumentProbe"/> so Undo Checkout can
     ///  refuse when the managed file is open in Inventor. Null (the default) =
-    ///  the filesystem exclusive-open probe only.</summary>
+    ///  the filesystem exclusive-open probe only. P6 M4.4 Package C: Get Latest
+    ///  needs more - it changes a stale checkout's file only when this also
+    ///  implements <see cref="Core.Documents.IEditorDocumentStateProbe"/> and
+    ///  answers "closed". Null or a plain probe blocks those entries; a host
+    ///  with no editor passes <see cref="Core.Documents.NoEditorProbe"/>.</summary>
     public Core.Documents.IEditorDocumentProbe? EditorProbe { get; init; }
 }
 
@@ -157,6 +161,9 @@ public sealed class ArchApiClient : IArchApi
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(request);
+        // R10 correction (MAJOR 1): this client's server, with this session's
+        // credentials - refused before anything is built or touched.
+        GetLatestOrchestrator.RequireSameServer(Server, session);
 
         // The orchestrator wires resolve + plan fetch + verified downloads +
         // materialize + manifest. Its plan client / downloader reuse THIS
@@ -165,7 +172,9 @@ public sealed class ArchApiClient : IArchApi
             Server,
             resolve: (s, lu, c) => ResolveCadDocumentAsync(s, lu, c),
             planClientFactory: s => new WorkspacePlanClient(Server, s, _http, _options.Timeout),
-            downloaderFactory: s => new HttpContentDownloader(Server, s, _http));
+            downloaderFactory: s => new HttpContentDownloader(Server, s, _http),
+            materializer: new WorkspaceMaterializer(_options.EditorProbe as Core.Documents.IEditorDocumentStateProbe),
+            checkoutStatus: (s, id, c) => new CheckoutHttpClient(Server, s, _http, _options.Timeout).GetStatusStrictAsync(id, c));
         return orchestrator.RunAsync(session, request, ct);
     }
 
@@ -175,6 +184,7 @@ public sealed class ArchApiClient : IArchApi
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(file);
+        RequireWorkspace(session, file);
         return Orchestrator(session).CheckoutAsync(file.WorkspaceRoot, file.AbsoluteFilePath, ct);
     }
 
@@ -182,6 +192,7 @@ public sealed class ArchApiClient : IArchApi
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(file);
+        RequireWorkspace(session, file);
         return Orchestrator(session).CheckInAsync(file.WorkspaceRoot, file.AbsoluteFilePath, ct);
     }
 
@@ -189,7 +200,20 @@ public sealed class ArchApiClient : IArchApi
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(file);
+        RequireWorkspace(session, file);
         return Orchestrator(session).UndoAsync(file.WorkspaceRoot, file.AbsoluteFilePath, reason, ct);
+    }
+
+    /// <summary>P6 M4.4 Package C: the same refusal the connection manager gives,
+    ///  for anyone calling this client directly: never a request for a workspace
+    ///  that needs recovery or belongs to another server or organization.</summary>
+    private static void RequireWorkspace(IArchSession session, ManagedFileRef file)
+    {
+        var binding = WorkspaceServerBinding.CheckWorkspace(file.WorkspaceRoot, session.Server, session.Identity.OrganizationId);
+        if (!binding.Allowed)
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest, binding.Message);
+        }
     }
 
     // ---- Copy Design apply / materialization (P6C) ---------------------

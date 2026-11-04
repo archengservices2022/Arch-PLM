@@ -59,11 +59,11 @@ public class ServerOriginGuardWiringSourceTests
         // overload takes an explicit (bound) server and does the work.
         Assert.Contains(
             "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName) =>\r\n"
-            + "        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession?.Server);",
+            + "        EnsureWorkspaceServer(workspaceRoot, commandName, _connection.CurrentSession);",
             source.Replace("\r\n", "\n").Replace("\n", "\r\n"));
-        var body = Body(source, "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, ArchServerUri? server)");
+        var body = Body(source, "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, IArchSession? session)");
 
-        Assert.Contains("WorkspaceServerBinding.CheckWorkspace(workspaceRoot, server)", body);
+        Assert.Contains("WorkspaceServerBinding.CheckWorkspace(workspaceRoot, session?.Server, session?.Identity.OrganizationId)", body);
         Assert.Contains("Error(", body);
         Assert.Contains("return false;", body);
     }
@@ -162,7 +162,7 @@ public class ServerOriginGuardWiringSourceTests
         var refusal = body.IndexOf("if (!target.Allowed)", StringComparison.Ordinal);
         Assert.True(admit >= 0 && refusal > admit);
         Assert.Contains(
-            "rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save());",
+            "rememberWorkspaceRoot: folder => (ConnectSettings.Load() with { LastWorkspaceRoot = folder }).Save(),",
             body[admit..refusal]);
         Assert.Single(Regex.Matches(body, @"\.Save\(\)"));
         Assert.DoesNotContain("WorkspaceServerBinding.CheckGetLatestTarget(", body);
@@ -211,7 +211,7 @@ public class ServerOriginGuardWiringSourceTests
             "private bool EnsureWorkspaceServer(string? workspaceRoot, string commandName, Action rememberSettingsWhenAllowed)");
 
         Assert.Contains("WorkspaceServerBinding.AdmitWorkspace(", body);
-        Assert.Contains("workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed)", body);
+        Assert.Contains("workspaceRoot, _connection.CurrentSession?.Server, rememberSettingsWhenAllowed, _connection.CurrentSession?.Identity.OrganizationId)", body);
         Assert.Single(Regex.Matches(body, "rememberSettingsWhenAllowed"));  // passed on, never invoked directly here
         Assert.Contains("return false;", body);
     }
@@ -268,7 +268,7 @@ public class ServerOriginGuardWiringSourceTests
                 new Regex($@"public Task<Workspace\.\w+> {method}\(ManagedFileRef file[^)]*\)\s*=> WithSessionAsync\(\(api, s\) => \{{ RequireWorkspaceServer\(file, s\); return api\.{method}\("),
                 source);
         }
-        Assert.Contains("CheckGetLatestTarget(request.WorkspaceRoot, session.Server)", source);
-        Assert.Contains("CheckWorkspace(WorkspaceRootOf(manifest), session.Server)", source);
+        Assert.Contains("CheckGetLatestTarget(request.WorkspaceRoot, session.Server, session.Identity.OrganizationId)", source);
+        Assert.Contains("CheckWorkspace(WorkspaceRootOf(manifest), session.Server, session.Identity.OrganizationId)", source);
     }
 }

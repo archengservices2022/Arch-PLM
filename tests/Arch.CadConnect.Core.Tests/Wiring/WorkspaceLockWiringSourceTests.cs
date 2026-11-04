@@ -114,7 +114,7 @@ public class WorkspaceLockWiringSourceTests
         Assert.DoesNotContain("RunBackground(", body.Replace("RunLockedInBackground(", ""));
 
         var recheck = Body(Controller(), "private bool GetLatestTargetAllowed(string workspaceRoot)");
-        Assert.Contains("WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server)", recheck);
+        Assert.Contains("WorkspaceServerBinding.CheckGetLatestTarget(workspaceRoot, _connection.CurrentSession?.Server, _connection.CurrentSession?.Identity.OrganizationId)", recheck);
         Assert.DoesNotContain("Save()", recheck);
         Assert.Contains("RefusalDiagnostics.WorkspaceOrigin(_diagnostics, \"Get Latest\", target);", recheck);
     }
@@ -148,8 +148,8 @@ public class WorkspaceLockWiringSourceTests
 
         // the origin checks cover the source workspace and every destination workspace, bound to the attempt's session
         var checks = Body(body, "bool OriginChecksPass()");
-        Assert.Contains("EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession.Server)", checks);
-        Assert.Contains("EnsureWorkspaceServer(destinationRoot, commandName, boundSession.Server)", checks);
+        Assert.Contains("EnsureWorkspaceServer(WorkspaceRootLocator.FindRootForFile(plan.RootAbsolutePath), commandName, boundSession)", checks);
+        Assert.Contains("EnsureWorkspaceServer(destinationRoot, commandName, boundSession)", checks);
         Assert.DoesNotContain("RunBackground(", body.Replace("RunLockedInBackground(", ""));
     }
 

@@ -9,7 +9,7 @@ using Arch.CadConnect.Core.Workspace;
 
 namespace Arch.CadConnect.Api.Tests;
 
-public class ArchConnectionManagerTests
+public partial class ArchConnectionManagerTests
 {
     private sealed class FakeApi : IArchApi
     {

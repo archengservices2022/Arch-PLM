@@ -260,8 +260,14 @@ public sealed class WorkspaceLockPlanner(ILockPathSystem paths)
     private LockTarget WorkspaceTarget(string root, LockMode mode)
     {
         var resolved = RequireLocal(paths.Resolve(root));
-        return new LockTarget(LockScope.Workspace, mode, resolved.Canonical, resolved.Canonical,
-            IdentityOf(resolved, paths.ReadBinding(resolved.Canonical)));
+        var binding = paths.ReadBinding(resolved.Canonical);
+        if (binding.IsRecoveryRequired)
+        {
+            // Here, the one place every workspace target passes through: planning
+            // takes no lock, and revalidation plans again under the locks.
+            throw Refuse(WorkspaceLockErrorCodes.WorkspaceRecoveryRequired, resolved);
+        }
+        return new LockTarget(LockScope.Workspace, mode, resolved.Canonical, resolved.Canonical, IdentityOf(resolved, binding));
     }
 
     private static LockIdentity IdentityOf(ResolvedPath resolved, WorkspaceBindingSnapshot? binding) =>

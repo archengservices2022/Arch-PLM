@@ -139,7 +139,7 @@ public static class WorkspaceFileLock
     private const int SharingViolation = unchecked((int)0x80070020);
     private const int LockViolation = unchecked((int)0x80070021);
 
-    public static string LockFilePath(string root) => Path.Combine(root, ".arch", "locks", LockFileName);
+    public static string LockFilePath(string root) => LockPaths.WorkspaceLockFile(root);
 
     public static LockHandleResult Acquire(string canonicalRoot, LockMode mode, WorkspaceLockHolderRecord holder)
     {
@@ -281,9 +281,22 @@ public static class WorkspaceFileLock
         }
     }
 
-    private sealed class Handle(FileStream stream) : IDisposable
+    private sealed class Handle(FileStream stream) : IDisposable, IHeldWorkspaceLockFile
     {
         public void Dispose() => stream.Dispose();
+
+        /// <summary>P6 M4.4 Package C: asked of this very handle, never reopened.</summary>
+        public string? FinalPath()
+        {
+            try
+            {
+                return WindowsFileNative.TryQuery(stream.SafeFileHandle, out var finalPath, out _) ? finalPath : null;
+            }
+            catch (ObjectDisposedException)
+            {
+                return null;
+            }
+        }
     }
 }
 

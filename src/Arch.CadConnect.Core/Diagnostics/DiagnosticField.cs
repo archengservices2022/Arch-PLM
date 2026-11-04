@@ -108,6 +108,8 @@ public static class DiagnosticFieldAllowList
         ["alreadyCurrent"] = DiagnosticFieldKind.Number,
         ["blocked"] = DiagnosticFieldKind.Number,
         ["failed"] = DiagnosticFieldKind.Number,
+        ["retainedRecoveryCopies"] = DiagnosticFieldKind.Number,
+        ["retainedManifestArtifacts"] = DiagnosticFieldKind.Number,
         ["removed"] = DiagnosticFieldKind.Number,
         ["durationMs"] = DiagnosticFieldKind.Number,
         ["lockCount"] = DiagnosticFieldKind.Number,

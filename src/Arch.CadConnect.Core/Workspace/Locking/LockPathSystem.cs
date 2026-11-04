@@ -39,7 +39,8 @@ public interface ILockPathSystem
     ResolvedPath Resolve(string path);
 
     /// <summary>Whether <paramref name="directory"/> holds
-    ///  <c>.arch\workspace.json</c> - the only workspace marker.</summary>
+    ///  <c>.arch\workspace.json</c> - the only workspace marker - or an
+    ///  interrupted one, which is still that workspace.</summary>
     bool HasManifest(string directory);
 
     WorkspaceBindingSnapshot ReadBinding(string workspaceRoot);
@@ -66,6 +67,9 @@ public static class LockPaths
     public static string Key(string path) => Trim(path).ToUpperInvariant();
 
     public static string Trim(string path) => Path.TrimEndingDirectorySeparator(path);
+
+    /// <summary>Where a workspace's W lock file lives: <c>&lt;root&gt;\.arch\locks\workspace.lock</c>.</summary>
+    public static string WorkspaceLockFile(string root) => Path.Combine(root, ".arch", "locks", "workspace.lock");
 }
 
 /// <summary>The real <see cref="ILockPathSystem"/>: Win32 handle queries,
@@ -137,7 +141,7 @@ public sealed class WindowsLockPathSystem : ILockPathSystem
     {
         try
         {
-            return File.Exists(Path.Combine(directory, WorkspaceManifest.RelativeManifestPath));
+            return WorkspaceRecoveryState.Inspect(directory).Status != WorkspaceRecoveryStatus.New;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -147,6 +151,10 @@ public sealed class WindowsLockPathSystem : ILockPathSystem
 
     public WorkspaceBindingSnapshot ReadBinding(string workspaceRoot)
     {
+        if (WorkspaceRecoveryState.Inspect(workspaceRoot).IsRecoveryRequired)
+        {
+            return WorkspaceBindingSnapshot.RecoveryRequired;
+        }
         var path = Path.Combine(workspaceRoot, WorkspaceManifest.RelativeManifestPath);
         if (!File.Exists(path))
         {

@@ -20,6 +20,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Arch.CadConnect.Api\Arch.CadConnect.Api.csproj" />
+    <!-- P6 M4.4 Package C R10: the separate-process helper, built into this output folder -->
+    <ProjectReference Include="..\Arch.CadConnect.LockProbe\Arch.CadConnect.LockProbe.csproj" />
   </ItemGroup>
 
 </Project>

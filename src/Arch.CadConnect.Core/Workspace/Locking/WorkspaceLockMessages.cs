@@ -57,6 +57,15 @@ public static class WorkspaceLockMessages
                 $"A folder{at} changed while the command was starting (it was moved or replaced). Try again.",
             WorkspaceLockErrorCodes.WorkspaceChanged =>
                 $"The workspace{at} was changed by someone else while the command was starting (its workspace record was created, removed or re-bound). Try again.",
+            WorkspaceLockErrorCodes.WorkspaceRecoveryRequired =>
+                $"The workspace{at} needs manual recovery: an earlier save of its record did not finish cleanly, or its .arch folder could not be verified. "
+                + "Follow the workspace recovery procedure, or ask your Arch PLM administrator.",
+            // One code, three causes: the operation is not the one the lock was taken
+            // for, the command holding it has ended, or the locked folder could not
+            // be verified as the one that was locked (it may have been moved or replaced).
+            WorkspaceLockErrorCodes.LockScopeRefused =>
+                $"The workspace lock{at} could not be used: it was taken for a different operation, the command that held it has already ended, "
+                + "or the workspace folder could not be verified as the one that was locked (it may have been moved or replaced). Try the command again.",
             _ =>
                 $"The workspace lock{at} could not be used ({refusal.ErrorCode}).",
         };

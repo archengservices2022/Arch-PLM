@@ -88,7 +88,8 @@ public class GetLatestDocumentTypeResolveTests : IDisposable
         WorkspaceTestSession.Server,
         resolve: (s, lu, c) => GetLatestOrchestrator.ResolveViaHttpAsync(WorkspaceTestSession.Server, s, http, lu, TimeSpan.FromSeconds(5), c),
         planClientFactory: s => new WorkspacePlanClient(WorkspaceTestSession.Server, s, http, TimeSpan.FromSeconds(5)),
-        downloaderFactory: s => new HttpContentDownloader(WorkspaceTestSession.Server, s, http));
+        downloaderFactory: s => new HttpContentDownloader(WorkspaceTestSession.Server, s, http),
+        checkoutStatus: (_, _, _) => Task.FromResult(new ServerCheckoutStatus(ServerCheckoutState.Available)));
 
     // ---- exact HTTP query string, inspected on the wire ------------------
 

@@ -215,7 +215,7 @@ public sealed class ArchConnectionManager
 
         // P6 M4.1: a folder that already belongs to ANOTHER server is never
         // refreshed (and silently re-bound) from this one.
-        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckGetLatestTarget(request.WorkspaceRoot, session.Server));
+        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckGetLatestTarget(request.WorkspaceRoot, session.Server, session.Identity.OrganizationId));
 
         try
         {
@@ -636,7 +636,7 @@ public sealed class ArchConnectionManager
         // belongs to another one. "Not available" - exactly like no session -
         // makes the Copy Design planner fail closed.
         if (manifest is not null
-            && !Core.Workspace.WorkspaceServerBinding.CheckWorkspace(WorkspaceRootOf(manifest), session.Server).Allowed)
+            && !Core.Workspace.WorkspaceServerBinding.CheckWorkspace(WorkspaceRootOf(manifest), session.Server, session.Identity.OrganizationId).Allowed)
         {
             return AllNotAvailable(modelCadDocumentIds);
         }
@@ -676,7 +676,7 @@ public sealed class ArchConnectionManager
         [System.Runtime.CompilerServices.CallerMemberName] string command = "")
     {
         ArgumentNullException.ThrowIfNull(file);
-        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckWorkspace(file.WorkspaceRoot, session.Server), command);
+        RequireAllowed(Core.Workspace.WorkspaceServerBinding.CheckWorkspace(file.WorkspaceRoot, session.Server, session.Identity.OrganizationId), command);
     }
 
     /// <summary>A refusal is a plain, non-retryable request error - never an

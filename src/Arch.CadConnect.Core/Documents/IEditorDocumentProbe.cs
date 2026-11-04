@@ -15,11 +15,32 @@ public interface IEditorDocumentProbe
     bool IsOpenForEditing(string absoluteFilePath);
 }
 
+/// <summary>P6 M4.4 Package C: what a look at the editor could establish.</summary>
+public enum EditorDocumentState
+{
+    Closed,
+    Open,
+
+    /// <summary>The editor could not be read completely, so this is NOT proof
+    ///  the document is closed.</summary>
+    Unknown,
+}
+
+/// <summary>P6 M4.4 Package C: <see cref="IEditorDocumentProbe"/> for a caller
+///  that must tell "closed" from "could not tell". Get Latest changes a stale
+///  checkout's file only on <see cref="EditorDocumentState.Closed"/>; Undo
+///  Checkout keeps its own probe.</summary>
+public interface IEditorDocumentStateProbe
+{
+    EditorDocumentState GetDocumentState(string absoluteFilePath);
+}
+
 /// <summary>The default: assume nothing is open (non-Inventor contexts and
 ///  tests). The filesystem exclusive-open probe in
 ///  <c>ManagedFileGuard.CanReplaceInPlace</c> still guards the real case.</summary>
-public sealed class NoEditorProbe : IEditorDocumentProbe
+public sealed class NoEditorProbe : IEditorDocumentProbe, IEditorDocumentStateProbe
 {
     public static readonly NoEditorProbe Instance = new();
     public bool IsOpenForEditing(string absoluteFilePath) => false;
+    public EditorDocumentState GetDocumentState(string absoluteFilePath) => EditorDocumentState.Closed;
 }

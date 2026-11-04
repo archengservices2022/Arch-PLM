@@ -1,6 +1,12 @@
 using System.ComponentModel;
+using System.Diagnostics;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Text;
+using Arch.CadConnect.Api;
+using Arch.CadConnect.Core.Session;
+using Arch.CadConnect.Core.Workspace;
 using Arch.CadConnect.Core.Workspace.Locking;
 using Microsoft.Win32.SafeHandles;
 
@@ -25,6 +31,19 @@ namespace Arch.CadConnect.LockProbe;
 /// <item><c>doc &lt;file&gt;</c>, <c>getlatest &lt;root&gt;</c> - the whole stack
 ///  (planner + acquirer + real path system).</item>
 /// <item><c>read &lt;root&gt;</c> - prints the holder record, or <c>NONE</c>.</item>
+/// <item><c>manifest-save &lt;root&gt; &lt;step&gt;|none [&lt;file&gt; &lt;checkoutId&gt;]</c> -
+///  loads the manifest, adds that checkout to that entry if given, and saves it
+///  with the production code, TERMINATING this process, with no cleanup of any
+///  kind, on reaching that <see cref="ManifestSaveStep"/>.</item>
+/// <item><c>hang &lt;text&gt;</c> - prints that text, then never ends.</item>
+/// <item><c>self-doc &lt;file&gt;</c> - runs an operation through
+///  <see cref="WorkspaceCommandScope"/> with no command in scope, so it takes the
+///  lock itself and proves its root; prints <c>HELD &lt;proved roots&gt;</c> from
+///  inside the operation, then never ends.</item>
+/// <item><c>getlatest-status-hang &lt;root&gt; &lt;number&gt; &lt;resolve.json&gt; &lt;plan.json&gt;</c> -
+///  the production Get Latest (<see cref="ArchApiClient"/>) against a scripted
+///  server whose checkout status never answers; prints <c>ASKING</c> when a status
+///  request arrives, and never ends.</item>
 /// </list>
 /// </summary>
 internal static class Program
@@ -84,10 +103,103 @@ internal static class Program
             case "getlatest":
                 return HoldAcquisition(Acquirer().TryAcquire(WorkspaceLockRequest.ForGetLatest("probe", args[1])));
 
+            case "manifest-save":
+                return SaveManifest(args[1], args[2], args.Length > 4 ? args[3] : null, args.Length > 4 ? args[4] : null);
+
+            case "hang":
+                Console.WriteLine(args[1]);
+                Console.Out.Flush();
+                Thread.Sleep(Timeout.Infinite);
+                return 0;
+
+            case "self-doc":
+                return WorkspaceCommandScope.RunAsync(WorkspaceLockRequest.ForDocument("probe", args[1]), () => { }, () =>
+                {
+                    Console.WriteLine("HELD " + WorkspaceCommandScope.Current!.Lease.HeldRoots.Count);
+                    Console.Out.Flush();
+                    Thread.Sleep(Timeout.Infinite);
+                    return Task.FromResult(0);
+                }, refusal => new InvalidOperationException(refusal.ErrorCode)).GetAwaiter().GetResult();
+
+            case "getlatest-status-hang":
+                return GetLatestHangingOnStatus(args[1], args[2], args[3], args[4]).GetAwaiter().GetResult();
+
             default:
                 Console.WriteLine("ERROR unknown " + args[0]);
                 return 2;
         }
+    }
+
+    private static int SaveManifest(string root, string terminateAt, string? file, string? checkoutId)
+    {
+        var (manifest, _) = WorkspaceManifest.Load(root);
+        if (file is not null)
+        {
+            manifest.StageCheckedOut(file, new WorkspaceCheckoutBinding
+            {
+                CheckoutId = checkoutId!,
+                BaseFileVersionId = "fv_added",
+                BaseVersionNumber = 1,
+                BaseChecksum = new string('a', 64),
+                BaseFileSize = 1,
+                CheckedOutAtUtc = DateTimeOffset.UnixEpoch,
+            });
+        }
+        manifest.SaveIfUnchangedSinceLoad(atStep: step =>
+        {
+            if (step.ToString() == terminateAt)
+            {
+                Console.WriteLine("TERMINATING " + step);
+                Console.Out.Flush();
+                Process.GetCurrentProcess().Kill();
+                Thread.Sleep(Timeout.Infinite);
+            }
+        });
+        Console.WriteLine("SAVED");
+        return 0;
+    }
+
+    private static async Task<int> GetLatestHangingOnStatus(string root, string documentNumber, string resolveFile, string planFile)
+    {
+        var server = ArchServerUri.Parse("https://plm.example.com");
+        var session = new DesktopSession(
+            server,
+            new ArchIdentity("u1", "Probe User", "probe@orga.com", "ENGINEER", "org1", "ORGA", "Org A"),
+            "arch_dt_PROBETOKEN123456",
+            DateTimeOffset.UtcNow.AddHours(1),
+            DateTimeOffset.UtcNow);
+        var handler = new HangingStatusHandler(File.ReadAllText(resolveFile), File.ReadAllText(planFile));
+        var client = new ArchApiClient(server, new HttpClient(handler), new ArchApiClientOptions { Timeout = TimeSpan.FromMinutes(10) });
+        await client.GetLatestAsync(session, new GetLatestRequest { Root = CadDocumentLookup.ByNumber(documentNumber), WorkspaceRoot = root });
+        Console.WriteLine("FINISHED");
+        return 0;
+    }
+
+    /// <summary>Answers resolve and the plan; a checkout status request is never answered.</summary>
+    private sealed class HangingStatusHandler(string resolve, string plan) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/resolve", StringComparison.Ordinal))
+            {
+                return Json(resolve);
+            }
+            if (path.EndsWith("/workspace-plan", StringComparison.Ordinal))
+            {
+                return Json(plan);
+            }
+            if (path.EndsWith("/checkout", StringComparison.Ordinal) && request.Method == HttpMethod.Get)
+            {
+                Console.WriteLine("ASKING");
+                Console.Out.Flush();
+                await Task.Delay(Timeout.Infinite, CancellationToken.None);
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{\"error\":\"no route\"}", Encoding.UTF8, "application/json") };
+        }
+
+        private static HttpResponseMessage Json(string body) =>
+            new(HttpStatusCode.OK) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
     }
 
     private static WorkspaceLockAcquirer Acquirer() =>

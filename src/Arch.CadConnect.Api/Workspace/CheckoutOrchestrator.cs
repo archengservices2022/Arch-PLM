@@ -1,7 +1,10 @@
 using Arch.CadConnect.Core.Documents;
+using Arch.CadConnect.Api.References;
 using Arch.CadConnect.Core.Files;
+using Arch.CadConnect.Core.References;
 using Arch.CadConnect.Core.Session;
 using Arch.CadConnect.Core.Workspace;
+using Arch.CadConnect.Core.Workspace.Locking;
 
 namespace Arch.CadConnect.Api.Workspace;
 
@@ -25,6 +28,12 @@ namespace Arch.CadConnect.Api.Workspace;
 /// Identity: the target is always an EXACT manifest-bound absolute path
 /// (<c>root + relativePath</c>). The entry's <c>cadDocumentId</c> is
 /// authoritative; a filename is never used as identity.
+///
+/// P6 M4.4 Package C: every command runs guarded and under the workspace lock
+/// whoever called it - see <see cref="Protected"/>. A checkout that cannot be
+/// honoured locally is reported, never released: the server's release acts on a
+/// document, not on an expected checkout, so nothing here ever calls it on its
+/// own initiative, and Undo only ever runs when a person asks for it.
 /// </summary>
 public sealed class CheckoutOrchestrator
 {
@@ -55,26 +64,113 @@ public sealed class CheckoutOrchestrator
     private CheckInClient CheckIn() => new(_server, _session, _http, TimeSpan.FromMinutes(10));
     private ManagedFileRestorer Restorer() => new(new HttpContentDownloader(_server, _session, _http));
 
+    /// <summary>
+    /// P6 M4.4 Package C: the one way into a command. The workspace must not need
+    /// recovery and must be bound to this server and organization, checked before
+    /// any lock, again under the lock, and on the very bytes loaded by
+    /// <see cref="ResolveManaged"/>, all before any request or local change. The
+    /// lock is borrowed if this runs inside a command, and taken here otherwise.
+    /// </summary>
+    private async Task<T> Protected<T>(string command, string workspaceRoot, string absoluteFilePath, Func<Task<T>> operation)
+    {
+        SafeWorkspacePath.RequireAbsoluteRoot(workspaceRoot);
+        if (string.IsNullOrWhiteSpace(absoluteFilePath) || !Path.IsPathFullyQualified(absoluteFilePath))
+        {
+            throw new NotManagedException();
+        }
+        return await WorkspaceCommandScope.RunAsync(
+            WorkspaceLockRequest.ForDocument(command, absoluteFilePath),
+            () => RequireBinding(workspaceRoot, absoluteFilePath),
+            operation,
+            refusal => new ArchApiException(ArchApiFailureKind.BadRequest, WorkspaceLockMessages.Describe(refusal))).ConfigureAwait(false);
+    }
+
+    private void RequireBinding(string workspaceRoot, string absoluteFilePath)
+    {
+        if (!string.Equals(_session.Server.OriginString, _server.OriginString, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest,
+                "Refusing to send this session's credentials to a different server. Nothing was sent or changed.");
+        }
+        var binding = WorkspaceServerBinding.CheckWorkspace(workspaceRoot, _server, _session.Identity.OrganizationId);
+        if (binding.Verdict == WorkspaceServerBindingVerdict.NoWorkspace)
+        {
+            throw new NotManagedException();
+        }
+        if (!binding.Allowed)
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest, binding.Message);
+        }
+        if (WorkspaceRootLocator.FindRootForFile(absoluteFilePath) is not { } root || !LockPaths.AreSame(root, Path.GetFullPath(workspaceRoot)))
+        {
+            throw new NotManagedException();
+        }
+    }
+
     // ================================================================
     // CHECKOUT
     // ================================================================
 
-    public async Task<CheckoutOperationResult> CheckoutAsync(
-        string workspaceRoot, string absoluteFilePath, CancellationToken ct = default)
+    public Task<CheckoutOperationResult> CheckoutAsync(
+        string workspaceRoot, string absoluteFilePath, CancellationToken ct = default) =>
+        Protected("Checkout", workspaceRoot, absoluteFilePath, () => RunCheckoutAsync(workspaceRoot, absoluteFilePath, ct));
+
+    private async Task<CheckoutOperationResult> RunCheckoutAsync(
+        string workspaceRoot, string absoluteFilePath, CancellationToken ct)
     {
         var (manifest, entry) = ResolveManaged(workspaceRoot, absoluteFilePath);
 
-        if (entry.State != WorkspaceManifestEntryState.Verified)
+        if (entry.State != WorkspaceManifestEntryState.Verified || !HasValidBaseMetadata(entry))
         {
             throw new NotVerifiedException();
         }
 
-        // server first (throws CheckoutConflictException / ArchApiException) --
-        var result = await Checkout().RequestCheckoutAsync(entry.CadDocumentId, ct).ConfigureAwait(false);
+        // P6 M4.4 Package C: read before writing, so a checkout this workspace
+        // cannot honour is never taken. A failure here took nothing.
+        var client = Checkout();
+        var status = await client.GetStatusStrictAsync(entry.CadDocumentId, ct).ConfigureAwait(false);
+        switch (status.State)
+        {
+            case ServerCheckoutState.Locked:
+                throw new CheckoutConflictException(status.HolderName, status.HolderEmail);
+
+            case ServerCheckoutState.Mine:
+                if (!IsBaseOf(entry, status.BaseFileVersionId, status.BaseVersionNumber))
+                {
+                    return Held(entry, status.BaseFileVersionId!, status.BaseVersionNumber);
+                }
+                break;
+
+            default:
+                await RequireLatestAsync(entry, ct).ConfigureAwait(false);
+                break;
+        }
+
+        // server first (throws CheckoutConflictException / ArchApiException). The
+        // POST is what authorizes this user NOW, even for a checkout that exists:
+        // the status read above checks no role, and the local session's is
+        // display-only. It changes nothing on the server for an existing checkout.
+        var result = await PostCheckoutAsync(client, entry, ct).ConfigureAwait(false);
+
+        // Nothing is written that does not describe this exact checkout on this
+        // exact base: the entry's checksum and size belong to the entry's version.
+        var held = status.State == ServerCheckoutState.Mine;
+        var confirmed = IsBaseOf(entry, result.BaseFileVersionId, result.BaseVersionNumber)
+            && (!held || (result.Kind == CheckoutOutcome.AlreadyMine
+                && string.Equals(result.CheckoutId, status.CheckoutId, StringComparison.Ordinal)
+                && string.Equals(result.BaseFileVersionId, status.BaseFileVersionId, StringComparison.Ordinal)
+                && result.BaseVersionNumber == status.BaseVersionNumber
+                && result.CheckedOutAt == status.CheckedOutAt));
+        if (!confirmed)
+        {
+            return Held(entry, result.BaseFileVersionId, result.BaseVersionNumber);
+        }
 
         // then local: record the exact base binding, then make writable. The
         // manifest write is OBSERVABLE - a failure -> ReconcileNeeded, never a
         // false success. The server checkout stays authoritative regardless.
+        // The base checksum and size come from the validated entry only, never
+        // from the file, which may hold edits.
         var binding = new WorkspaceCheckoutBinding
         {
             CheckoutId = result.CheckoutId,
@@ -82,17 +178,23 @@ public sealed class CheckoutOrchestrator
             BaseVersionNumber = result.BaseVersionNumber,
             BaseChecksum = entry.Checksum,
             BaseFileSize = entry.FileSize,
-            CheckedOutAtUtc = _clock(),
+            // R10 correction (MINOR 2): the server's own validated instant, for a
+            // new checkout too - never this machine's clock.
+            CheckedOutAtUtc = result.CheckedOutAt,
         };
         var manifestUpdated = TrySave(() => manifest.MarkCheckedOut(absoluteFilePath, binding));
-        var madeWritable = ManagedFileGuard.SetWritable(absoluteFilePath);
+
+        // R10 correction (MINOR 3): a file regains write access only once its
+        // record is safe. A failed save leaves its attributes exactly as they were,
+        // read-only or not, and releases nothing on the server.
+        var madeWritable = manifestUpdated && ManagedFileGuard.SetWritable(absoluteFilePath);
 
         var reconcileNeeded = !manifestUpdated || !madeWritable;
         var message = reconcileNeeded
             ? "Checkout is HELD on the server, but the local file could not be fully updated"
               + (!manifestUpdated ? " (workspace record not saved)" : "")
               + (!madeWritable ? " (could not clear read-only)" : "")
-              + ". Close and reopen the file, or run Get Latest, to reconcile."
+              + ". Close anything using this file and run Checkout again to reconcile."
             : result.Kind == CheckoutOutcome.AlreadyMine
                 ? "You already hold this checkout. The local file is editable."
                 : "Checked out. The local file is now editable.";
@@ -103,14 +205,96 @@ public sealed class CheckoutOrchestrator
             ReconcileNeeded: reconcileNeeded, Message: message);
     }
 
+    /// <summary>A POST that may have taken effect is reported as exactly that: the
+    ///  next Checkout asks the server first, so running it again is always safe.</summary>
+    private static async Task<CheckoutResult> PostCheckoutAsync(CheckoutHttpClient client, WorkspaceManifestEntry entry, CancellationToken ct)
+    {
+        try
+        {
+            return await client.RequestCheckoutAsync(entry.CadDocumentId, ct).ConfigureAwait(false);
+        }
+        catch (ArchApiException ex) when (ex.Kind is ArchApiFailureKind.Network or ArchApiFailureKind.Timeout or ArchApiFailureKind.Server)
+        {
+            throw new ArchApiException(ex.Kind,
+                "The server's answer to Checkout was lost or could not be read, so this file may or may not be checked out to you. "
+                + "Nothing was changed locally. Run Checkout again: it asks the server first.", inner: ex);
+        }
+    }
+
+    /// <summary>A workspace behind the server would lock a version it does not
+    ///  hold, so that is refused before anything is taken. Refusing narrows the
+    ///  window; the POST's answer is what closes it.</summary>
+    private async Task RequireLatestAsync(WorkspaceManifestEntry entry, CancellationToken ct)
+    {
+        var lookup = await new HttpLatestVersionProbe(_server, _http, _timeout)
+            .LookupAsync(_session, [entry.CadDocumentId], ct).ConfigureAwait(false);
+        var answer = lookup.Get(entry.CadDocumentId);
+        if (answer.Outcome != LatestVersionOutcome.Found || answer.Version is not { HasCanonicalIntegrity: true } latest)
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest,
+                "Could not confirm the latest version of this document, so it was not checked out. Nothing was changed. Try again.");
+        }
+        if (!string.Equals(latest.LatestFileVersionId, entry.FileVersionId, StringComparison.Ordinal)
+            || latest.VersionNumber != entry.VersionNumber
+            || !string.Equals(latest.Sha256, entry.Checksum, StringComparison.Ordinal)
+            || latest.FileSize != entry.FileSize)
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest,
+                "This workspace does not hold the latest version of this document, so it was not checked out. Nothing was changed. Run Get Latest first.");
+        }
+    }
+
+    private static bool IsBaseOf(WorkspaceManifestEntry entry, string? baseFileVersionId, int baseVersionNumber) =>
+        string.Equals(baseFileVersionId, entry.FileVersionId, StringComparison.Ordinal)
+        && baseVersionNumber == entry.VersionNumber;
+
+    private static bool HasValidBaseMetadata(WorkspaceManifestEntry entry) =>
+        WorkspaceManifest.IsWellFormedId(entry.CadDocumentId)
+        && WorkspaceManifest.IsWellFormedId(entry.FileVersionId)
+        && entry.VersionNumber > 0
+        && FileVersionIntegrity.IsCanonicalSha256(entry.Checksum)
+        && entry.FileSize > 0;
+
+    /// <summary>R10 correction (MINOR 1): Check In and Undo act on a marker only when
+    ///  every field Checkout writes is there and well formed.</summary>
+    private static bool IsCompleteMarker(WorkspaceCheckoutBinding marker) =>
+        WorkspaceManifest.IsWellFormedId(marker.CheckoutId)
+        && WorkspaceManifest.IsWellFormedId(marker.BaseFileVersionId)
+        && marker.BaseVersionNumber > 0
+        && FileVersionIntegrity.IsCanonicalSha256(marker.BaseChecksum)
+        && marker.BaseFileSize > 0
+        && marker.CheckedOutAtUtc != default;
+
+    /// <summary>The server holds a checkout this workspace cannot record: no marker
+    ///  and no attribute change, and it is not released from here.</summary>
+    private static CheckoutOperationResult Held(WorkspaceManifestEntry entry, string baseFileVersionId, int baseVersionNumber) => new(
+        entry.CadDocumentId, baseFileVersionId, baseVersionNumber,
+        MadeWritable: false, ManifestUpdated: false, ReconcileNeeded: true,
+        Message: "This document is checked out to you on the server, but not on the version this workspace holds, so nothing was changed locally. "
+            + "Copy any edits you need to a safe place and ask your Arch PLM administrator to reconcile this checkout.");
+
     // ================================================================
     // CHECK IN
     // ================================================================
 
-    public async Task<CheckInOperationResult> CheckInAsync(
-        string workspaceRoot, string absoluteFilePath, CancellationToken ct = default)
+    public Task<CheckInOperationResult> CheckInAsync(
+        string workspaceRoot, string absoluteFilePath, CancellationToken ct = default) =>
+        Protected("Check In", workspaceRoot, absoluteFilePath, () => RunCheckInAsync(workspaceRoot, absoluteFilePath, ct));
+
+    private async Task<CheckInOperationResult> RunCheckInAsync(
+        string workspaceRoot, string absoluteFilePath, CancellationToken ct)
     {
         var (manifest, entry) = ResolveManaged(workspaceRoot, absoluteFilePath);
+
+        // P6 M4.4 Package C: a check-in creates an immutable version, and only the
+        // marker ties these bytes to the base they were edited from. The server
+        // saying "mine" does not.
+        if (entry.Checkout is not { } marker || !IsCompleteMarker(marker))
+        {
+            throw new NotCheckedOutLocallyException(
+                "This workspace has no complete record of a checkout of this file, so nothing was uploaded. "
+                + "Your file was not changed. Run Checkout again to restore the record, then Check In.");
+        }
 
         // AUTHORITATIVE gate: the local marker alone does not authorize an
         // upload. Throws CheckoutConflictException (locked by other) /
@@ -180,20 +364,24 @@ public sealed class CheckoutOrchestrator
     //                 replace -> read-only -> manifest)
     // ================================================================
 
-    public async Task<UndoOperationResult> UndoAsync(
-        string workspaceRoot, string absoluteFilePath, string? reason, CancellationToken ct = default)
+    public Task<UndoOperationResult> UndoAsync(
+        string workspaceRoot, string absoluteFilePath, string? reason, CancellationToken ct = default) =>
+        Protected("Undo Checkout", workspaceRoot, absoluteFilePath, () => RunUndoAsync(workspaceRoot, absoluteFilePath, reason, ct));
+
+    private async Task<UndoOperationResult> RunUndoAsync(
+        string workspaceRoot, string absoluteFilePath, string? reason, CancellationToken ct)
     {
         // (1) resolve the exact manifest target.
         var (manifest, entry) = ResolveManaged(workspaceRoot, absoluteFilePath);
 
         var binding = entry.Checkout
             ?? throw new NotCheckedOutLocallyException(
-                "This file is not marked as checked out by you. Nothing to undo. Run Get Latest to restore it.");
-        if (string.IsNullOrEmpty(binding.BaseFileVersionId)
-            || string.IsNullOrEmpty(binding.BaseChecksum) || binding.BaseFileSize <= 0)
+                "This workspace has no record of a checkout of this file, so nothing was released. If it is checked out to you, "
+                + "run Checkout again to restore the record, then Undo Checkout. Otherwise run Get Latest to restore it.");
+        if (!IsCompleteMarker(binding))
         {
             throw new NotCheckedOutLocallyException(
-                "The local checkout record is incomplete. Run Get Latest to restore this file.");
+                "The local checkout record is incomplete, so nothing was released. Run Checkout again to restore it.");
         }
 
         // (2) the exact manifest-bound target must still exist as a regular
@@ -316,7 +504,18 @@ public sealed class CheckoutOrchestrator
         {
             throw new NotManagedException();
         }
-        var manifest = WorkspaceManifest.LoadOrEmpty(workspaceRoot);
+        var (manifest, status) = WorkspaceManifest.Load(workspaceRoot);
+        if (status == WorkspaceManifestLoadStatus.Missing)
+        {
+            throw new NotManagedException();
+        }
+        var binding = status == WorkspaceManifestLoadStatus.Loaded
+            ? WorkspaceServerBinding.Evaluate(manifest.ServerOrigin, _server, workspaceRoot, manifest.OrganizationId, _session.Identity.OrganizationId)
+            : WorkspaceServerBinding.CheckWorkspace(workspaceRoot, _server, _session.Identity.OrganizationId);
+        if (status != WorkspaceManifestLoadStatus.Loaded || !binding.Allowed)
+        {
+            throw new ArchApiException(ArchApiFailureKind.BadRequest, binding.Message);
+        }
         var entry = manifest.FindByAbsolutePath(absoluteFilePath)
             ?? throw new NotManagedException();
         return (manifest, entry);
@@ -330,7 +529,9 @@ public sealed class CheckoutOrchestrator
     private async Task<ServerCheckoutStatus> RequireMineAsync(
         WorkspaceManifest manifest, WorkspaceManifestEntry entry, string absoluteFilePath, CancellationToken ct)
     {
-        ServerCheckoutStatus status = await Checkout().GetStatusAsync(entry.CadDocumentId, ct).ConfigureAwait(false);
+        // P6 M4.4 Package C: strict, because a marker is reconciled on this answer.
+        // One that is malformed or contradicts itself throws here and proves nothing.
+        ServerCheckoutStatus status = await Checkout().GetStatusStrictAsync(entry.CadDocumentId, ct).ConfigureAwait(false);
 
         switch (status.State)
         {
