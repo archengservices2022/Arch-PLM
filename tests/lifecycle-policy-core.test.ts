@@ -254,3 +254,38 @@ test("D-A7 comment normalization: optional, trimmed, control characters stripped
   assert.throws(() => normalizeLifecycleComment("x".repeat(MAX_LIFECYCLE_COMMENT_LENGTH + 1)), InvalidLifecycleCommentError);
   assert.throws(() => normalizeLifecycleComment(42), InvalidLifecycleCommentError);
 });
+
+// ------------------------------------------------------------
+// Option A, O-2: LEGACY_LINEAGE_EXCLUDED
+// ------------------------------------------------------------
+
+test("O-2: a person in lineageExcludedIds is refused approve and release (APPROVER and ADMIN); others are not", () => {
+  const excluded = ["legacy-creator", "legacy-sub", "reval"];
+  for (const actorId of excluded) {
+    for (const role of [UserRole.APPROVER, UserRole.ADMIN]) {
+      assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId, actorRole: role, lineageExcludedIds: excluded }))), "LEGACY_LINEAGE_EXCLUDED", `${actorId} approve`);
+      assert.equal(
+        codeOf(evaluateLifecycleTransition(input({ actorId, actorRole: role, from: S.APPROVED, to: S.RELEASED, events: APPROVED_BY_APPR, lineageExcludedIds: excluded }))),
+        "LEGACY_LINEAGE_EXCLUDED",
+        `${actorId} release`,
+      );
+    }
+  }
+  assert.equal(evaluateLifecycleTransition(input({ actorId: "appr", lineageExcludedIds: excluded })).allowed, true);
+  assert.equal(evaluateLifecycleTransition(input({ actorId: "legacy-sub" })).allowed, true, "absent list = no lineage exclusion (ordinary revision)");
+});
+
+test("O-2: the lineage exclusion applies only to approve/release, not to submit, return, obsolete or undo-approval", () => {
+  const excluded = ["x"];
+  for (const [from, to] of [[S.WORKING, S.IN_REVIEW], [S.IN_REVIEW, S.WORKING], [S.WORKING, S.OBSOLETE], [S.APPROVED, S.WORKING]] as const) {
+    assert.equal(evaluateLifecycleTransition(input({ actorId: "x", from, to, events: APPROVED_BY_APPR, lineageExcludedIds: excluded })).allowed, true, `${from}->${to}`);
+  }
+});
+
+test("O-2 check order: role, hold, creator, submitter come first; LEGACY_LINEAGE_EXCLUDED before STATE_NOT_RECORDED", () => {
+  assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId: "x", actorRole: UserRole.ENGINEER, lineageExcludedIds: ["x"] }))), "ROLE_NOT_PERMITTED");
+  assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId: "x", legacyHold: true, lineageExcludedIds: ["x"] }))), "LEGACY_HISTORY_UNVERIFIED");
+  assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId: "creator", lineageExcludedIds: ["creator"] }))), "CREATOR_CANNOT_APPROVE");
+  assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId: "submitter", lineageExcludedIds: ["submitter"] }))), "SUBMITTER_CANNOT_APPROVE");
+  assert.equal(codeOf(evaluateLifecycleTransition(input({ actorId: "x", events: [], lineageExcludedIds: ["x"] }))), "LEGACY_LINEAGE_EXCLUDED");
+});

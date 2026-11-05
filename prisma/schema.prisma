@@ -50,6 +50,9 @@ enum LifecycleEventTrigger {
   // released in the same transaction (actor = the user who released the
   // successor).
   AUTOMATIC_SUPERSESSION
+  // Option A: a step in closing a held legacy revision (-> WORKING ->
+  // OBSOLETE) as part of revalidating it into a fresh successor revision.
+  LEGACY_REVALIDATION
 }
 
 // PDM: physical CAD document formats. Engineering revision lifecycle
@@ -133,6 +136,7 @@ model Organization {
   copyDesignOperationEntries CopyDesignOperationEntry[]
   lifecycleEvents            ItemRevisionLifecycleEvent[]
   legacyLifecycleHolds       ItemRevisionLegacyLifecycleHold[]
+  legacyRevalidations        ItemRevisionLegacyRevalidation[]
 }
 
 // ============================================================
@@ -185,6 +189,10 @@ model User {
   // Lifecycle transitions this user performed (B03) - see
   // ItemRevisionLifecycleEvent.
   lifecycleEventsActed ItemRevisionLifecycleEvent[] @relation("ItemRevisionLifecycleEventActor")
+
+  // Legacy revisions this user revalidated (Option A) - see
+  // ItemRevisionLegacyRevalidation.
+  legacyRevalidationsActed ItemRevisionLegacyRevalidation[] @relation("LegacyRevalidationActor")
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -334,6 +342,11 @@ model ItemRevision {
   // unverifiable) - see ItemRevisionLegacyLifecycleHold.
   legacyLifecycleHold ItemRevisionLegacyLifecycleHold?
 
+  // Option A: present on a legacy revision that was revalidated (closed) /
+  // on the successor revision it produced - see ItemRevisionLegacyRevalidation.
+  legacyRevalidationAsLegacy    ItemRevisionLegacyRevalidation? @relation("LegacyRevalidationLegacy")
+  legacyRevalidationAsSuccessor ItemRevisionLegacyRevalidation? @relation("LegacyRevalidationSuccessor")
+
   @@unique([organizationId, id])
   @@unique([itemId, revision])
   @@index([organizationId])
@@ -436,6 +449,56 @@ model ItemRevisionLegacyLifecycleHold {
 
   @@unique([organizationId, itemRevisionId])
   @@index([organizationId])
+}
+
+// ============================================================
+// Option A: legacy revalidation audit link (append-only).
+//
+// One row per held legacy revision that was revalidated: in ONE SERIALIZABLE
+// transaction the legacy revision was closed (-> OBSOLETE through recorded
+// LEGACY_REVALIDATION events; never approved or released; hold, creator and
+// history untouched) and a fresh WORKING successor revision was created with
+// the actor as its trusted creator. Written only by
+// revalidateLegacyRevisionForActor (app/lib/legacy-revalidation-db.ts).
+//
+// legacyRevisionId and successorRevisionId are each UNIQUE: at most one
+// successor per legacy revision (duplicate guard), and a successor belongs to
+// exactly one legacy revision. The row also drives Product Owner decision
+// O-2 (the legacy creator, post-B03 legacy submitters and this actor may not
+// approve or release the successor) and O-4 (releasing the successor
+// supersedes the legacy revision's RELEASED source). The required reason
+// (O-5) is stored in `comment`. Same append-only database triggers as the
+// B03 tables; all foreign keys organization-scoped and RESTRICT.
+// ============================================================
+model ItemRevisionLegacyRevalidation {
+  id String @id @default(cuid())
+
+  // Database-assigned order (same convention as ItemRevisionLifecycleEvent).
+  sequence BigInt @unique @default(autoincrement())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  legacyRevisionId String       @unique
+  legacyRevision   ItemRevision @relation("LegacyRevalidationLegacy", fields: [organizationId, legacyRevisionId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  successorRevisionId String       @unique
+  successorRevision   ItemRevision @relation("LegacyRevalidationSuccessor", fields: [organizationId, successorRevisionId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  // Who revalidated, and their role at that moment (re-read in the transaction).
+  actedById   String
+  actedBy     User     @relation("LegacyRevalidationActor", fields: [organizationId, actedById], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+  actedByRole UserRole
+
+  // Required reason (O-5): normalized, non-empty, at most 500 characters.
+  comment String
+
+  // Same instant as the closure events (application clock; informational).
+  occurredAt DateTime
+
+  @@unique([organizationId, legacyRevisionId])
+  @@unique([organizationId, successorRevisionId])
+  @@index([organizationId, actedById])
 }
 
 // ============================================================

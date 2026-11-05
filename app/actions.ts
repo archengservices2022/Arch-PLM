@@ -12,6 +12,11 @@ import { prisma } from "@/app/lib/prisma";
 import { assertCanMutate, requireActor } from "@/app/lib/authz";
 import { getStorageProvider } from "@/app/lib/storage";
 import { advanceRevisionForActor } from "@/app/lib/release-db";
+import { revalidateLegacyRevisionForActor } from "@/app/lib/legacy-revalidation-db";
+import {
+  CREATE_NEXT_FROM_HELD_MESSAGE,
+  isHeldNonTerminalSource,
+} from "@/app/lib/legacy-revalidation-core";
 import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
 import {
   canCreateSuccessorFrom,
@@ -335,11 +340,25 @@ export async function createEngineeringRevision(formData: FormData) {
         description: true,
         item: { select: { organizationId: true } },
         documentLinks: { select: { cadDocumentId: true } },
+        legacyLifecycleHold: { select: { itemRevisionId: true } },
       },
     });
 
     if (!source || source.item.organizationId !== actor.organizationId) {
       throw new Error("Source revision not found in your organization");
+    }
+
+    // Option A: a held, non-terminal legacy revision (in practice a held
+    // APPROVED one) may only be continued through "Revalidate as new
+    // revision", which closes it, records the reason and applies the O-2
+    // exclusions. Held RELEASED/SUPERSEDED/OBSOLETE sources are unaffected.
+    if (
+      isHeldNonTerminalSource({
+        lifecycle: source.lifecycle,
+        legacyHold: source.legacyLifecycleHold !== null,
+      })
+    ) {
+      throw new Error(CREATE_NEXT_FROM_HELD_MESSAGE);
     }
 
     // 9. Eligibility: only APPROVED / RELEASED sources.
@@ -439,6 +458,41 @@ export async function createEngineeringRevision(formData: FormData) {
       });
     }
   });
+
+  revalidatePath("/");
+}
+
+/**
+ * Option A: revalidate a held legacy revision into a fresh successor revision.
+ *
+ * Thin wrapper: every rule (eligibility, O-3 roles, closure, successor letter
+ * and Z limit, carry-forward, O-5 required reason, audit link, idempotency)
+ * is enforced inside `revalidateLegacyRevisionForActor`'s SERIALIZABLE
+ * transaction (app/lib/legacy-revalidation-db.ts). Carry-forward fields use
+ * the same names as "Create next revision".
+ */
+export async function revalidateLegacyRevision(formData: FormData) {
+  const actor = await requireActor();
+  assertCanMutate(actor);
+
+  const legacyRevisionId = requiredValue(formData, "legacyRevisionId");
+  const carryForward = optionalValue(formData, "carryForwardMode") ?? "all";
+  const selected: string[] = [];
+  for (const value of formData.getAll("carryForwardDocumentId")) {
+    if (typeof value === "string" && value.trim() !== "") selected.push(value.trim());
+  }
+
+  await revalidateLegacyRevisionForActor(
+    actor,
+    legacyRevisionId,
+    {
+      carryForward,
+      selectedCadDocumentIds: selected,
+      description: optionalValue(formData, "description") ?? null,
+      comment: formData.get("reason") ?? undefined,
+    },
+    prisma,
+  );
 
   revalidatePath("/");
 }

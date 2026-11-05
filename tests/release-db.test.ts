@@ -78,6 +78,8 @@ interface RevisionRow {
   createdById?: string | null;
   /** B03 (NO-GO finding 1): an ItemRevisionLegacyLifecycleHold row exists. */
   legacyHold?: boolean;
+  /** Option A: this revision is the successor of a revalidated legacy revision. */
+  revalidatedFrom?: { legacyRevisionId: string; actedById: string };
 }
 /** B03: the acting-user row re-read inside the transaction. */
 interface UserRow {
@@ -384,6 +386,19 @@ class FakeDatabase {
                     sourceRevisionId: row.sourceRevisionId,
                     createdById: row.createdById ?? null,
                     legacyLifecycleHold: row.legacyHold ? { itemRevisionId: row.id } : null,
+                    legacyRevalidationAsSuccessor: (() => {
+                      if (!row.revalidatedFrom) return null;
+                      const legacy = self.revisions.find((r) => r.id === row.revalidatedFrom!.legacyRevisionId)!;
+                      return {
+                        actedById: row.revalidatedFrom.actedById,
+                        legacyRevision: {
+                          id: legacy.id,
+                          itemId: legacy.itemId,
+                          createdById: legacy.createdById ?? null,
+                          sourceRevisionId: legacy.sourceRevisionId,
+                        },
+                      };
+                    })(),
                   }
                 : null;
             }) as unknown,
@@ -1798,4 +1813,138 @@ test("B03 D-A7: an over-long comment is refused before the transaction starts; n
   assert.equal(db.transactionAttempts, 0);
   assert.equal(db.events.length, 0);
   assert.equal(db.revisions[0]!.lifecycle, LifecycleState.WORKING);
+});
+
+// ============================================================
+// Option A (Product Owner decisions O-2 and O-4): approving / releasing the
+// SUCCESSOR of a revalidated legacy revision.
+// Fixture: item-1 has Rev B (pre-B03 RELEASED, the legacy revision's
+// source), legacy Rev C (closed OBSOLETE, created by "legacy-creator",
+// submitted after B03 by "legacy-sub", revalidated by "reval") and its
+// successor Rev D (created by "reval", submitted by "eng").
+// ============================================================
+
+function seedSuccessor(db: FakeDatabase, opts: { successorState?: string; legacyCreatorId?: string | null; legacyItemId?: string } = {}) {
+  db.addRevision({ organizationId: "orgA", id: "rev-B", itemId: opts.legacyItemId ?? "item-1", lifecycle: LifecycleState.RELEASED, sourceRevisionId: null, releasedAt: new Date(), createdById: "x", legacyHold: true });
+  db.addRevision({ organizationId: "orgA", id: "rev-C", itemId: opts.legacyItemId ?? "item-1", lifecycle: LifecycleState.OBSOLETE, sourceRevisionId: "rev-B", releasedAt: null, createdById: opts.legacyCreatorId === undefined ? "legacy-creator" : opts.legacyCreatorId, legacyHold: true });
+  // Legacy history after B03: one recorded submission and its return, then the revalidation closure.
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-C", fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "legacy-sub", occurredAt: seedTime(1) });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-C", fromState: LifecycleState.IN_REVIEW, toState: LifecycleState.WORKING, actedById: "reval", trigger: "LEGACY_REVALIDATION", occurredAt: seedTime(2) });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-C", fromState: LifecycleState.WORKING, toState: LifecycleState.OBSOLETE, actedById: "reval", trigger: "LEGACY_REVALIDATION", occurredAt: seedTime(2) });
+  db.addRevision({ organizationId: "orgA", id: "rev-D", itemId: "item-1", lifecycle: opts.successorState ?? LifecycleState.IN_REVIEW, sourceRevisionId: "rev-C", releasedAt: null, createdById: "reval", revalidatedFrom: { legacyRevisionId: "rev-C", actedById: "reval" } });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-D", fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "eng", actedByRole: "ENGINEER", occurredAt: seedTime(3) });
+  if ((opts.successorState ?? LifecycleState.IN_REVIEW) === LifecycleState.APPROVED) {
+    db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-D", fromState: LifecycleState.IN_REVIEW, toState: LifecycleState.APPROVED, actedById: "appr", occurredAt: seedTime(4) });
+  }
+  for (const [uid, role] of [["legacy-creator", "APPROVER"], ["legacy-sub", "ADMIN"], ["reval", "APPROVER"], ["eng", "ENGINEER"], ["appr", "APPROVER"], ["admin", "ADMIN"]] as const) {
+    db.addUser("orgA", uid, role);
+  }
+}
+
+test("Option A O-2: the legacy creator, a recorded legacy submitter and the revalidating person are each refused approve (LEGACY_LINEAGE_EXCLUDED / creator rule); nothing written", async () => {
+  for (const [who, role, code] of [
+    ["legacy-creator", "APPROVER", "LEGACY_LINEAGE_EXCLUDED"],
+    ["legacy-sub", "ADMIN", "LEGACY_LINEAGE_EXCLUDED"],
+    // The revalidating person is also the successor's creator: the existing creator rule reports first.
+    ["reval", "APPROVER", "CREATOR_CANNOT_APPROVE"],
+  ] as const) {
+    const db = new FakeDatabase();
+    seedSuccessor(db);
+    const before = snapshot(db);
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs(who, role), "rev-D", LifecycleState.APPROVED, db.db, db.provider),
+      code,
+    );
+    assert.deepEqual(snapshot(db), before, who);
+  }
+});
+
+test("Option A O-2: the revalidating person is excluded by the lineage rule even when they are NOT the successor's creator", async () => {
+  const db = new FakeDatabase();
+  seedSuccessor(db);
+  db.revisions.find((r) => r.id === "rev-D")!.createdById = "someone-else";
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("reval", "APPROVER"), "rev-D", LifecycleState.APPROVED, db.db, db.provider),
+    "LEGACY_LINEAGE_EXCLUDED",
+  );
+});
+
+test("Option A O-2: the same exclusions apply to RELEASE of the successor; a non-excluded eligible approver may approve and release", async () => {
+  const db = new FakeDatabase();
+  seedSuccessor(db, { successorState: LifecycleState.APPROVED });
+  for (const [who, role] of [["legacy-creator", "APPROVER"], ["legacy-sub", "ADMIN"]] as const) {
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs(who, role), "rev-D", LifecycleState.RELEASED, db.db, db.provider),
+      "LEGACY_LINEAGE_EXCLUDED",
+    );
+  }
+  await advanceRevisionForActor(actorAs("admin", "ADMIN"), "rev-D", LifecycleState.RELEASED, db.db, db.provider);
+  assert.equal(db.revisions.find((r) => r.id === "rev-D")!.lifecycle, LifecycleState.RELEASED);
+
+  const db2 = new FakeDatabase();
+  seedSuccessor(db2);
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-D", LifecycleState.APPROVED, db2.db, db2.provider);
+  assert.equal(db2.revisions.find((r) => r.id === "rev-D")!.lifecycle, LifecycleState.APPROVED);
+});
+
+test("Option A O-2: an unknown (NULL) legacy creator excludes nobody extra; the legacy submitter and revalidator are still excluded", async () => {
+  const db = new FakeDatabase();
+  seedSuccessor(db, { legacyCreatorId: null });
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("legacy-sub", "ADMIN"), "rev-D", LifecycleState.APPROVED, db.db, db.provider),
+    "LEGACY_LINEAGE_EXCLUDED",
+  );
+  await advanceRevisionForActor(actorAs("legacy-creator", "APPROVER"), "rev-D", LifecycleState.APPROVED, db.db, db.provider);
+});
+
+test("Option A O-2 does not affect ordinary revisions (no revalidation link)", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "legacy-sub", "ADMIN");
+  db.addUser("orgA", "eng", "ENGINEER");
+  seedWorkingRevision(db);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("legacy-sub", "ADMIN"), "rev-w", LifecycleState.APPROVED, db.db, db.provider);
+});
+
+test("Option A O-4: releasing the successor supersedes the legacy revision's RELEASED source (same item, one step) with an AUTOMATIC_SUPERSESSION event", async () => {
+  const db = new FakeDatabase();
+  seedSuccessor(db, { successorState: LifecycleState.APPROVED });
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-D", LifecycleState.RELEASED, db.db, db.provider);
+  assert.equal(db.revisions.find((r) => r.id === "rev-B")!.lifecycle, LifecycleState.SUPERSEDED);
+  assert.equal(db.revisions.find((r) => r.id === "rev-C")!.lifecycle, LifecycleState.OBSOLETE, "the closed legacy revision is untouched");
+  const sup = db.eventsFor("rev-B").at(-1)!;
+  assert.deepEqual([sup.fromState, sup.toState, sup.trigger, sup.actedById], ["RELEASED", "SUPERSEDED", "AUTOMATIC_SUPERSESSION", "appr"]);
+  const rel = db.eventsFor("rev-D").at(-1)!;
+  assert.equal(rel.toState, "RELEASED");
+  assert.ok(sup.sequence > rel.sequence, "supersession sequenced after the release");
+  assert.equal(db.baselines.length, 1);
+});
+
+test("Option A O-4: no lineage supersession when the legacy source is not RELEASED, is on another item, or the release fails (rollback)", async () => {
+  // Source already SUPERSEDED -> nothing changes.
+  const a = new FakeDatabase();
+  seedSuccessor(a, { successorState: LifecycleState.APPROVED });
+  a.revisions.find((r) => r.id === "rev-B")!.lifecycle = LifecycleState.SUPERSEDED;
+  const eventsBefore = a.eventsFor("rev-B").length;
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-D", LifecycleState.RELEASED, a.db, a.provider);
+  assert.equal(a.eventsFor("rev-B").length, eventsBefore);
+
+  // Legacy revision (and its source) on another item -> not superseded.
+  const b = new FakeDatabase();
+  seedSuccessor(b, { successorState: LifecycleState.APPROVED, legacyItemId: "item-OTHER" });
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-D", LifecycleState.RELEASED, b.db, b.provider);
+  assert.equal(b.revisions.find((r) => r.id === "rev-B")!.lifecycle, LifecycleState.RELEASED);
+
+  // Failed release (missing binary) -> nothing superseded, no events, successor stays APPROVED.
+  const c = new FakeDatabase();
+  seedSuccessor(c, { successorState: LifecycleState.APPROVED });
+  c.addLink("orgA", "rev-D", "doc-1");
+  seedDocumentWithVersion(c, "doc-1", "fv-1-v1", 1, { present: false });
+  const before = snapshot(c);
+  await assert.rejects(
+    () => advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-D", LifecycleState.RELEASED, c.db, c.provider),
+    ReleaseBaselineIncompleteError,
+  );
+  assert.deepEqual(snapshot(c), before);
+  assert.equal(c.revisions.find((r) => r.id === "rev-B")!.lifecycle, LifecycleState.RELEASED);
 });

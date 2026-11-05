@@ -64,6 +64,7 @@ export type LifecycleDenialCode =
   | "LEGACY_HISTORY_UNVERIFIED"
   | "CREATOR_CANNOT_APPROVE"
   | "SUBMITTER_CANNOT_APPROVE"
+  | "LEGACY_LINEAGE_EXCLUDED"
   | "STATE_NOT_RECORDED";
 
 /** The parts of an ItemRevisionLifecycleEvent the policy needs. */
@@ -87,6 +88,15 @@ export interface LifecyclePolicyInput {
   legacyHold: boolean;
   /** Every recorded event for this revision, in any order. */
   events: readonly LifecycleEventFact[];
+  /**
+   * Option A, Product Owner decision O-2: when this revision is the successor
+   * of a revalidated legacy revision, the people who may NOT approve or
+   * release it in addition to its own creator and submitters - the legacy
+   * revision's creator, every recorded submitter of the legacy revision, and
+   * the person who ran the revalidation (see `lineageExclusionIds` in
+   * legacy-revalidation-core.ts). Empty / absent for every other revision.
+   */
+  lineageExcludedIds?: readonly string[];
 }
 
 export type LifecyclePolicyDecision =
@@ -102,6 +112,8 @@ export const LIFECYCLE_DENIAL_MESSAGES: Record<LifecycleDenialCode, string> = {
     "You created this revision, so a different Approver or Admin must approve and release it.",
   SUBMITTER_CANNOT_APPROVE:
     "You submitted this revision for review, so a different Approver or Admin must approve and release it.",
+  LEGACY_LINEAGE_EXCLUDED:
+    "This revision replaces a legacy revision you created, submitted or revalidated, so a different Approver or Admin must approve and release it.",
   STATE_NOT_RECORDED:
     "This revision's current state was not reached through a recorded transition, so it cannot be approved or released.",
 };
@@ -192,12 +204,13 @@ function deny(code: LifecycleDenialCode): LifecyclePolicyDecision {
  * `from -> to` is in LIFECYCLE_TRANSITIONS.
  *
  * Check order for approve/release (the first failing check is reported):
- * role, legacy hold, creator, submitter, recorded state.
+ * role, legacy hold, creator, submitter, legacy lineage (O-2), recorded state.
  */
 export function evaluateLifecycleTransition(
   input: LifecyclePolicyInput,
 ): LifecyclePolicyDecision {
   const { actorId, actorRole, from, to, creatorId, legacyHold, events } = input;
+  const lineageExcludedIds = input.lineageExcludedIds ?? [];
 
   if (!LIFECYCLE_WRITE_ROLES.includes(actorRole)) {
     return deny("ROLE_NOT_PERMITTED");
@@ -226,6 +239,9 @@ export function evaluateLifecycleTransition(
   }
   if (submitterIdsOf(events).has(actorId)) {
     return deny("SUBMITTER_CANNOT_APPROVE");
+  }
+  if (lineageExcludedIds.includes(actorId)) {
+    return deny("LEGACY_LINEAGE_EXCLUDED");
   }
   if (!isCurrentStateRecorded(from, events)) {
     return deny("STATE_NOT_RECORDED");

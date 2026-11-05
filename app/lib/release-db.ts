@@ -111,6 +111,7 @@ import {
   type LifecycleDenialCode,
   type LifecycleEventFact,
 } from "./lifecycle-policy-core.ts";
+import { lineageExclusionIds } from "./legacy-revalidation-core.ts";
 import {
   lockCadDocumentForVersionMutation,
   runSerializableTransaction,
@@ -433,6 +434,16 @@ export async function advanceRevisionForActor(
           createdById: true,
           // B03 (NO-GO finding 1): pre-B03 revisions carry an immutable hold.
           legacyLifecycleHold: { select: { itemRevisionId: true } },
+          // Option A: present when this revision is the successor of a
+          // revalidated legacy revision (drives O-2 and O-4 below).
+          legacyRevalidationAsSuccessor: {
+            select: {
+              actedById: true,
+              legacyRevision: {
+                select: { id: true, itemId: true, createdById: true, sourceRevisionId: true },
+              },
+            },
+          },
         },
       });
 
@@ -486,6 +497,28 @@ export async function advanceRevisionForActor(
           },
         });
 
+      // Option A, O-2: for a successor, the legacy creator, every recorded
+      // legacy submitter and the revalidating person are also excluded -
+      // read in this same transaction.
+      const revalidation = current.legacyRevalidationAsSuccessor;
+      let lineageExcludedIds: string[] = [];
+      if (revalidation) {
+        const legacyEvents: LifecycleEventFact[] =
+          await tx.itemRevisionLifecycleEvent.findMany({
+            where: {
+              organizationId: actor.organizationId,
+              itemRevisionId: revalidation.legacyRevision.id,
+            },
+            orderBy: { sequence: "asc" },
+            select: { sequence: true, fromState: true, toState: true, actedById: true },
+          });
+        lineageExcludedIds = lineageExclusionIds({
+          legacyCreatorId: revalidation.legacyRevision.createdById,
+          legacyEvents,
+          revalidatedById: revalidation.actedById,
+        });
+      }
+
       const decision = evaluateLifecycleTransition({
         actorId: actingUser.id,
         actorRole: actingUser.role,
@@ -494,6 +527,7 @@ export async function advanceRevisionForActor(
         creatorId: current.createdById,
         legacyHold: current.legacyLifecycleHold !== null,
         events: history,
+        lineageExcludedIds,
       });
       if (!decision.allowed) {
         throw new LifecyclePermissionError(decision.code, decision.message);
@@ -556,6 +590,44 @@ export async function advanceRevisionForActor(
             data: {
               organizationId: actor.organizationId,
               itemRevisionId: current.sourceRevisionId,
+              fromState: LifecycleState.RELEASED,
+              toState: LifecycleState.SUPERSEDED,
+              trigger: LifecycleEventTrigger.AUTOMATIC_SUPERSESSION,
+              actedById: actingUser.id,
+              actedByRole: actingUser.role,
+              comment: null,
+              occurredAt: at,
+            },
+          });
+        }
+      }
+
+      // Option A, O-4: releasing a successor also supersedes the RELEASED
+      // revision its legacy revision was derived from (same Item, one step),
+      // exactly as if the legacy revision itself had been released. Same
+      // conditional update and event as above; rolls back with the release.
+      const legacySourceId = revalidation?.legacyRevision.sourceRevisionId ?? null;
+      if (
+        target === LifecycleState.RELEASED &&
+        revalidation &&
+        legacySourceId &&
+        revalidation.legacyRevision.itemId === current.itemId &&
+        legacySourceId !== current.sourceRevisionId
+      ) {
+        const lineageSuperseded = await tx.itemRevision.updateMany({
+          where: {
+            id: legacySourceId,
+            organizationId: actor.organizationId,
+            itemId: current.itemId, // same Item only
+            lifecycle: LifecycleState.RELEASED,
+          },
+          data: { lifecycle: LifecycleState.SUPERSEDED },
+        });
+        if (lineageSuperseded.count > 0) {
+          await tx.itemRevisionLifecycleEvent.create({
+            data: {
+              organizationId: actor.organizationId,
+              itemRevisionId: legacySourceId,
               fromState: LifecycleState.RELEASED,
               toState: LifecycleState.SUPERSEDED,
               trigger: LifecycleEventTrigger.AUTOMATIC_SUPERSESSION,

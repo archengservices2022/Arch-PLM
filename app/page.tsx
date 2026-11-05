@@ -11,6 +11,7 @@ import {
   createEngineeringRevision,
   createItem,
   linkExistingCadDocumentToRevision,
+  revalidateLegacyRevision,
 } from "@/app/actions";
 import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { prisma } from "@/app/lib/prisma";
@@ -28,6 +29,11 @@ import {
   MAX_LIFECYCLE_COMMENT_LENGTH,
   orderLifecycleEvents,
 } from "@/app/lib/lifecycle-policy-core";
+import {
+  evaluateLegacyRevalidation,
+  isHeldNonTerminalSource,
+  lineageExclusionIds,
+} from "@/app/lib/legacy-revalidation-core";
 import { signOut } from "@/auth";
 
 export const dynamic = "force-dynamic";
@@ -105,6 +111,35 @@ async function getDashboardData(organizationId: string) {
             },
           },
           legacyLifecycleHold: { select: { recordedAt: true } },
+          // Option A: this legacy revision was revalidated into a successor ...
+          legacyRevalidationAsLegacy: {
+            select: {
+              occurredAt: true,
+              comment: true,
+              actedBy: { select: { name: true, email: true } },
+              successorRevision: { select: { revision: true } },
+            },
+          },
+          // ... or this revision IS such a successor. The legacy creator,
+          // legacy submitters and the revalidating person feed the O-2
+          // preview below (the server re-checks in its transaction).
+          legacyRevalidationAsSuccessor: {
+            select: {
+              actedById: true,
+              occurredAt: true,
+              comment: true,
+              actedBy: { select: { name: true, email: true } },
+              legacyRevision: {
+                select: {
+                  revision: true,
+                  createdById: true,
+                  lifecycleEvents: {
+                    select: { sequence: true, fromState: true, toState: true, actedById: true },
+                  },
+                },
+              },
+            },
+          },
           // Who released a revision before B03 recorded events: the release
           // baseline has always stored its creator.
           releaseBaseline: {
@@ -874,6 +909,28 @@ function RevisionCard({
     documentLinks: { id: string; cadDocument: { id: string; fileName: string } }[];
     lifecycleEvents: RevisionLifecycleEventView[];
     legacyLifecycleHold: { recordedAt: Date } | null;
+    legacyRevalidationAsLegacy: {
+      occurredAt: Date;
+      comment: string;
+      actedBy: { name: string; email: string };
+      successorRevision: { revision: string };
+    } | null;
+    legacyRevalidationAsSuccessor: {
+      actedById: string;
+      occurredAt: Date;
+      comment: string;
+      actedBy: { name: string; email: string };
+      legacyRevision: {
+        revision: string;
+        createdById: string | null;
+        lifecycleEvents: {
+          sequence: bigint;
+          fromState: LifecycleState;
+          toState: LifecycleState;
+          actedById: string;
+        }[];
+      };
+    } | null;
     releaseBaseline: {
       createdAt: Date;
       createdBy: { name: string; email: string };
@@ -881,11 +938,31 @@ function RevisionCard({
   };
   actor: Actor;
 }) {
-  const canCreateNext = canCreateSuccessorFrom(revision.lifecycle);
   // Authoritative order (database `sequence`), via the same helper the
   // policy uses - never by timestamp.
   const events = orderLifecycleEvents(revision.lifecycleEvents);
   const legacyHold = revision.legacyLifecycleHold !== null;
+  // Option A: "Create next revision" refuses a held, non-terminal source;
+  // such a revision is continued through revalidation instead.
+  const canCreateNext =
+    canCreateSuccessorFrom(revision.lifecycle) &&
+    !isHeldNonTerminalSource({ lifecycle: revision.lifecycle, legacyHold });
+  const revalidatedAs = revision.legacyRevalidationAsLegacy;
+  const successorOf = revision.legacyRevalidationAsSuccessor;
+  // O-2 preview for a successor (the server re-checks in its transaction).
+  const lineageExcludedIds = successorOf
+    ? lineageExclusionIds({
+        legacyCreatorId: successorOf.legacyRevision.createdById,
+        legacyEvents: successorOf.legacyRevision.lifecycleEvents,
+        revalidatedById: successorOf.actedById,
+      })
+    : [];
+  const revalidation = evaluateLegacyRevalidation({
+    actorRole: actor.role,
+    legacyHold,
+    lifecycle: revision.lifecycle,
+  });
+  const canRevalidate = revalidation.allowed && !revalidatedAs;
 
   // B03: offer only the transitions this user may make. Display only - the
   // server re-evaluates the same policy inside the transaction.
@@ -900,6 +977,7 @@ function RevisionCard({
         creatorId: revision.createdById,
         legacyHold,
         events,
+        lineageExcludedIds,
       }),
     }),
   );
@@ -998,12 +1076,29 @@ function RevisionCard({
         </div>
       </dl>
 
-      {legacyHold ? (
+      {successorOf ? (
+        <p className="mt-2 rounded-md bg-sky-50 px-3 py-2 text-xs text-sky-900">
+          Successor of legacy Rev {successorOf.legacyRevision.revision} ·
+          revalidated by {personLabel(successorOf.actedBy)} ·{" "}
+          {formatWhen(successorOf.occurredAt)} · “{successorOf.comment}”. The
+          legacy revision&apos;s creator, its recorded submitters and the
+          person who revalidated it cannot approve or release this revision.
+        </p>
+      ) : null}
+
+      {revalidatedAs ? (
+        <p className="mt-2 rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-700">
+          Revalidated as Rev {revalidatedAs.successorRevision.revision} by{" "}
+          {personLabel(revalidatedAs.actedBy)} ·{" "}
+          {formatWhen(revalidatedAs.occurredAt)} · “{revalidatedAs.comment}”.
+          This legacy revision was closed without approval.
+        </p>
+      ) : legacyHold ? (
         <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
           Legacy revision: it existed before approval tracking, so who submitted
-          it for review cannot be verified. It cannot be approved or released
-          until a revalidation procedure is approved. Returning it to Working
-          and resubmitting does not lift this hold.
+          it for review cannot be verified. It can never be approved or
+          released; returning it to Working and resubmitting does not lift
+          this hold. To continue the work, revalidate it as a new revision.
         </p>
       ) : stateUnrecorded ? (
         <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
@@ -1066,12 +1161,82 @@ function RevisionCard({
                 {formatState(event.toState)} · {personLabel(event.actedBy)}
                 {event.trigger === "AUTOMATIC_SUPERSESSION"
                   ? " (automatic, successor released)"
-                  : ""}
+                  : event.trigger === "LEGACY_REVALIDATION"
+                    ? " (legacy revalidation)"
+                    : ""}
                 {event.comment ? ` · “${event.comment}”` : ""}
               </li>
             ))}
           </ol>
         </details>
+      ) : null}
+
+      {canRevalidate ? (
+        <form
+          action={revalidateLegacyRevision}
+          className="mt-3 rounded-md bg-amber-50 p-3"
+        >
+          <input type="hidden" name="legacyRevisionId" value={revision.id} />
+          <p className="text-xs font-semibold text-amber-900">
+            Revalidate Rev {revision.revision} as a new revision
+          </p>
+          <p className="mt-0.5 text-xs text-amber-900">
+            Closes this legacy revision without approving it and creates a new
+            Working revision (the next free letter for this item), created by
+            you, which then goes through normal review. Carried-forward CAD
+            documents are the same logical documents; nothing is copied.
+          </p>
+          <label className="mt-2 flex flex-col gap-1 text-xs font-medium text-slate-600">
+            CAD documents
+            <select
+              name="carryForwardMode"
+              defaultValue="all"
+              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+            >
+              <option value="all">Carry forward all</option>
+              <option value="selected">Carry forward only the checked ones</option>
+              <option value="none">Start with none</option>
+            </select>
+          </label>
+          {revision.documentLinks.length > 0 ? (
+            <div className="mt-2 flex flex-col gap-1">
+              {revision.documentLinks.map((link) => (
+                <label
+                  key={link.id}
+                  className="flex items-center gap-2 text-xs text-slate-700"
+                >
+                  <input
+                    type="checkbox"
+                    name="carryForwardDocumentId"
+                    value={link.cadDocument.id}
+                    defaultChecked
+                  />
+                  {link.cadDocument.fileName}
+                </label>
+              ))}
+            </div>
+          ) : null}
+          <label className="mt-2 flex flex-col gap-1 text-xs font-medium text-slate-600">
+            Description (optional)
+            <input
+              name="description"
+              placeholder="defaults to this revision's description"
+              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+            />
+          </label>
+          <label className="mt-2 flex flex-col gap-1 text-xs font-medium text-slate-600">
+            Reason (required)
+            <input
+              name="reason"
+              required
+              maxLength={MAX_LIFECYCLE_COMMENT_LENGTH}
+              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+            />
+          </label>
+          <button className="mt-3 h-9 rounded-md bg-amber-700 px-3 text-xs font-semibold text-white transition hover:bg-amber-800">
+            Revalidate as new revision
+          </button>
+        </form>
       ) : null}
 
       {canCreateNext ? (
