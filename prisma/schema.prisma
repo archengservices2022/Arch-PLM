@@ -42,6 +42,16 @@ enum LifecycleState {
   OBSOLETE
 }
 
+// B03: what caused an ItemRevisionLifecycleEvent.
+enum LifecycleEventTrigger {
+  // A user-requested transition through advanceRevisionForActor.
+  MANUAL
+  // A RELEASED source revision moved to SUPERSEDED because its successor was
+  // released in the same transaction (actor = the user who released the
+  // successor).
+  AUTOMATIC_SUPERSESSION
+}
+
 // PDM: physical CAD document formats. Engineering revision lifecycle
 // (LifecycleState) is deliberately unrelated to CAD file versioning.
 enum CadDocumentType {
@@ -121,6 +131,8 @@ model Organization {
   copyDesignOperations       CopyDesignOperation[]
   cadCopyLineages            CadCopyLineage[]
   copyDesignOperationEntries CopyDesignOperationEntry[]
+  lifecycleEvents            ItemRevisionLifecycleEvent[]
+  legacyLifecycleHolds       ItemRevisionLegacyLifecycleHold[]
 }
 
 // ============================================================
@@ -169,6 +181,10 @@ model User {
   // CadCopyLineage.
   performedCopyDesignOperations CopyDesignOperation[]
   copiedCadLineages             CadCopyLineage[]
+
+  // Lifecycle transitions this user performed (B03) - see
+  // ItemRevisionLifecycleEvent.
+  lifecycleEventsActed ItemRevisionLifecycleEvent[] @relation("ItemRevisionLifecycleEventActor")
 
   // Enables tenant-aware composite foreign keys that reference a user
   // together with their organization.
@@ -312,6 +328,12 @@ model ItemRevision {
   // like CadDocument.checkout.
   releaseBaseline ReleaseBaseline?
 
+  // Append-only lifecycle history (B03) - see ItemRevisionLifecycleEvent.
+  lifecycleEvents     ItemRevisionLifecycleEvent[]
+  // Present iff this revision existed before B03 (its pre-B03 history is
+  // unverifiable) - see ItemRevisionLegacyLifecycleHold.
+  legacyLifecycleHold ItemRevisionLegacyLifecycleHold?
+
   @@unique([organizationId, id])
   @@unique([itemId, revision])
   @@index([organizationId])
@@ -319,6 +341,101 @@ model ItemRevision {
   @@index([lifecycle])
   @@index([createdById])
   @@index([sourceRevisionId])
+}
+
+// ============================================================
+// B03: append-only engineering revision lifecycle history.
+//
+// Exactly one row is written, in the SAME SERIALIZABLE transaction as the
+// state change it records, for every successful lifecycle transition
+// (`advanceRevisionForActor`, app/lib/release-db.ts), plus one
+// AUTOMATIC_SUPERSESSION row when a successor's release supersedes its
+// RELEASED source. A refused or rolled-back transition leaves no row.
+//
+// These rows are the ONLY record of who submitted a revision for review and
+// who approved it, so the separation-of-duties rules in
+// app/lib/lifecycle-policy-core.ts are evaluated against them.
+//
+// APPEND-ONLY: the application never updates or deletes a row, and the
+// migration installs a database trigger that rejects UPDATE, DELETE and
+// TRUNCATE on this table (Product Owner decision D-A8). All foreign keys are
+// Restrict in both directions, so the history can never be removed or
+// rewritten by a cascade either. No history is backfilled or fabricated:
+// revisions that existed before B03 get an ItemRevisionLegacyLifecycleHold
+// instead (see below).
+//
+// ORDER: `sequence` is the AUTHORITATIVE transition order. It is assigned by
+// a database sequence at INSERT time. Transitions of one revision are
+// serialized (conditional row update under SERIALIZABLE), and each event is
+// inserted inside its transition's transaction after the previous transition
+// committed, so per revision, sequence order = commit order. `occurredAt`
+// (application clock, same instant as releasedAt) is informational only and
+// is NEVER used to order history or to make an authorization decision.
+// ============================================================
+model ItemRevisionLifecycleEvent {
+  id String @id @default(cuid())
+
+  // Authoritative, database-assigned transition order (see above).
+  sequence BigInt @unique @default(autoincrement())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  itemRevisionId String
+  itemRevision   ItemRevision @relation(fields: [organizationId, itemRevisionId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  fromState LifecycleState
+  toState   LifecycleState
+  trigger   LifecycleEventTrigger
+
+  // Who performed the transition (for AUTOMATIC_SUPERSESSION: the user who
+  // released the successor), and their role at that moment - read from the
+  // database inside the transaction, never from the client.
+  actedById   String
+  actedBy     User     @relation("ItemRevisionLifecycleEventActor", fields: [organizationId, actedById], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+  actedByRole UserRole
+
+  // Optional human comment (e.g. why a revision was returned from review).
+  // Trimmed, control characters stripped, bounded length - see
+  // normalizeLifecycleComment. Never a place for secrets or system data.
+  comment String?
+
+  // Set explicitly by the transaction, to the same instant as
+  // ItemRevision.releasedAt for a release. Informational: display only, never
+  // used for ordering (use `sequence`).
+  occurredAt DateTime
+
+  @@index([organizationId, itemRevisionId, sequence])
+  @@index([organizationId, actedById])
+}
+
+// ============================================================
+// B03 (Codex NO-GO finding 1): legacy lifecycle hold.
+//
+// One row per ItemRevision that ALREADY EXISTED when the B03 migration ran,
+// written by that migration (INSERT ... SELECT from ItemRevision) and never
+// by the application. For such a revision, who submitted it for review before
+// B03 cannot be verified, so separation of duties cannot be proven: approve
+// and release are refused for as long as the row exists - and the row is
+// append-only (same trigger as the event table), so nothing in the
+// application can lift the hold. Returning to Working and resubmitting does
+// NOT remove it. Creator and history are left untouched; no submitter is
+// fabricated. Safe revalidation is a separate, not-yet-approved design.
+// ============================================================
+model ItemRevisionLegacyLifecycleHold {
+  itemRevisionId String @id
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  itemRevision   ItemRevision @relation(fields: [organizationId, itemRevisionId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  // The revision's lifecycle when the hold was recorded (evidence only).
+  lifecycleAtHold LifecycleState
+  // Database time of the migration that recorded the hold.
+  recordedAt      DateTime       @default(now())
+
+  @@unique([organizationId, itemRevisionId])
+  @@index([organizationId])
 }
 
 // ============================================================

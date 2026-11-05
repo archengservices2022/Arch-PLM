@@ -20,6 +20,14 @@ import {
   manualTransitionTargets,
   nextRevisionLetter,
 } from "@/app/lib/revisions";
+import {
+  evaluateLifecycleTransition,
+  isApprovalTransition,
+  isCurrentStateRecorded,
+  latestLifecycleEventWhere,
+  MAX_LIFECYCLE_COMMENT_LENGTH,
+  orderLifecycleEvents,
+} from "@/app/lib/lifecycle-policy-core";
 import { signOut } from "@/auth";
 
 export const dynamic = "force-dynamic";
@@ -76,6 +84,35 @@ async function getDashboardData(organizationId: string) {
           item: true,
           createdBy: { select: { name: true, email: true } },
           sourceRevision: { select: { revision: true, lifecycle: true } },
+          // B03: the full recorded lifecycle history (a handful of rows per
+          // revision). All of it is needed for the separation-of-duties
+          // preview below (anyone who EVER submitted is excluded, D-A1);
+          // the card displays the most recent entries.
+          // Ordered by the database-assigned `sequence` - the same
+          // authoritative order the server uses for authorization.
+          lifecycleEvents: {
+            orderBy: { sequence: "asc" },
+            select: {
+              id: true,
+              sequence: true,
+              fromState: true,
+              toState: true,
+              trigger: true,
+              occurredAt: true,
+              comment: true,
+              actedById: true,
+              actedBy: { select: { name: true, email: true } },
+            },
+          },
+          legacyLifecycleHold: { select: { recordedAt: true } },
+          // Who released a revision before B03 recorded events: the release
+          // baseline has always stored its creator.
+          releaseBaseline: {
+            select: {
+              createdAt: true,
+              createdBy: { select: { name: true, email: true } },
+            },
+          },
           // CAD documents are associated through the ItemRevisionDocument link,
           // not owned by the revision.
           documentLinks: {
@@ -410,7 +447,7 @@ export default async function Home() {
                   </p>
                   <div className="mt-3 flex flex-col gap-3">
                     {group.revs.map((revision) => (
-                      <RevisionCard key={revision.id} revision={revision} />
+                      <RevisionCard key={revision.id} revision={revision} actor={actor} />
                     ))}
                   </div>
                 </div>
@@ -802,20 +839,103 @@ export default async function Home() {
   );
 }
 
+type RevisionLifecycleEventView = {
+  id: string;
+  sequence: bigint;
+  fromState: LifecycleState;
+  toState: LifecycleState;
+  trigger: string;
+  occurredAt: Date;
+  comment: string | null;
+  actedById: string;
+  actedBy: { name: string; email: string };
+};
+
+function personLabel(person: { name: string; email: string }) {
+  return person.name || person.email;
+}
+
+/** Server-rendered, so a fixed, unambiguous UTC format. */
+function formatWhen(when: Date) {
+  return `${when.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
 function RevisionCard({
   revision,
+  actor,
 }: {
   revision: {
     id: string;
     revision: string;
     lifecycle: LifecycleState;
+    createdById: string | null;
     createdBy: { name: string; email: string } | null;
     sourceRevision: { revision: string; lifecycle: LifecycleState } | null;
     documentLinks: { id: string; cadDocument: { id: string; fileName: string } }[];
+    lifecycleEvents: RevisionLifecycleEventView[];
+    legacyLifecycleHold: { recordedAt: Date } | null;
+    releaseBaseline: {
+      createdAt: Date;
+      createdBy: { name: string; email: string };
+    } | null;
   };
+  actor: Actor;
 }) {
-  const transitionTargets = manualTransitionTargets(revision.lifecycle);
   const canCreateNext = canCreateSuccessorFrom(revision.lifecycle);
+  // Authoritative order (database `sequence`), via the same helper the
+  // policy uses - never by timestamp.
+  const events = orderLifecycleEvents(revision.lifecycleEvents);
+  const legacyHold = revision.legacyLifecycleHold !== null;
+
+  // B03: offer only the transitions this user may make. Display only - the
+  // server re-evaluates the same policy inside the transaction.
+  const transitionChoices = manualTransitionTargets(revision.lifecycle).map(
+    (target) => ({
+      target,
+      decision: evaluateLifecycleTransition({
+        actorId: actor.userId,
+        actorRole: actor.role,
+        from: revision.lifecycle,
+        to: target,
+        creatorId: revision.createdById,
+        legacyHold,
+        events,
+      }),
+    }),
+  );
+  const transitionTargets = transitionChoices
+    .filter((choice) => choice.decision.allowed)
+    .map((choice) => choice.target);
+  const blockedApprovalReasons = [
+    ...new Set(
+      transitionChoices
+        .filter(
+          (choice) =>
+            !choice.decision.allowed &&
+            isApprovalTransition(revision.lifecycle, choice.target),
+        )
+        .map((choice) => (choice.decision.allowed ? "" : choice.decision.message)),
+    ),
+  ];
+
+  const submitted = latestLifecycleEventWhere(
+    events,
+    (e) => e.toState === LifecycleState.IN_REVIEW,
+  );
+  const approved = latestLifecycleEventWhere(
+    events,
+    (e) => e.toState === LifecycleState.APPROVED,
+  );
+  const released = latestLifecycleEventWhere(
+    events,
+    (e) => e.toState === LifecycleState.RELEASED,
+  );
+  const stateUnrecorded =
+    !legacyHold &&
+    (revision.lifecycle === LifecycleState.IN_REVIEW ||
+      revision.lifecycle === LifecycleState.APPROVED) &&
+    !isCurrentStateRecorded(revision.lifecycle, events);
+  const recentEvents = events.slice(-20).reverse();
 
   let nextRev: string | null = null;
   try {
@@ -838,12 +958,59 @@ function RevisionCard({
           {revision.documentLinks.length} CAD document
           {revision.documentLinks.length === 1 ? "" : "s"}
         </span>
-        <span className="text-xs text-slate-400">
-          {revision.createdBy
-            ? `by ${revision.createdBy.name || revision.createdBy.email}`
-            : "creator unknown"}
-        </span>
+        {revision.createdBy ? (
+          <span className="text-xs text-slate-400">
+            Created by {personLabel(revision.createdBy)}
+          </span>
+        ) : (
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+            Creator unknown
+          </span>
+        )}
       </div>
+
+      <dl className="mt-2 grid gap-x-4 gap-y-0.5 text-xs text-slate-600 sm:grid-cols-3">
+        <div>
+          <dt className="inline font-medium">Submitted: </dt>
+          <dd className="inline">
+            {submitted
+              ? `${personLabel(submitted.actedBy)} · ${formatWhen(submitted.occurredAt)}`
+              : "not recorded"}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline font-medium">Approved: </dt>
+          <dd className="inline">
+            {approved
+              ? `${personLabel(approved.actedBy)} · ${formatWhen(approved.occurredAt)}`
+              : "not recorded"}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline font-medium">Released: </dt>
+          <dd className="inline">
+            {released
+              ? `${personLabel(released.actedBy)} · ${formatWhen(released.occurredAt)}`
+              : revision.releaseBaseline
+                ? `${personLabel(revision.releaseBaseline.createdBy)} · ${formatWhen(revision.releaseBaseline.createdAt)} (from release baseline)`
+                : "not released"}
+          </dd>
+        </div>
+      </dl>
+
+      {legacyHold ? (
+        <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          Legacy revision: it existed before approval tracking, so who submitted
+          it for review cannot be verified. It cannot be approved or released
+          until a revalidation procedure is approved. Returning it to Working
+          and resubmitting does not lift this hold.
+        </p>
+      ) : stateUnrecorded ? (
+        <p className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          This revision&apos;s current state was not reached through a recorded
+          transition, so it cannot be approved or released.
+        </p>
+      ) : null}
 
       {transitionTargets.length > 0 ? (
         <form
@@ -865,10 +1032,46 @@ function RevisionCard({
               ))}
             </select>
           </label>
+          <label className="flex min-w-48 flex-1 flex-col gap-1 text-xs font-medium text-slate-600">
+            Comment (optional)
+            <input
+              name="comment"
+              maxLength={MAX_LIFECYCLE_COMMENT_LENGTH}
+              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+            />
+          </label>
           <button className="h-9 rounded-md bg-teal-700 px-3 text-xs font-semibold text-white transition hover:bg-teal-800">
             Update
           </button>
         </form>
+      ) : null}
+
+      {blockedApprovalReasons.length > 0 ? (
+        <ul className="mt-2 flex flex-col gap-0.5 text-xs text-slate-500">
+          {blockedApprovalReasons.map((reason) => (
+            <li key={reason}>{reason}</li>
+          ))}
+        </ul>
+      ) : null}
+
+      {recentEvents.length > 0 ? (
+        <details className="mt-2 text-xs text-slate-600">
+          <summary className="cursor-pointer font-medium text-slate-700">
+            Lifecycle history ({events.length})
+          </summary>
+          <ol className="mt-1 flex flex-col gap-0.5">
+            {recentEvents.map((event) => (
+              <li key={event.id}>
+                {formatWhen(event.occurredAt)} · {formatState(event.fromState)} →{" "}
+                {formatState(event.toState)} · {personLabel(event.actedBy)}
+                {event.trigger === "AUTOMATIC_SUPERSESSION"
+                  ? " (automatic, successor released)"
+                  : ""}
+                {event.comment ? ` · “${event.comment}”` : ""}
+              </li>
+            ))}
+          </ol>
+        </details>
       ) : null}
 
       {canCreateNext ? (

@@ -214,6 +214,11 @@ export async function createItem(formData: FormData) {
  * delegates to `app/lib/release-db.ts`'s `advanceRevisionForActor`, which is
  * what the focused tests exercise directly with an in-memory fake database
  * - see that module for the full transition/baseline/concurrency design.
+ *
+ * B03: approval authority, separation of duties and the append-only
+ * lifecycle event are all enforced inside `advanceRevisionForActor`'s
+ * transaction (see `app/lib/lifecycle-policy-core.ts`); this wrapper only
+ * passes the optional `comment` form field through.
  */
 export async function advanceRevision(formData: FormData) {
   const actor = await requireActor();
@@ -225,8 +230,11 @@ export async function advanceRevision(formData: FormData) {
     requiredValue(formData, "lifecycle"),
     "lifecycle",
   );
+  const comment = optionalValue(formData, "comment");
 
-  await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider());
+  await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider(), {
+    comment,
+  });
 
   revalidatePath("/");
 }

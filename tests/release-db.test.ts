@@ -27,6 +27,7 @@ import { isTerminalLifecycle, manualTransitionTargets } from "../app/lib/revisio
 import type { Actor } from "../app/lib/authz.ts";
 import type { UserRole } from "../app/generated/prisma/enums.ts";
 import {
+  LifecyclePermissionError,
   ReleaseBaselineIncompleteError,
   ReleaseClosureInvalidError,
   ReleaseClosureTooLargeError,
@@ -34,6 +35,10 @@ import {
   buildReleaseBaselineInTransaction,
   type ReleaseDb,
 } from "../app/lib/release-db.ts";
+import {
+  InvalidLifecycleCommentError,
+  MAX_LIFECYCLE_COMMENT_LENGTH,
+} from "../app/lib/lifecycle-policy-core.ts";
 
 // ------------------------------------------------------------
 // Fake database + storage: REAL per-row async mutex behind $transaction +
@@ -69,6 +74,32 @@ interface RevisionRow {
   lifecycle: string;
   sourceRevisionId: string | null;
   releasedAt: Date | null;
+  /** B03: NULL = pre-lineage revision with no recorded creator. */
+  createdById?: string | null;
+  /** B03 (NO-GO finding 1): an ItemRevisionLegacyLifecycleHold row exists. */
+  legacyHold?: boolean;
+}
+/** B03: the acting-user row re-read inside the transaction. */
+interface UserRow {
+  organizationId: string;
+  id: string;
+  role: string;
+  active: boolean;
+}
+/** B03: ItemRevisionLifecycleEvent. */
+interface EventRow {
+  id: string;
+  /** Database-assigned order (BIGSERIAL), the ONLY ordering used. */
+  sequence: bigint;
+  organizationId: string;
+  itemRevisionId: string;
+  fromState: string;
+  toState: string;
+  trigger: string;
+  actedById: string;
+  actedByRole: string;
+  comment: string | null;
+  occurredAt: Date;
 }
 interface LinkRow {
   organizationId: string;
@@ -117,6 +148,8 @@ class FakeDatabase {
   readonly dependencies: DependencyRow[] = [];
   readonly baselines: BaselineRow[] = [];
   readonly entries: EntryRow[] = [];
+  readonly users: UserRow[] = [];
+  readonly events: EventRow[] = [];
   readonly storageObjects = new Set<string>();
   /** storageKey -> the bytes the storage layer would report (defaults to the
    *  FileVersion row's own checksum/size; corruption tests override). */
@@ -133,6 +166,46 @@ class FakeDatabase {
   addRevision(row: RevisionRow): this {
     this.revisions.push(row);
     return this;
+  }
+  /** B03: register (or replace) a user row. */
+  addUser(organizationId: string, id: string, role: string, active = true): this {
+    const existing = this.users.findIndex((u) => u.organizationId === organizationId && u.id === id);
+    if (existing >= 0) this.users.splice(existing, 1);
+    this.users.push({ organizationId, id, role, active });
+    return this;
+  }
+  /** B03: the database sequence behind ItemRevisionLifecycleEvent.sequence.
+   *  Like PostgreSQL, a value is consumed even if its transaction rolls back. */
+  #nextSequence = 1n;
+  nextSequence(): bigint {
+    const value = this.#nextSequence;
+    this.#nextSequence += 1n;
+    return value;
+  }
+  /** B03: seed a historical lifecycle event (as if written by an earlier
+   *  transaction). `sequence` defaults to the next database value; tests may
+   *  pass an explicit one. */
+  addEvent(
+    row: Omit<EventRow, "id" | "sequence" | "trigger" | "comment" | "actedByRole"> & Partial<EventRow>,
+  ): this {
+    // An explicit seeded value moves the sequence past it (like setval), so a
+    // later live write is always ordered after every existing row - exactly
+    // what the real BIGSERIAL guarantees.
+    if (row.sequence !== undefined && row.sequence >= this.#nextSequence) {
+      this.#nextSequence = row.sequence + 1n;
+    }
+    this.events.push({
+      id: `ev-${randomBytes(6).toString("hex")}`,
+      sequence: row.sequence ?? this.nextSequence(),
+      trigger: "MANUAL",
+      comment: null,
+      actedByRole: "APPROVER",
+      ...row,
+    } as EventRow);
+    return this;
+  }
+  eventsFor(itemRevisionId: string): EventRow[] {
+    return this.events.filter((e) => e.itemRevisionId === itemRevisionId);
   }
   addLink(organizationId: string, itemRevisionId: string, cadDocumentId: string): this {
     this.links.push({ organizationId, itemRevisionId, cadDocumentId });
@@ -226,6 +299,8 @@ class FakeDatabase {
       } as unknown as ReleaseDb["fileVersion"],
       releaseBaseline: {} as unknown as ReleaseDb["releaseBaseline"],
       releaseBaselineEntry: {} as unknown as ReleaseDb["releaseBaselineEntry"],
+      user: {} as unknown as ReleaseDb["user"],
+      itemRevisionLifecycleEvent: {} as unknown as ReleaseDb["itemRevisionLifecycleEvent"],
       $transaction: (async (fn: (tx: unknown) => Promise<unknown>) => {
         self.transactionAttempts += 1;
         if (self.forceSerializationFailures > 0) {
@@ -254,13 +329,62 @@ class FakeDatabase {
             releases.push(release);
             return [{ id: cadDocumentId, organizationId }];
           }) as unknown,
+          user: {
+            // B03: the acting user is re-read inside the transaction.
+            findFirst: (async (args: { where: { id: string; organizationId: string; active: boolean } }) => {
+              const row = self.users.find(
+                (u) =>
+                  u.id === args.where.id &&
+                  u.organizationId === args.where.organizationId &&
+                  u.active === args.where.active,
+              );
+              return row ? { id: row.id, role: row.role } : null;
+            }) as unknown,
+          },
+          itemRevisionLifecycleEvent: {
+            findMany: (async (args: { where: { organizationId: string; itemRevisionId: string } }) => {
+              return self.events
+                .filter(
+                  (e) =>
+                    e.organizationId === args.where.organizationId &&
+                    e.itemRevisionId === args.where.itemRevisionId,
+                )
+                .sort((a, b) => (a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0))
+                .map((e) => ({
+                  sequence: e.sequence,
+                  fromState: e.fromState,
+                  toState: e.toState,
+                  actedById: e.actedById,
+                }));
+            }) as unknown,
+            create: (async (args: { data: Omit<EventRow, "id" | "sequence"> }) => {
+              const row: EventRow = {
+                id: `ev-${randomBytes(6).toString("hex")}`,
+                sequence: self.nextSequence(),
+                ...args.data,
+              };
+              self.events.push(row);
+              undo.push(() => {
+                const idx = self.events.indexOf(row);
+                if (idx >= 0) self.events.splice(idx, 1);
+              });
+              return row;
+            }) as unknown,
+          },
           itemRevision: {
             findFirst: (async (args: { where: { id: string; organizationId: string } }) => {
               const row = self.revisions.find(
                 (r) => r.id === args.where.id && r.organizationId === args.where.organizationId,
               );
               return row
-                ? { id: row.id, itemId: row.itemId, lifecycle: row.lifecycle, sourceRevisionId: row.sourceRevisionId }
+                ? {
+                    id: row.id,
+                    itemId: row.itemId,
+                    lifecycle: row.lifecycle,
+                    sourceRevisionId: row.sourceRevisionId,
+                    createdById: row.createdById ?? null,
+                    legacyLifecycleHold: row.legacyHold ? { itemRevisionId: row.id } : null,
+                  }
                 : null;
             }) as unknown,
             updateMany: (async (args: {
@@ -409,15 +533,31 @@ class FakeDatabase {
   }
 }
 
+// B03 FIXTURE UPDATE (Product Owner decision D-A): release is restricted to
+// APPROVER / ADMIN, never the creator or a submitter, and only for a revision
+// whose APPROVED state was recorded. The release tests below are about the
+// frozen baseline, not about who may release, so their default actor is now
+// an eligible APPROVER (previously ENGINEER, which B03 refuses), and
+// `seedApprovedRevision` seeds a revision created by a different user,
+// submitted by a third user and approved by the releasing APPROVER (D-A6
+// allows the same eligible person to approve and release). No baseline
+// assertion is changed. The authorization rules themselves are tested in the
+// "B03" section at the end of this file and in lifecycle-policy-core.test.ts.
 function actorIn(organizationId: string, overrides: Partial<Actor> = {}): Actor {
   return {
     userId: `user-${organizationId}`,
     organizationId,
-    role: "ENGINEER" as UserRole,
+    role: "APPROVER" as UserRole,
     name: "Test User",
     email: `user@${organizationId}.example`,
     ...overrides,
   };
+}
+
+/** Fixed, increasing timestamps for seeded history (before any live write). */
+const SEED_TIME = Date.UTC(2026, 0, 1);
+function seedTime(minutes: number): Date {
+  return new Date(SEED_TIME + minutes * 60_000);
 }
 
 function seedApprovedRevision(
@@ -433,7 +573,32 @@ function seedApprovedRevision(
     releasedAt: null,
     ...overrides,
   };
+  const org = row.organizationId;
+  if (row.createdById === undefined) row.createdById = `creator-${org}`;
   db.addRevision(row);
+  // The default releasing actor (`actorIn(org)`) is an active APPROVER.
+  if (!db.users.some((u) => u.organizationId === org && u.id === `user-${org}`)) {
+    db.addUser(org, `user-${org}`, "APPROVER");
+  }
+  if (row.lifecycle === LifecycleState.APPROVED) {
+    db.addEvent({
+      organizationId: org,
+      itemRevisionId: row.id,
+      fromState: LifecycleState.WORKING,
+      toState: LifecycleState.IN_REVIEW,
+      actedById: `submitter-${org}`,
+      actedByRole: "ENGINEER",
+      occurredAt: seedTime(1),
+    });
+    db.addEvent({
+      organizationId: org,
+      itemRevisionId: row.id,
+      fromState: LifecycleState.IN_REVIEW,
+      toState: LifecycleState.APPROVED,
+      actedById: `user-${org}`,
+      occurredAt: seedTime(2),
+    });
+  }
   return row;
 }
 
@@ -1115,4 +1280,522 @@ test("locks every closure document (direct AND dependency) in one ascending-id o
 
   assert.deepEqual(lockOrder, ["a-dep", "m-root", "z-dep"], "closure locked in one global ascending-id order");
   assert.equal(db.entries.length, 3);
+});
+
+// ============================================================
+// B03: approval authority, separation of duties, append-only lifecycle
+// events (Product Owner decisions D-A, D-A1..D-A9). Each test asserts both
+// the decision AND what was (or was not) written.
+// ============================================================
+
+/** A WORKING revision created by `creator-orgA`. */
+function seedWorkingRevision(
+  db: FakeDatabase,
+  overrides: Partial<RevisionRow> = {},
+): RevisionRow {
+  const row: RevisionRow = {
+    organizationId: "orgA",
+    id: "rev-w",
+    itemId: "item-1",
+    lifecycle: LifecycleState.WORKING,
+    sourceRevisionId: null,
+    releasedAt: null,
+    createdById: "creator-orgA",
+    ...overrides,
+  };
+  db.addRevision(row);
+  return row;
+}
+
+function actorAs(userId: string, role: string): Actor {
+  return actorIn("orgA", { userId, role: role as UserRole });
+}
+
+async function expectPermissionError(
+  run: () => Promise<unknown>,
+  code: string,
+): Promise<void> {
+  await assert.rejects(run, (error: unknown) => {
+    assert.ok(error instanceof LifecyclePermissionError, `expected LifecyclePermissionError, got ${String(error)}`);
+    assert.equal(error.code, code);
+    return true;
+  });
+}
+
+function snapshot(db: FakeDatabase) {
+  return {
+    lifecycles: db.revisions.map((r) => `${r.id}:${r.lifecycle}`),
+    events: db.events.length,
+    baselines: db.baselines.length,
+  };
+}
+
+test("B03 full flow: designer creates, engineer submits, approver approves and releases - one event per step, actor + role + time recorded", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "creator-orgA", "DESIGNER");
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db);
+  db.addLink("orgA", "rev-w", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider, {
+    comment: "  looks good \u0007 ",
+  });
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.RELEASED, db.db, db.provider);
+
+  const events = db.eventsFor("rev-w");
+  assert.deepEqual(
+    events.map((e) => [e.fromState, e.toState, e.actedById, e.actedByRole, e.trigger]),
+    [
+      ["WORKING", "IN_REVIEW", "eng", "ENGINEER", "MANUAL"],
+      ["IN_REVIEW", "APPROVED", "appr", "APPROVER", "MANUAL"],
+      ["APPROVED", "RELEASED", "appr", "APPROVER", "MANUAL"],
+    ],
+  );
+  assert.equal(events[1]!.comment, "looks good", "comment trimmed, control characters stripped");
+  assert.equal(events[0]!.comment, null);
+  const revision = db.revisions.find((r) => r.id === "rev-w")!;
+  assert.equal(revision.lifecycle, LifecycleState.RELEASED);
+  assert.equal(
+    events[2]!.occurredAt.getTime(),
+    revision.releasedAt!.getTime(),
+    "release event and releasedAt are the same instant",
+  );
+  assert.equal(events.every((e) => e.organizationId === "orgA"), true);
+  assert.equal(db.baselines.length, 1);
+});
+
+test("B03 D-A + D-A9: only APPROVER or ADMIN may approve - ENGINEER, DESIGNER and REVIEWER are refused, nothing written", async () => {
+  for (const role of ["ENGINEER", "DESIGNER", "REVIEWER"]) {
+    const db = new FakeDatabase();
+    db.addUser("orgA", "eng", "ENGINEER");
+    db.addUser("orgA", "x", role);
+    seedWorkingRevision(db);
+    await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+    const before = snapshot(db);
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs("x", role), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+      "ROLE_NOT_PERMITTED",
+    );
+    assert.deepEqual(snapshot(db), before, `${role}: no state change, no event`);
+  }
+});
+
+test("B03 D-A: only APPROVER or ADMIN may release - an ENGINEER release is refused, no baseline, no event", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addLink("orgA", "rev-1", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    "ROLE_NOT_PERMITTED",
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("B03 D-A + D-A4: the creator cannot approve or release, even as APPROVER or ADMIN", async () => {
+  for (const role of ["APPROVER", "ADMIN"]) {
+    const db = new FakeDatabase();
+    db.addUser("orgA", "creator-orgA", role);
+    db.addUser("orgA", "eng", "ENGINEER");
+    seedWorkingRevision(db);
+    await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+    const before = snapshot(db);
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs("creator-orgA", role), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+      "CREATOR_CANNOT_APPROVE",
+    );
+    assert.deepEqual(snapshot(db), before, `${role} creator: nothing written`);
+  }
+
+  const db = new FakeDatabase();
+  seedApprovedRevision(db, { createdById: "admin-creator" });
+  db.addUser("orgA", "admin-creator", "ADMIN");
+  db.addLink("orgA", "rev-1", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("admin-creator", "ADMIN"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    "CREATOR_CANNOT_APPROVE",
+  );
+  assert.deepEqual(snapshot(db), before, "ADMIN creator cannot release (no override)");
+});
+
+test("B03 D-A1: anyone who EVER submitted is excluded - A submits, it is returned, B resubmits, A (APPROVER) still cannot approve or release", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "a", "APPROVER");
+  db.addUser("orgA", "b", "ENGINEER");
+  db.addUser("orgA", "appr2", "APPROVER");
+  seedWorkingRevision(db);
+  db.addLink("orgA", "rev-w", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+
+  await advanceRevisionForActor(actorAs("a", "APPROVER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("b", "ENGINEER"), "rev-w", LifecycleState.WORKING, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("b", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("a", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+    "SUBMITTER_CANNOT_APPROVE",
+  );
+  assert.deepEqual(snapshot(db), before);
+
+  // A different approver approves; A still may not release.
+  await advanceRevisionForActor(actorAs("appr2", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider);
+  const beforeRelease = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("a", "APPROVER"), "rev-w", LifecycleState.RELEASED, db.db, db.provider),
+    "SUBMITTER_CANNOT_APPROVE",
+  );
+  assert.deepEqual(snapshot(db), beforeRelease);
+});
+
+test("B03 D-A2: a legacy revision with NO recorded creator may be approved by an eligible approver", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db, { createdById: null });
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  assert.equal(db.eventsFor("rev-w").length, 2);
+});
+
+// ------------------------------------------------------------
+// Codex NO-GO finding 1: the legacy hold cannot be bypassed
+// ------------------------------------------------------------
+
+test("B03 finding 1: legacy IN_REVIEW - three return/resubmit cycles never lift the hold; APPROVER and ADMIN approval refused every time; history, creator and hold intact", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "des", "DESIGNER");
+  db.addUser("orgA", "appr", "APPROVER");
+  db.addUser("orgA", "admin", "ADMIN");
+  const rev = seedWorkingRevision(db, { id: "legacy-review", lifecycle: LifecycleState.IN_REVIEW, legacyHold: true });
+
+  for (const [actor, role] of [["appr", "APPROVER"], ["admin", "ADMIN"]] as const) {
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs(actor, role), "legacy-review", LifecycleState.APPROVED, db.db, db.provider),
+      "LEGACY_HISTORY_UNVERIFIED",
+    );
+  }
+  for (let cycle = 1; cycle <= 3; cycle += 1) {
+    await advanceRevisionForActor(actorAs("des", "DESIGNER"), "legacy-review", LifecycleState.WORKING, db.db, db.provider, {
+      comment: `revalidation attempt ${cycle}`,
+    });
+    await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "legacy-review", LifecycleState.IN_REVIEW, db.db, db.provider);
+    for (const [actor, role] of [["appr", "APPROVER"], ["admin", "ADMIN"]] as const) {
+      const before = snapshot(db);
+      await expectPermissionError(
+        () => advanceRevisionForActor(actorAs(actor, role), "legacy-review", LifecycleState.APPROVED, db.db, db.provider),
+        "LEGACY_HISTORY_UNVERIFIED",
+      );
+      assert.deepEqual(snapshot(db), before, `cycle ${cycle}, ${role}: nothing written`);
+    }
+  }
+  assert.equal(rev.lifecycle, LifecycleState.IN_REVIEW, "never APPROVED");
+  assert.equal(rev.legacyHold, true, "hold still present");
+  assert.equal(rev.createdById, "creator-orgA", "creator untouched");
+  const history = db.eventsFor("legacy-review");
+  assert.equal(history.length, 6, "only the 3 returns + 3 resubmissions were recorded");
+  assert.equal(history.every((e) => e.toState !== "APPROVED"), true);
+  assert.equal(history.some((e) => e.actedById !== "des" && e.actedById !== "eng"), false, "no fabricated submitter");
+});
+
+test("B03 finding 1: legacy APPROVED - release refused (ADMIN); after undo-approval and resubmission, approval is still refused", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "appr", "APPROVER");
+  db.addUser("orgA", "appr2", "APPROVER");
+  db.addUser("orgA", "admin", "ADMIN");
+  seedWorkingRevision(db, { id: "legacy-approved", lifecycle: LifecycleState.APPROVED, legacyHold: true });
+  db.addLink("orgA", "legacy-approved", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("admin", "ADMIN"), "legacy-approved", LifecycleState.RELEASED, db.db, db.provider),
+    "LEGACY_HISTORY_UNVERIFIED",
+  );
+  await advanceRevisionForActor(actorAs("appr2", "APPROVER"), "legacy-approved", LifecycleState.WORKING, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "legacy-approved", LifecycleState.IN_REVIEW, db.db, db.provider);
+  for (const [actor, role] of [["appr", "APPROVER"], ["admin", "ADMIN"]] as const) {
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs(actor, role), "legacy-approved", LifecycleState.APPROVED, db.db, db.provider),
+      "LEGACY_HISTORY_UNVERIFIED",
+    );
+  }
+  assert.equal(db.baselines.length, 0);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.IN_REVIEW);
+});
+
+test("B03 finding 1: a legacy WORKING revision (pre-B03 history unverifiable) may be submitted but never approved; a legacy hold also wins over an unknown creator (D-A2)", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "admin", "ADMIN");
+  seedWorkingRevision(db, { id: "legacy-working", legacyHold: true });
+  seedWorkingRevision(db, { id: "legacy-nocreator", itemId: "item-2", createdById: null, legacyHold: true });
+  for (const id of ["legacy-working", "legacy-nocreator"]) {
+    await advanceRevisionForActor(actorAs("eng", "ENGINEER"), id, LifecycleState.IN_REVIEW, db.db, db.provider);
+    await expectPermissionError(
+      () => advanceRevisionForActor(actorAs("admin", "ADMIN"), id, LifecycleState.APPROVED, db.db, db.provider),
+      "LEGACY_HISTORY_UNVERIFIED",
+    );
+  }
+});
+
+test("B03 defense in depth: a NON-legacy revision whose current state was not reached by a recorded event (changed outside the app) is refused STATE_NOT_RECORDED", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db, { id: "oob-review", lifecycle: LifecycleState.IN_REVIEW });
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("appr", "APPROVER"), "oob-review", LifecycleState.APPROVED, db.db, db.provider),
+    "STATE_NOT_RECORDED",
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+// ------------------------------------------------------------
+// Codex NO-GO finding 3: authoritative database order (`sequence`)
+// ------------------------------------------------------------
+
+test("B03 finding 3: REVERSED timestamps - the decision follows sequence: a recorded resubmission (highest sequence, earliest time) allows approval", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db, { id: "rev-r", lifecycle: LifecycleState.IN_REVIEW });
+  // sequence order: submit, return, resubmit. Time order is scrambled so that
+  // the time-latest event is the RETURN (a time-ordered check would refuse).
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-r", sequence: 11n, fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "s1", occurredAt: seedTime(10) });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-r", sequence: 12n, fromState: LifecycleState.IN_REVIEW, toState: LifecycleState.WORKING, actedById: "s1", occurredAt: seedTime(30) });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-r", sequence: 13n, fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "s2", occurredAt: seedTime(20) });
+
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-r", LifecycleState.APPROVED, db.db, db.provider);
+  const approval = db.eventsFor("rev-r").find((e) => e.toState === "APPROVED")!;
+  assert.ok(approval.sequence > 13n, "the new event is ordered after all existing events");
+});
+
+test("B03 finding 3: REVERSED timestamps cannot make an unrecorded state look recorded (time-latest = submit, sequence-latest = return)", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db, { id: "rev-x", lifecycle: LifecycleState.IN_REVIEW }); // state changed outside the app
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-x", sequence: 21n, fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "s1", occurredAt: seedTime(50) });
+  db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-x", sequence: 22n, fromState: LifecycleState.IN_REVIEW, toState: LifecycleState.WORKING, actedById: "s1", occurredAt: seedTime(10) });
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-x", LifecycleState.APPROVED, db.db, db.provider),
+    "STATE_NOT_RECORDED",
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("B03 finding 3: EQUAL timestamps - sequence alone decides (allowed when the highest sequence is the submission, refused when it is the return)", async () => {
+  const same = seedTime(5);
+  for (const [lastTo, expectAllowed] of [[LifecycleState.IN_REVIEW, true], [LifecycleState.WORKING, false]] as const) {
+    const db = new FakeDatabase();
+    db.addUser("orgA", "appr", "APPROVER");
+    seedWorkingRevision(db, { id: "rev-eq", lifecycle: LifecycleState.IN_REVIEW });
+    db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-eq", sequence: 31n, fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "s1", occurredAt: same });
+    db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-eq", sequence: 32n, fromState: LifecycleState.IN_REVIEW, toState: LifecycleState.WORKING, actedById: "s1", occurredAt: same });
+    db.addEvent({ organizationId: "orgA", itemRevisionId: "rev-eq", sequence: lastTo === LifecycleState.IN_REVIEW ? 33n : 30n, fromState: LifecycleState.WORKING, toState: LifecycleState.IN_REVIEW, actedById: "s2", occurredAt: same });
+    const run = () => advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-eq", LifecycleState.APPROVED, db.db, db.provider);
+    if (expectAllowed) {
+      await run();
+      assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+    } else {
+      await expectPermissionError(run, "STATE_NOT_RECORDED");
+    }
+  }
+});
+
+test("B03 finding 3: every write gets a strictly increasing sequence (full flow + supersession); a rolled-back attempt consumes a value but leaves no row", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db, { id: "rev-source", lifecycle: LifecycleState.RELEASED, releasedAt: new Date() });
+  seedApprovedRevision(db, { id: "rev-successor", sourceRevisionId: "rev-source" });
+  db.addLink("orgA", "rev-successor", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1, { present: false });
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-successor", LifecycleState.RELEASED, db.db, db.provider),
+    ReleaseBaselineIncompleteError,
+  );
+  const consumed = db.nextSequence(); // the failed attempt's value is gone, like a PostgreSQL sequence
+  db.storageObjects.add("org/orgA/doc/doc-1/v1/fv-1-v1");
+  db.storedBytes.set("org/orgA/doc/doc-1/v1/fv-1-v1", { sha256: "checksum-fv-1-v1", size: 100 });
+  await advanceRevisionForActor(actorIn("orgA"), "rev-successor", LifecycleState.RELEASED, db.db, db.provider);
+  const release = db.eventsFor("rev-successor").at(-1)!;
+  const supersession = db.eventsFor("rev-source").at(-1)!;
+  assert.equal(release.toState, "RELEASED");
+  assert.equal(supersession.toState, "SUPERSEDED");
+  assert.ok(release.sequence > consumed && supersession.sequence > release.sequence, "release, then supersession, in sequence order");
+  const all = db.events.map((e) => e.sequence);
+  assert.equal(new Set(all.map(String)).size, all.length, "sequences are unique");
+});
+
+test("B03 D-A5: any write role may return a revision from review; only APPROVER/ADMIN may undo an approval", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "des", "DESIGNER");
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("des", "DESIGNER"), "rev-w", LifecycleState.WORKING, db.db, db.provider, {
+    comment: "missing drawing",
+  });
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.WORKING);
+  assert.equal(db.eventsFor("rev-w").at(-1)!.comment, "missing drawing");
+
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider);
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.WORKING, db.db, db.provider),
+    "ROLE_NOT_PERMITTED",
+  );
+  assert.deepEqual(snapshot(db), before, "ENGINEER cannot undo an approval");
+
+  await advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.WORKING, db.db, db.provider);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.WORKING);
+  assert.equal(db.eventsFor("rev-w").length, 5);
+});
+
+test("B03: the role is re-read in the transaction - a request-time APPROVER demoted to ENGINEER is refused; a deactivated user is refused", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+  db.addUser("orgA", "demoted", "ENGINEER");
+  db.addUser("orgA", "gone", "APPROVER", false);
+  const before = snapshot(db);
+
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("demoted", "APPROVER"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    "ROLE_NOT_PERMITTED",
+  );
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("gone", "APPROVER"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    "ACTOR_NOT_ACTIVE",
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("B03: a VIEWER (re-read from the database) cannot make any transition", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "viewer", "VIEWER");
+  seedWorkingRevision(db);
+  const before = snapshot(db);
+  await expectPermissionError(
+    () => advanceRevisionForActor(actorAs("viewer", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider),
+    "ROLE_NOT_PERMITTED",
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("B03: a successful release records an AUTOMATIC_SUPERSESSION event for the superseded source (actor = releaser)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db, { id: "rev-source", lifecycle: LifecycleState.RELEASED, releasedAt: new Date() });
+  seedApprovedRevision(db, { id: "rev-successor", sourceRevisionId: "rev-source" });
+  db.addLink("orgA", "rev-successor", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1);
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-successor", LifecycleState.RELEASED, db.db, db.provider);
+
+  const sourceEvents = db.eventsFor("rev-source");
+  assert.equal(sourceEvents.length, 1);
+  assert.deepEqual(
+    [sourceEvents[0]!.fromState, sourceEvents[0]!.toState, sourceEvents[0]!.trigger, sourceEvents[0]!.actedById],
+    ["RELEASED", "SUPERSEDED", "AUTOMATIC_SUPERSESSION", "user-orgA"],
+  );
+  const releaseEvent = db.eventsFor("rev-successor").at(-1)!;
+  assert.equal(releaseEvent.toState, "RELEASED");
+  assert.equal(sourceEvents[0]!.occurredAt.getTime(), releaseEvent.occurredAt.getTime());
+});
+
+test("B03: a failed release (missing binary) writes NO event - neither the release nor the supersession", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db, { id: "rev-source", lifecycle: LifecycleState.RELEASED, releasedAt: new Date() });
+  seedApprovedRevision(db, { id: "rev-successor", sourceRevisionId: "rev-source" });
+  db.addLink("orgA", "rev-successor", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1, { present: false });
+  const eventsBefore = db.events.length;
+
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-successor", LifecycleState.RELEASED, db.db, db.provider),
+    ReleaseBaselineIncompleteError,
+  );
+  assert.equal(db.events.length, eventsBefore, "rollback removed every event this attempt wrote");
+  assert.equal(db.revisions.find((r) => r.id === "rev-source")!.lifecycle, LifecycleState.RELEASED);
+});
+
+test("B03: concurrent approvals by two eligible approvers - exactly one succeeds and exactly one APPROVED event is written", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "appr1", "APPROVER");
+  db.addUser("orgA", "appr2", "ADMIN");
+  seedWorkingRevision(db);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+
+  const results = await Promise.allSettled([
+    advanceRevisionForActor(actorAs("appr1", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+    advanceRevisionForActor(actorAs("appr2", "ADMIN"), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+  ]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(db.eventsFor("rev-w").filter((e) => e.toState === "APPROVED").length, 1);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  // Finding 3: the winner's event has the highest sequence, so the
+  // sequence-latest event equals the current state.
+  const history = db.eventsFor("rev-w");
+  const top = history.reduce((a, b) => (b.sequence > a.sequence ? b : a));
+  assert.equal(top.toState, "APPROVED");
+});
+
+test("B03 finding 3: concurrent approve vs return-to-Working - exactly one wins and the sequence-latest event equals the final state", async () => {
+  for (let round = 0; round < 5; round += 1) {
+    const db = new FakeDatabase();
+    db.addUser("orgA", "eng", "ENGINEER");
+    db.addUser("orgA", "des", "DESIGNER");
+    db.addUser("orgA", "appr", "APPROVER");
+    seedWorkingRevision(db);
+    await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+    const pair = [
+      advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+      advanceRevisionForActor(actorAs("des", "DESIGNER"), "rev-w", LifecycleState.WORKING, db.db, db.provider),
+    ];
+    const results = await Promise.allSettled(round % 2 === 0 ? pair : pair.reverse());
+    assert.equal(results.filter((r) => r.status === "fulfilled").length, 1, `round ${round}`);
+    const history = db.eventsFor("rev-w");
+    assert.equal(history.length, 2, `round ${round}: submit + exactly one winner`);
+    const top = history.reduce((a, b) => (b.sequence > a.sequence ? b : a));
+    assert.equal(top.toState, db.revisions[0]!.lifecycle, `round ${round}`);
+  }
+});
+
+test("B03: tenant isolation - a revision in another organization is not found and no event is written", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "appr", "APPROVER");
+  seedWorkingRevision(db, { organizationId: "orgB", lifecycle: LifecycleState.IN_REVIEW });
+  await assert.rejects(
+    () => advanceRevisionForActor(actorAs("appr", "APPROVER"), "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+    /Revision not found/,
+  );
+  assert.equal(db.events.length, 0);
+});
+
+test("B03 D-A7: an over-long comment is refused before the transaction starts; nothing written", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  seedWorkingRevision(db);
+  await assert.rejects(
+    () =>
+      advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider, {
+        comment: "x".repeat(MAX_LIFECYCLE_COMMENT_LENGTH + 1),
+      }),
+    InvalidLifecycleCommentError,
+  );
+  assert.equal(db.transactionAttempts, 0);
+  assert.equal(db.events.length, 0);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.WORKING);
 });

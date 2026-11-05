@@ -100,11 +100,17 @@
  */
 import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
-import { LifecycleState } from "../generated/prisma/enums.ts";
+import { LifecycleEventTrigger, LifecycleState } from "../generated/prisma/enums.ts";
 import {
   isTerminalLifecycle,
   isManualTransitionAllowed,
 } from "./revisions.ts";
+import {
+  evaluateLifecycleTransition,
+  normalizeLifecycleComment,
+  type LifecycleDenialCode,
+  type LifecycleEventFact,
+} from "./lifecycle-policy-core.ts";
 import {
   lockCadDocumentForVersionMutation,
   runSerializableTransaction,
@@ -145,8 +151,31 @@ export type ReleaseDb = Pick<
   | "fileVersion"
   | "releaseBaseline"
   | "releaseBaselineEntry"
+  | "user"
+  | "itemRevisionLifecycleEvent"
   | "$transaction"
 >;
+
+/**
+ * B03: a lifecycle transition refused by the authorization / separation-of-
+ * duties policy (`lifecycle-policy-core.ts`), or because the acting user is
+ * no longer an active member of the organization. Thrown inside the
+ * transaction BEFORE any write, so a refusal changes nothing.
+ */
+export class LifecyclePermissionError extends Error {
+  readonly code: LifecycleDenialCode | "ACTOR_NOT_ACTIVE";
+  constructor(code: LifecycleDenialCode | "ACTOR_NOT_ACTIVE", message: string) {
+    super(message);
+    this.name = "LifecyclePermissionError";
+    this.code = code;
+  }
+}
+
+/** B03 options for `advanceRevisionForActor`. */
+export interface AdvanceRevisionOptions {
+  /** Optional human comment (D-A7); normalized before the transaction. */
+  comment?: unknown;
+}
 
 /**
  * Resolve the release closure AND hold a `FOR UPDATE` lock on every
@@ -352,14 +381,31 @@ export async function buildReleaseBaselineInTransaction(
 /**
  * Move an ItemRevision to a new lifecycle state - a verbatim port of the
  * pre-P3D-1 `advanceRevision` transaction body (see module doc comment),
- * with ONE addition: when `target === RELEASED` and the conditional update
- * actually applies, atomically build the frozen release baseline in the
- * SAME transaction before it commits.
+ * with these additions:
+ *  - P3D-1: when `target === RELEASED` and the conditional update actually
+ *    applies, atomically build the frozen release baseline in the SAME
+ *    transaction before it commits.
+ *  - B03: after the existing existence / terminal / transition-map checks,
+ *    and BEFORE any write, the acting user's role and active flag are
+ *    re-read from the database, the revision's legacy hold and its recorded
+ *    lifecycle history (ordered by the database-assigned `sequence`) are
+ *    read, and `evaluateLifecycleTransition` decides whether this actor may
+ *    make this transition (approval authority, separation of duties, legacy
+ *    hold). Every
+ *    successful transition then writes exactly one ItemRevisionLifecycleEvent
+ *    (MANUAL), and an applied supersession writes one more for the
+ *    superseded source (AUTOMATIC_SUPERSESSION) - all in the same
+ *    transaction, so a refusal or any later failure leaves no state change
+ *    and no event.
  *
  * @throws Error if the revision does not exist, is already terminal, the
  *   transition is not allowed, or a concurrent update won the race after
  *   the bounded SERIALIZABLE retry is exhausted (exact messages preserved
  *   from the original implementation).
+ * @throws LifecyclePermissionError if the policy refuses the transition or
+ *   the acting user is no longer active - nothing is written.
+ * @throws InvalidLifecycleCommentError if the comment is not text or too long
+ *   (checked before the transaction starts).
  * @throws ReleaseBaselineIncompleteError / ReleaseClosureTooLargeError /
  *   ReleaseClosureInvalidError if `target === RELEASED` and the frozen
  *   package cannot be captured - the revision does NOT become RELEASED (the
@@ -371,7 +417,10 @@ export async function advanceRevisionForActor(
   target: LifecycleState,
   db: ReleaseDb,
   provider: StorageProvider,
+  options: AdvanceRevisionOptions = {},
 ): Promise<void> {
+  const comment = normalizeLifecycleComment(options.comment);
+
   try {
     await runSerializableTransaction(db, async (tx) => {
       const current = await tx.itemRevision.findFirst({
@@ -381,6 +430,9 @@ export async function advanceRevisionForActor(
           itemId: true,
           lifecycle: true,
           sourceRevisionId: true,
+          createdById: true,
+          // B03 (NO-GO finding 1): pre-B03 revisions carry an immutable hold.
+          legacyLifecycleHold: { select: { itemRevisionId: true } },
         },
       });
 
@@ -399,6 +451,59 @@ export async function advanceRevisionForActor(
         );
       }
 
+      // B03: authorization inside the transaction, before any write. The
+      // role is re-read here (not trusted from the request-time actor), so a
+      // demotion or deactivation that commits first is honored.
+      const actingUser = await tx.user.findFirst({
+        where: {
+          id: actor.userId,
+          organizationId: actor.organizationId,
+          active: true,
+        },
+        select: { id: true, role: true },
+      });
+      if (!actingUser) {
+        throw new LifecyclePermissionError(
+          "ACTOR_NOT_ACTIVE",
+          "Your account is not active in this organization.",
+        );
+      }
+
+      // Ordered by the database-assigned `sequence` (NO-GO finding 3); the
+      // policy itself also orders by `sequence`, never by time.
+      const history: LifecycleEventFact[] =
+        await tx.itemRevisionLifecycleEvent.findMany({
+          where: {
+            organizationId: actor.organizationId,
+            itemRevisionId: current.id,
+          },
+          orderBy: { sequence: "asc" },
+          select: {
+            sequence: true,
+            fromState: true,
+            toState: true,
+            actedById: true,
+          },
+        });
+
+      const decision = evaluateLifecycleTransition({
+        actorId: actingUser.id,
+        actorRole: actingUser.role,
+        from: current.lifecycle,
+        to: target,
+        creatorId: current.createdById,
+        legacyHold: current.legacyLifecycleHold !== null,
+        events: history,
+      });
+      if (!decision.allowed) {
+        throw new LifecyclePermissionError(decision.code, decision.message);
+      }
+
+      // One instant for the state change and its event (and releasedAt).
+      // Informational only: history order is the database `sequence`
+      // assigned at INSERT below (NO-GO finding 3).
+      const at = new Date();
+
       // Optimistic conditional update: only apply if the revision is STILL in
       // the state we validated the transition against.
       const updated = await tx.itemRevision.updateMany({
@@ -409,7 +514,7 @@ export async function advanceRevisionForActor(
         },
         data:
           target === LifecycleState.RELEASED
-            ? { lifecycle: target, releasedAt: new Date() }
+            ? { lifecycle: target, releasedAt: at }
             : { lifecycle: target },
       });
 
@@ -419,10 +524,24 @@ export async function advanceRevisionForActor(
         );
       }
 
+      await tx.itemRevisionLifecycleEvent.create({
+        data: {
+          organizationId: actor.organizationId,
+          itemRevisionId: current.id,
+          fromState: current.lifecycle,
+          toState: target,
+          trigger: LifecycleEventTrigger.MANUAL,
+          actedById: actingUser.id,
+          actedByRole: actingUser.role,
+          comment,
+          occurredAt: at,
+        },
+      });
+
       // Automatic supersession along source-revision lineage - runs only
       // because the conditional release above succeeded.
       if (target === LifecycleState.RELEASED && current.sourceRevisionId) {
-        await tx.itemRevision.updateMany({
+        const superseded = await tx.itemRevision.updateMany({
           where: {
             id: current.sourceRevisionId,
             organizationId: actor.organizationId,
@@ -431,6 +550,22 @@ export async function advanceRevisionForActor(
           },
           data: { lifecycle: LifecycleState.SUPERSEDED },
         });
+        // B03: record the supersession only if it actually happened.
+        if (superseded.count > 0) {
+          await tx.itemRevisionLifecycleEvent.create({
+            data: {
+              organizationId: actor.organizationId,
+              itemRevisionId: current.sourceRevisionId,
+              fromState: LifecycleState.RELEASED,
+              toState: LifecycleState.SUPERSEDED,
+              trigger: LifecycleEventTrigger.AUTOMATIC_SUPERSESSION,
+              actedById: actingUser.id,
+              actedByRole: actingUser.role,
+              comment: null,
+              occurredAt: at,
+            },
+          });
+        }
       }
 
       // Frozen release baseline, atomic with the transition above. Any
