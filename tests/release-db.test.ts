@@ -39,6 +39,8 @@ import {
   InvalidLifecycleCommentError,
   MAX_LIFECYCLE_COMMENT_LENGTH,
 } from "../app/lib/lifecycle-policy-core.ts";
+import { LifecycleStateError } from "../app/lib/lifecycle-errors-core.ts";
+import { classifyActionError } from "../app/lib/action-notice-core.ts";
 
 // ------------------------------------------------------------
 // Fake database + storage: REAL per-row async mutex behind $transaction +
@@ -1813,6 +1815,99 @@ test("B03 D-A7: an over-long comment is refused before the transaction starts; n
   assert.equal(db.transactionAttempts, 0);
   assert.equal(db.events.length, 0);
   assert.equal(db.revisions[0]!.lifecycle, LifecycleState.WORKING);
+});
+
+// ============================================================
+// Pilot UX fix KI-2: lifecycle state refusals carry a stable code
+// (LifecycleStateError) with their UNCHANGED messages, are classified as
+// allowlisted notices, and still write nothing.
+// ============================================================
+
+async function expectStateError(run: () => Promise<unknown>, code: string, message: RegExp): Promise<void> {
+  await assert.rejects(run, (error: unknown) => {
+    assert.ok(error instanceof LifecycleStateError, `expected LifecycleStateError, got ${String(error)}`);
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, code);
+    assert.match(error.message, message, "message unchanged");
+    assert.equal(classifyActionError(error), `state.${code}`);
+    return true;
+  });
+}
+
+test("KI-2: a stale transition (already In Review -> In Review) is INVALID_TRANSITION with the unchanged message; nothing written", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "eng", "ENGINEER");
+  seedWorkingRevision(db);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  const before = snapshot(db);
+  await expectStateError(
+    () => advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider),
+    "INVALID_TRANSITION",
+    /^Invalid lifecycle transition: IN_REVIEW -> IN_REVIEW$/,
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("KI-2: a terminal revision is TERMINAL_REVISION and a missing / other-org revision is REVISION_NOT_FOUND; nothing written", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db, { lifecycle: LifecycleState.RELEASED, releasedAt: new Date() });
+  const before = snapshot(db);
+  await expectStateError(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.WORKING, db.db, db.provider),
+    "TERMINAL_REVISION",
+    /^Released or terminal revisions cannot be changed$/,
+  );
+  await expectStateError(
+    () => advanceRevisionForActor(actorIn("orgA"), "no-such-revision", LifecycleState.WORKING, db.db, db.provider),
+    "REVISION_NOT_FOUND",
+    /^Revision not found$/,
+  );
+  await expectStateError(
+    () => advanceRevisionForActor(actorIn("orgB"), "rev-1", LifecycleState.WORKING, db.db, db.provider),
+    "REVISION_NOT_FOUND",
+    /^Revision not found$/,
+  );
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("KI-2: permission refusals are unchanged LifecyclePermissionErrors and are classified as allowlisted notices; nothing written", async () => {
+  const db = new FakeDatabase();
+  db.addUser("orgA", "creator-orgA", "APPROVER");
+  db.addUser("orgA", "eng", "ENGINEER");
+  db.addUser("orgA", "rev", "REVIEWER");
+  seedWorkingRevision(db);
+  await advanceRevisionForActor(actorAs("eng", "ENGINEER"), "rev-w", LifecycleState.IN_REVIEW, db.db, db.provider);
+  const before = snapshot(db);
+  for (const [actor, code] of [
+    [actorAs("creator-orgA", "APPROVER"), "CREATOR_CANNOT_APPROVE"],
+    [actorAs("rev", "REVIEWER"), "ROLE_NOT_PERMITTED"],
+  ] as const) {
+    await assert.rejects(
+      () => advanceRevisionForActor(actor, "rev-w", LifecycleState.APPROVED, db.db, db.provider),
+      (error: unknown) => {
+        assert.ok(error instanceof LifecyclePermissionError);
+        assert.equal(error.code, code);
+        assert.equal(classifyActionError(error), `lifecycle.${code}`);
+        return true;
+      },
+    );
+  }
+  assert.deepEqual(snapshot(db), before);
+});
+
+test("KI-2: an unexpected failure during a release (missing binary) is NOT classified as a refusal", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "doc-1");
+  seedDocumentWithVersion(db, "doc-1", "fv-1-v1", 1, { present: false });
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseBaselineIncompleteError);
+      assert.equal(classifyActionError(error), null, "an integrity failure reaches the error page, not a notice");
+      return true;
+    },
+  );
 });
 
 // ============================================================

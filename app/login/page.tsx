@@ -1,13 +1,23 @@
-import { redirect } from "next/navigation";
+import { redirect, unstable_rethrow } from "next/navigation";
 
 import { auth, signIn } from "@/auth";
+import {
+  isSignInErrorParam,
+  runSignInAttempt,
+  SIGN_IN_FAILED_MESSAGE,
+  SIGN_IN_REFUSED_HREF,
+} from "@/app/lib/action-notice-core";
 
-export default async function LoginPage() {
+export default async function LoginPage({ searchParams }: PageProps<"/login">) {
   const session = await auth();
 
   if (session?.user) {
     redirect("/");
   }
+
+  // KI-1: only the exact value set by the login action shows the (fixed,
+  // generic) message; any other value is ignored.
+  const signInFailed = isSignInErrorParam((await searchParams).error);
 
   async function login(formData: FormData) {
     "use server";
@@ -19,11 +29,24 @@ export default async function LoginPage() {
       return;
     }
 
-    await signIn("credentials", {
-      email,
-      password,
-      redirectTo: "/",
-    });
+    // KI-1: refused credentials (unknown email, wrong password, inactive
+    // account - Auth.js reports all three the same way) come back to this
+    // page with one generic message. A successful sign-in's redirect and any
+    // other error are rethrown unchanged. The redirect below is outside the
+    // try/catch inside runSignInAttempt, as Next.js requires.
+    const outcome = await runSignInAttempt(
+      () =>
+        signIn("credentials", {
+          email,
+          password,
+          redirectTo: "/",
+        }),
+      { rethrowFramework: unstable_rethrow },
+    );
+
+    if (outcome === "refused") {
+      redirect(SIGN_IN_REFUSED_HREF);
+    }
   }
 
   return (
@@ -67,6 +90,25 @@ export default async function LoginPage() {
             Product Lifecycle Management
           </p>
         </div>
+
+        {signInFailed ? (
+          <p
+            role="alert"
+            data-testid="sign-in-error"
+            style={{
+              marginTop: 0,
+              marginBottom: "20px",
+              padding: "12px 14px",
+              borderRadius: "8px",
+              border: "1px solid #fda29b",
+              background: "#fef3f2",
+              color: "#912018",
+              fontSize: "14px",
+            }}
+          >
+            {SIGN_IN_FAILED_MESSAGE}
+          </p>
+        ) : null}
 
         <form action={login}>
           <div style={{ marginBottom: "20px" }}>

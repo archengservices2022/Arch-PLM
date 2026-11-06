@@ -1,0 +1,305 @@
+import {
+  InvalidLifecycleCommentError,
+  LIFECYCLE_DENIAL_MESSAGES,
+  MAX_LIFECYCLE_COMMENT_LENGTH,
+  type LifecycleDenialCode,
+} from "./lifecycle-policy-core.ts";
+import {
+  LEGACY_REVALIDATION_MESSAGES,
+  LegacyRevalidationError,
+  type LegacyRevalidationCode,
+} from "./legacy-revalidation-core.ts";
+import {
+  LifecycleStateError,
+  type LifecycleStateErrorCode,
+} from "./lifecycle-errors-core.ts";
+
+// ============================================================
+// Arch PLM - safe refusal notices for Server Actions (pilot UX fixes)
+//
+// Pure: no I/O and no Next.js imports, so the plain Node test runner can load
+// it. Used by app/actions.ts, app/page.tsx and app/login/page.tsx.
+//
+// KI-1  A refused sign-in (wrong email or password, inactive account) is
+//       shown as one generic message instead of an error page.
+// KI-2  An EXPECTED refusal of a lifecycle, revalidation or "Create next
+//       revision" action is shown as a fixed message on the dashboard
+//       instead of an error page.
+//
+// SAFETY RULES
+//   1. Only refusals on the explicit allowlist below become notices.
+//      Anything else - unexpected errors, database errors, bugs - is
+//      rethrown unchanged and reaches the error boundary (app/error.tsx).
+//   2. Next.js control-flow errors (redirect, notFound, ...) are NEVER
+//      treated as refusals; they are rethrown before classification.
+//   3. The URL carries only a notice CODE. The page shows the fixed message
+//      for an allowlisted code and ignores any other value, so no text from
+//      the URL is ever rendered.
+//   4. Classification happens after the action has already failed: the
+//      refusals are all raised before any write or inside a transaction that
+//      rolled back. Nothing about permissions or transactions changes here.
+// ============================================================
+
+// ------------------------------------------------------------
+// Next.js control flow
+// ------------------------------------------------------------
+
+/**
+ * Digests of the errors Next.js throws to implement redirect(), notFound(),
+ * forbidden()/unauthorized() and request-time APIs. They must always
+ * propagate. (app/actions.ts additionally calls Next's own
+ * `unstable_rethrow` first; this check keeps the pure layer safe on its own.)
+ */
+const NEXT_CONTROL_FLOW_DIGEST_PREFIXES = [
+  "NEXT_REDIRECT",
+  "NEXT_NOT_FOUND",
+  "NEXT_HTTP_ERROR_FALLBACK",
+  "DYNAMIC_SERVER_USAGE",
+  "BAILOUT_TO_CLIENT_SIDE_RENDERING",
+  "NEXT_PRERENDER_INTERRUPTED",
+  "HANGING_PROMISE_REJECTION",
+] as const;
+
+export function isNextControlFlowError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const digest = (error as { digest?: unknown }).digest;
+  return (
+    typeof digest === "string" &&
+    NEXT_CONTROL_FLOW_DIGEST_PREFIXES.some((prefix) => digest.startsWith(prefix))
+  );
+}
+
+// ------------------------------------------------------------
+// Refusals raised directly by app/actions.ts
+// ------------------------------------------------------------
+
+export type ActionRefusalCode =
+  | "TARGET_STATE_REQUIRED"
+  | "CREATE_NEXT_SOURCE_NOT_FOUND"
+  | "CREATE_NEXT_HELD_SOURCE"
+  | "CREATE_NEXT_NOT_ELIGIBLE"
+  | "CREATE_NEXT_REVISION_LIMIT"
+  | "CREATE_NEXT_REVISION_EXISTS"
+  | "CREATE_NEXT_ROLE_NOT_PERMITTED";
+
+/**
+ * An expected refusal raised by a Server Action itself. `message` keeps the
+ * text the action has always used (server logs, callers); the dashboard shows
+ * the fixed notice for `code` instead.
+ */
+export class ActionRefusalError extends Error {
+  readonly code: ActionRefusalCode;
+  constructor(code: ActionRefusalCode, message: string = ACTION_REFUSAL_MESSAGES[code]) {
+    super(message);
+    this.name = "ActionRefusalError";
+    this.code = code;
+  }
+}
+
+export const ACTION_REFUSAL_MESSAGES: Record<ActionRefusalCode, string> = {
+  TARGET_STATE_REQUIRED: "Choose the state to move this revision to, then select Update.",
+  CREATE_NEXT_SOURCE_NOT_FOUND:
+    "That revision was not found. Refresh the page and try again.",
+  CREATE_NEXT_HELD_SOURCE:
+    "This legacy revision cannot be used as the source for a new revision. Use “Revalidate as new revision” instead.",
+  CREATE_NEXT_NOT_ELIGIBLE:
+    "A new revision can only be created from an Approved or Released revision.",
+  CREATE_NEXT_REVISION_LIMIT:
+    "This item has reached revision Z; revisions beyond Z are not supported yet.",
+  CREATE_NEXT_REVISION_EXISTS:
+    "The next revision already exists for this item. Refresh the page to see it.",
+  CREATE_NEXT_ROLE_NOT_PERMITTED:
+    "Your role does not allow creating new revisions.",
+};
+
+const LIFECYCLE_STATE_MESSAGES: Record<LifecycleStateErrorCode, string> = {
+  REVISION_NOT_FOUND: "That revision was not found. Refresh the page and try again.",
+  TERMINAL_REVISION: "Released or terminal revisions cannot be changed.",
+  INVALID_TRANSITION:
+    "This revision's state changed since the page was loaded, so that change is no longer possible. Check its current state and try again.",
+  CONCURRENT_CHANGE:
+    "The revision changed while you were updating it. Refresh and try again.",
+  RETRY_EXHAUSTED:
+    "Could not update the revision because of concurrent changes. Please try again.",
+};
+
+const ACTOR_NOT_ACTIVE_MESSAGE = "Your account is not active in this organization.";
+
+const COMMENT_TOO_LONG_MESSAGE = `The comment or reason is too long (maximum ${MAX_LIFECYCLE_COMMENT_LENGTH} characters).`;
+
+// ------------------------------------------------------------
+// The allowlist: notice code -> fixed message
+// ------------------------------------------------------------
+
+function namespaced<C extends string>(
+  prefix: string,
+  messages: Record<C, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [code, message] of Object.entries(messages) as [C, string][]) {
+    out[`${prefix}.${code}`] = message;
+  }
+  return out;
+}
+
+const NOTICE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  ...namespaced<LifecycleDenialCode>("lifecycle", LIFECYCLE_DENIAL_MESSAGES),
+  "lifecycle.ACTOR_NOT_ACTIVE": ACTOR_NOT_ACTIVE_MESSAGE,
+  ...namespaced<LegacyRevalidationCode>("revalidation", LEGACY_REVALIDATION_MESSAGES),
+  ...namespaced<LifecycleStateErrorCode>("state", LIFECYCLE_STATE_MESSAGES),
+  ...namespaced<ActionRefusalCode>("action", ACTION_REFUSAL_MESSAGES),
+  "comment.INVALID": COMMENT_TOO_LONG_MESSAGE,
+});
+
+/** A notice code on the allowlist (branded so only validated codes flow on). */
+export type NoticeCode = string & { readonly __notice: true };
+
+/** Every allowlisted code (for tests and documentation). */
+export function allNoticeCodes(): NoticeCode[] {
+  return Object.keys(NOTICE_MESSAGES) as NoticeCode[];
+}
+
+function allowlisted(code: string): NoticeCode | null {
+  return Object.prototype.hasOwnProperty.call(NOTICE_MESSAGES, code)
+    ? (code as NoticeCode)
+    : null;
+}
+
+/**
+ * Validate the `notice` search parameter. Returns the code only when it is
+ * exactly one allowlisted value; arrays, unknown values and anything else
+ * return null and are ignored.
+ */
+export function parseNoticeCode(raw: unknown): NoticeCode | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 64) return null;
+  return allowlisted(raw);
+}
+
+/** The fixed message for an allowlisted code. */
+export function noticeMessage(code: NoticeCode): string {
+  return NOTICE_MESSAGES[code];
+}
+
+/** Where a refused action sends the user: the dashboard with the code only. */
+export function noticeHref(code: NoticeCode): string {
+  return `/?notice=${encodeURIComponent(code)}`;
+}
+
+// ------------------------------------------------------------
+// Classification
+// ------------------------------------------------------------
+
+/**
+ * Map an error to an allowlisted notice code, or null when it is NOT an
+ * expected refusal (the caller must then rethrow it unchanged).
+ *
+ * `LifecyclePermissionError` lives in release-db.ts (which needs the
+ * database), so it is recognized by its stable `name` plus an allowlisted
+ * `code`; errors are created only on the server, never from request data.
+ */
+export function classifyActionError(error: unknown): NoticeCode | null {
+  if (isNextControlFlowError(error)) return null;
+  if (!(error instanceof Error)) return null;
+
+  if (error instanceof LegacyRevalidationError) {
+    return allowlisted(`revalidation.${error.code}`);
+  }
+  if (error instanceof LifecycleStateError) {
+    return allowlisted(`state.${error.code}`);
+  }
+  if (error instanceof ActionRefusalError) {
+    return allowlisted(`action.${error.code}`);
+  }
+  if (error instanceof InvalidLifecycleCommentError) {
+    return allowlisted("comment.INVALID");
+  }
+  if (error.name === "LifecyclePermissionError") {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? allowlisted(`lifecycle.${code}`) : null;
+  }
+  return null;
+}
+
+/**
+ * Run a Server Action body. Resolves to null on success, or to the notice
+ * code of an EXPECTED refusal. Anything else is rethrown unchanged:
+ * `rethrowFramework` (Next's `unstable_rethrow` in production code) runs
+ * first, then the pure control-flow check, then the allowlist.
+ *
+ * The caller performs the redirect AFTER this resolves, outside any
+ * try/catch, as Next.js requires.
+ */
+export async function runRefusable(
+  run: () => Promise<unknown>,
+  options: {
+    classify?: (error: unknown) => NoticeCode | null;
+    rethrowFramework?: (error: unknown) => void;
+  } = {},
+): Promise<NoticeCode | null> {
+  const classify = options.classify ?? classifyActionError;
+  try {
+    await run();
+    return null;
+  } catch (error) {
+    options.rethrowFramework?.(error);
+    if (isNextControlFlowError(error)) throw error;
+    const code = classify(error);
+    if (code === null) throw error;
+    return code;
+  }
+}
+
+// ------------------------------------------------------------
+// KI-1: sign-in
+// ------------------------------------------------------------
+
+/** The only accepted value of /login?error=... */
+export const SIGN_IN_ERROR_PARAM = "signin";
+
+/**
+ * One message for every refused sign-in (unknown email, wrong password,
+ * inactive account), so the page reveals nothing about which accounts exist.
+ */
+export const SIGN_IN_FAILED_MESSAGE = "Invalid email or password.";
+
+/**
+ * True only for Auth.js's refused-credentials error (`CredentialsSignin`,
+ * raised when `authorize` returns null). Every other Auth.js error (for
+ * example a configuration or database failure) and Next's success redirect
+ * are NOT refusals and must propagate.
+ */
+export function isCredentialsSignInError(error: unknown): boolean {
+  if (isNextControlFlowError(error)) return false;
+  if (!(error instanceof Error)) return false;
+  return (error as { type?: unknown }).type === "CredentialsSignin";
+}
+
+/** True only when /login?error= carries exactly the accepted value. */
+export function isSignInErrorParam(raw: unknown): boolean {
+  return raw === SIGN_IN_ERROR_PARAM;
+}
+
+/** Where a refused sign-in sends the user. */
+export const SIGN_IN_REFUSED_HREF = `/login?error=${SIGN_IN_ERROR_PARAM}`;
+
+/**
+ * Run a sign-in attempt. Resolves to "refused" only for refused credentials.
+ * A successful sign-in ends in Next's redirect, which - like every other
+ * error - is rethrown unchanged (`rethrowFramework` first, then the pure
+ * control-flow check). The caller redirects to SIGN_IN_REFUSED_HREF outside
+ * any try/catch.
+ */
+export async function runSignInAttempt(
+  run: () => Promise<unknown>,
+  options: { rethrowFramework?: (error: unknown) => void } = {},
+): Promise<"completed" | "refused"> {
+  try {
+    await run();
+    return "completed";
+  } catch (error) {
+    options.rethrowFramework?.(error);
+    if (isNextControlFlowError(error)) throw error;
+    if (!isCredentialsSignInError(error)) throw error;
+    return "refused";
+  }
+}

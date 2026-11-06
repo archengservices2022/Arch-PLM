@@ -112,6 +112,7 @@ import {
   type LifecycleEventFact,
 } from "./lifecycle-policy-core.ts";
 import { lineageExclusionIds } from "./legacy-revalidation-core.ts";
+import { LifecycleStateError } from "./lifecycle-errors-core.ts";
 import {
   lockCadDocumentForVersionMutation,
   runSerializableTransaction,
@@ -447,17 +448,24 @@ export async function advanceRevisionForActor(
         },
       });
 
+      // Pilot UX fix KI-2: the refusals below carry their unchanged messages
+      // plus a stable code (LifecycleStateError), so the dashboard can show
+      // a fixed message instead of an error page. Same checks, same order.
       if (!current) {
-        throw new Error("Revision not found");
+        throw new LifecycleStateError("REVISION_NOT_FOUND", "Revision not found");
       }
 
       // Release immutability + existing terminal protection.
       if (isTerminalLifecycle(current.lifecycle)) {
-        throw new Error("Released or terminal revisions cannot be changed");
+        throw new LifecycleStateError(
+          "TERMINAL_REVISION",
+          "Released or terminal revisions cannot be changed",
+        );
       }
 
       if (!isManualTransitionAllowed(current.lifecycle, target)) {
-        throw new Error(
+        throw new LifecycleStateError(
+          "INVALID_TRANSITION",
           `Invalid lifecycle transition: ${current.lifecycle} -> ${target}`,
         );
       }
@@ -553,7 +561,8 @@ export async function advanceRevisionForActor(
       });
 
       if (updated.count === 0) {
-        throw new Error(
+        throw new LifecycleStateError(
+          "CONCURRENT_CHANGE",
           "The revision changed while you were updating it. Refresh and try again.",
         );
       }
@@ -657,7 +666,8 @@ export async function advanceRevisionForActor(
   } catch (error) {
     if (error instanceof SerializableTransactionExhaustedError) {
       // Preserves the exact original message for this failure mode.
-      throw new Error(
+      throw new LifecycleStateError(
+        "RETRY_EXHAUSTED",
         "Could not update the revision due to concurrent changes, please retry",
       );
     }

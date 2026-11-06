@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { redirect, unstable_rethrow } from "next/navigation";
 import {
   LifecycleState,
   ItemType,
@@ -9,7 +10,12 @@ import {
 } from "@/app/generated/prisma/enums";
 import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/app/lib/prisma";
-import { assertCanMutate, requireActor } from "@/app/lib/authz";
+import {
+  assertCanMutate,
+  hasRole,
+  PLM_WRITE_ROLES,
+  requireActor,
+} from "@/app/lib/authz";
 import { getStorageProvider } from "@/app/lib/storage";
 import { advanceRevisionForActor } from "@/app/lib/release-db";
 import { revalidateLegacyRevisionForActor } from "@/app/lib/legacy-revalidation-db";
@@ -18,6 +24,11 @@ import {
   isHeldNonTerminalSource,
 } from "@/app/lib/legacy-revalidation-core";
 import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
+import {
+  ActionRefusalError,
+  noticeHref,
+  runRefusable,
+} from "@/app/lib/action-notice-core";
 import {
   canCreateSuccessorFrom,
   isCarryForwardMode,
@@ -44,6 +55,25 @@ function optionalValue(formData: FormData, name: string) {
   }
 
   return value.trim();
+}
+
+/**
+ * Pilot UX fix KI-2: run the part of a Server Action that can be REFUSED.
+ *
+ * An expected, allowlisted refusal (app/lib/action-notice-core.ts) sends the
+ * user to the dashboard with a notice code, so they see a fixed message
+ * instead of an error page. Everything else - Next.js control flow first
+ * (`unstable_rethrow`), then any unexpected error - is rethrown unchanged.
+ *
+ * The refusals are all raised before any write or inside a transaction that
+ * has already rolled back, so nothing here changes what is written. The
+ * redirect happens OUTSIDE the try/catch, as Next.js requires.
+ */
+async function runWithRefusalNotice(run: () => Promise<unknown>): Promise<void> {
+  const notice = await runRefusable(run, { rethrowFramework: unstable_rethrow });
+  if (notice !== null) {
+    redirect(noticeHref(notice));
+  }
 }
 
 function enumValue<T extends Record<string, string>>(
@@ -230,15 +260,20 @@ export async function advanceRevision(formData: FormData) {
   assertCanMutate(actor);
 
   const revisionId = requiredValue(formData, "revisionId");
-  const target = enumValue(
-    LifecycleState,
-    requiredValue(formData, "lifecycle"),
-    "lifecycle",
-  );
   const comment = optionalValue(formData, "comment");
 
-  await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider(), {
-    comment,
+  await runWithRefusalNotice(async () => {
+    // KI-3: the dashboard no longer pre-selects a state; a submission
+    // without an explicit choice is refused with a message.
+    const rawTarget = optionalValue(formData, "lifecycle");
+    if (rawTarget === undefined) {
+      throw new ActionRefusalError("TARGET_STATE_REQUIRED", "lifecycle is required");
+    }
+    const target = enumValue(LifecycleState, rawTarget, "lifecycle");
+
+    await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider(), {
+      comment,
+    });
   });
 
   revalidatePath("/");
@@ -302,6 +337,17 @@ function isDuplicateRevisionError(error: unknown): boolean {
  */
 export async function createEngineeringRevision(formData: FormData) {
   const actor = await requireActor();
+  // F-1: a direct request from a role that may not create revisions (e.g.
+  // VIEWER) gets a typed, allowlisted notice instead of an error page. Same
+  // rule as assertCanMutate, which stays below as the enforcing check.
+  await runWithRefusalNotice(async () => {
+    if (!hasRole(actor, PLM_WRITE_ROLES)) {
+      throw new ActionRefusalError(
+        "CREATE_NEXT_ROLE_NOT_PERMITTED",
+        "You do not have permission to perform this action.",
+      );
+    }
+  });
   assertCanMutate(actor);
 
   const sourceRevisionId = requiredValue(formData, "sourceRevisionId");
@@ -328,7 +374,9 @@ export async function createEngineeringRevision(formData: FormData) {
 
   const providedDescription = optionalValue(formData, "description");
 
-  await prisma.$transaction(async (tx) => {
+  // KI-2: the expected refusals below are ActionRefusalErrors (same messages
+  // as before); they roll the transaction back and are shown as a notice.
+  await runWithRefusalNotice(() => prisma.$transaction(async (tx) => {
     // 1-2. Source revision + its Item must be in the actor's organization.
     const source = await tx.itemRevision.findFirst({
       where: { id: sourceRevisionId, organizationId: actor.organizationId },
@@ -345,7 +393,10 @@ export async function createEngineeringRevision(formData: FormData) {
     });
 
     if (!source || source.item.organizationId !== actor.organizationId) {
-      throw new Error("Source revision not found in your organization");
+      throw new ActionRefusalError(
+        "CREATE_NEXT_SOURCE_NOT_FOUND",
+        "Source revision not found in your organization",
+      );
     }
 
     // Option A: a held, non-terminal legacy revision (in practice a held
@@ -358,17 +409,25 @@ export async function createEngineeringRevision(formData: FormData) {
         legacyHold: source.legacyLifecycleHold !== null,
       })
     ) {
-      throw new Error(CREATE_NEXT_FROM_HELD_MESSAGE);
+      throw new ActionRefusalError("CREATE_NEXT_HELD_SOURCE", CREATE_NEXT_FROM_HELD_MESSAGE);
     }
 
     // 9. Eligibility: only APPROVED / RELEASED sources.
     if (!canCreateSuccessorFrom(source.lifecycle)) {
-      throw new Error(
+      throw new ActionRefusalError(
+        "CREATE_NEXT_NOT_ELIGIBLE",
         `A successor revision can only be created from an APPROVED or RELEASED revision (this revision is ${source.lifecycle}).`,
       );
     }
 
-    // 6 + 10. Next revision letter is derived on the server.
+    // 6 + 10. Next revision letter is derived on the server. Revision Z has
+    // no successor yet (same message nextRevisionLetter has always used).
+    if (source.revision.trim().toUpperCase() === "Z") {
+      throw new ActionRefusalError(
+        "CREATE_NEXT_REVISION_LIMIT",
+        "Revisions beyond Z are not supported yet.",
+      );
+    }
     const newRevision = nextRevisionLetter(source.revision);
 
     // 7. Reject an existing revision for the same Item (fast path; the unique
@@ -378,7 +437,8 @@ export async function createEngineeringRevision(formData: FormData) {
       select: { id: true },
     });
     if (clash) {
-      throw new Error(
+      throw new ActionRefusalError(
+        "CREATE_NEXT_REVISION_EXISTS",
         `Revision ${newRevision} already exists for this item.`,
       );
     }
@@ -439,7 +499,8 @@ export async function createEngineeringRevision(formData: FormData) {
       });
     } catch (error) {
       if (isDuplicateRevisionError(error)) {
-        throw new Error(
+        throw new ActionRefusalError(
+          "CREATE_NEXT_REVISION_EXISTS",
           `Revision ${newRevision} already exists for this item.`,
         );
       }
@@ -457,7 +518,7 @@ export async function createEngineeringRevision(formData: FormData) {
         })),
       });
     }
-  });
+  }));
 
   revalidatePath("/");
 }
@@ -482,16 +543,20 @@ export async function revalidateLegacyRevision(formData: FormData) {
     if (typeof value === "string" && value.trim() !== "") selected.push(value.trim());
   }
 
-  await revalidateLegacyRevisionForActor(
-    actor,
-    legacyRevisionId,
-    {
-      carryForward,
-      selectedCadDocumentIds: selected,
-      description: optionalValue(formData, "description") ?? null,
-      comment: formData.get("reason") ?? undefined,
-    },
-    prisma,
+  // KI-2: expected refusals (reason required, revision Z, role, ...) are
+  // shown as a notice; nothing is written when they occur.
+  await runWithRefusalNotice(() =>
+    revalidateLegacyRevisionForActor(
+      actor,
+      legacyRevisionId,
+      {
+        carryForward,
+        selectedCadDocumentIds: selected,
+        description: optionalValue(formData, "description") ?? null,
+        comment: formData.get("reason") ?? undefined,
+      },
+      prisma,
+    ),
   );
 
   revalidatePath("/");

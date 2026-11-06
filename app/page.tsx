@@ -14,8 +14,15 @@ import {
   revalidateLegacyRevision,
 } from "@/app/actions";
 import { UploadFileVersion } from "@/app/components/upload-file-version";
+import { ActionNotice } from "@/app/components/action-notice";
+import { noticeMessage, parseNoticeCode } from "@/app/lib/action-notice-core";
 import { prisma } from "@/app/lib/prisma";
-import { requireDashboardActor, type Actor } from "@/app/lib/authz";
+import {
+  hasRole,
+  PLM_WRITE_ROLES,
+  requireDashboardActor,
+  type Actor,
+} from "@/app/lib/authz";
 import {
   canCreateSuccessorFrom,
   manualTransitionTargets,
@@ -278,9 +285,14 @@ const lifecycleOrder = [
   LifecycleState.OBSOLETE,
 ];
 
-export default async function Home() {
+export default async function Home({ searchParams }: PageProps<"/">) {
   const actor = await requireDashboardActor();
   const dashboard = await loadDashboard(actor.organizationId);
+
+  // KI-2: a refused action redirects here with ?notice=<code>. Only an
+  // allowlisted code is shown, as its fixed message; anything else is ignored.
+  const noticeCode = parseNoticeCode((await searchParams).notice);
+  const notice = noticeCode ? noticeMessage(noticeCode) : null;
 
   if (dashboard.status === "unavailable") {
     return (
@@ -386,6 +398,7 @@ export default async function Home() {
               </p>
               <SessionBar actor={actor} />
             </div>
+            {notice ? <ActionNotice message={notice} /> : null}
             <h1 className="mt-3 text-4xl font-semibold tracking-normal">
               {organization?.name ?? "No workspace yet"}
             </h1>
@@ -944,7 +957,10 @@ function RevisionCard({
   const legacyHold = revision.legacyLifecycleHold !== null;
   // Option A: "Create next revision" refuses a held, non-terminal source;
   // such a revision is continued through revalidation instead.
+  // F-1: offered only to roles that may create revisions (the server enforces
+  // the same rule in createEngineeringRevision).
   const canCreateNext =
+    hasRole(actor, PLM_WRITE_ROLES) &&
     canCreateSuccessorFrom(revision.lifecycle) &&
     !isHeldNonTerminalSource({ lifecycle: revision.lifecycle, legacyHold });
   const revalidatedAs = revision.legacyRevalidationAsLegacy;
@@ -1115,11 +1131,17 @@ function RevisionCard({
           <input type="hidden" name="revisionId" value={revision.id} />
           <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
             Move to
+            {/* KI-3: no pre-selected transition; an explicit choice is
+                required (the server refuses an empty submission too). */}
             <select
               name="lifecycle"
-              defaultValue={transitionTargets[0]}
+              defaultValue=""
+              required
               className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm"
             >
+              <option value="" disabled>
+                Select a state…
+              </option>
               {transitionTargets.map((state) => (
                 <option key={state} value={state}>
                   {formatState(state)}
