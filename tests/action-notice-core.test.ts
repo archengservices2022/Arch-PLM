@@ -23,10 +23,12 @@ import {
   isCredentialsSignInError,
   isNextControlFlowError,
   isSignInErrorParam,
+  isUniqueViolationOn,
   noticeHref,
   noticeMessage,
   parseNoticeCode,
   refuseUnlessCanMutate,
+  retryOnSerializationConflict,
   runRefusable,
   runSignInAttempt,
   SIGN_IN_ERROR_PARAM,
@@ -192,6 +194,151 @@ test("SD-I1 guard: every Server Action that calls assertCanMutate first refuses 
       body.indexOf('"CREATE_NEXT_ROLE_NOT_PERMITTED"'), // F-1's specific refusal (createEngineeringRevision)
     );
     assert.ok(refuse !== -1 && refuse < enforce, `${name}: typed role refusal must come before role enforcement`);
+  }
+});
+
+// ------------------------------------------------------------
+// Form-errors follow-up: user-correctable Server Action refusals
+// ------------------------------------------------------------
+
+test("form errors: every new refusal code is allowlisted with a fixed message that never echoes input", () => {
+  const codes = [
+    "FIELD_REQUIRED", "FIELD_INVALID", "REVISION_LETTER_INVALID", "ITEM_NUMBER_EXISTS",
+    "PROJECT_NOT_FOUND", "ITEM_REVISION_NOT_FOUND", "CAD_DOCUMENT_NOT_FOUND",
+    "CAD_DOCUMENT_NOT_ON_SOURCE", "CAD_DOCUMENT_EXISTS", "REVISION_TERMINAL_FOR_CAD",
+    "CAD_SELF_DEPENDENCY", "CAD_DEPENDENCY_CYCLE", "CAD_DEPENDENCY_EXISTS",
+    "CAD_GRAPH_TOO_LARGE", "CONCURRENT_CHANGES",
+  ] as const;
+  for (const code of codes) {
+    const secret = `user-input-${code}-<script>`;
+    const notice = classifyActionError(new ActionRefusalError(code, `Item ${secret} already exists.`));
+    assert.equal(notice, `action.${code}`);
+    assert.equal(parseNoticeCode(`action.${code}`), `action.${code}`, "fits the 64-char allowlist limit");
+    assert.ok(!noticeMessage(notice!).includes(secret), `${code}: the notice never echoes the server message`);
+  }
+});
+
+test("isUniqueViolationOn: matches only a P2002 on the named constraint fields", () => {
+  const p2002 = (target: unknown) => Object.assign(new Error("Unique constraint failed"), { code: "P2002", meta: { target } });
+  // Array form (field names) and string form (index name) both match.
+  assert.equal(isUniqueViolationOn(p2002(["organizationId", "itemNumber"]), ["organizationId", "itemNumber"]), true);
+  assert.equal(isUniqueViolationOn(p2002("Item_organizationId_itemNumber_key"), ["organizationId", "itemNumber"]), true);
+  assert.equal(
+    isUniqueViolationOn(p2002("CadDocument_organizationId_documentNumber_documentType_key"), ["organizationId", "documentNumber", "documentType"]),
+    true,
+  );
+  // A different constraint, a partial match, another error code, odd shapes: never.
+  assert.equal(isUniqueViolationOn(p2002(["organizationId", "id"]), ["organizationId", "itemNumber"]), false);
+  assert.equal(isUniqueViolationOn(p2002(["organizationId", "documentNumber"]), ["organizationId", "documentNumber", "documentType"]), false);
+  assert.equal(isUniqueViolationOn(Object.assign(new Error("x"), { code: "P2034", meta: { target: ["itemNumber"] } }), ["itemNumber"]), false);
+  assert.equal(isUniqueViolationOn(p2002(undefined), ["itemNumber"]), false);
+  assert.equal(isUniqueViolationOn(p2002(42), ["itemNumber"]), false);
+  assert.equal(isUniqueViolationOn(null, ["itemNumber"]), false);
+  assert.equal(isUniqueViolationOn(new Error("itemNumber"), ["itemNumber"]), false);
+});
+
+test("FE-M1: retryOnSerializationConflict turns the LAST conflict into CONCURRENT_CHANGES after exactly maxAttempts", async () => {
+  const conflict = () => Object.assign(new Error("Transaction failed due to a write conflict"), { code: "P2034" });
+  const isConflict = (e: unknown) => (e as { code?: unknown } | null)?.code === "P2034";
+
+  // Always conflicting: 3 attempts, then the typed refusal (server message kept), onExhausted once.
+  let attempts = 0;
+  const exhausted: unknown[] = [];
+  let caught: unknown;
+  try {
+    await retryOnSerializationConflict(async () => {
+      attempts += 1;
+      throw conflict();
+    }, { isConflict, exhaustedMessage: "Could not add it due to concurrent changes", onExhausted: (e) => exhausted.push(e) });
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(attempts, 3);
+  assert.ok(caught instanceof ActionRefusalError);
+  assert.equal((caught as ActionRefusalError).code, "CONCURRENT_CHANGES");
+  assert.equal((caught as Error).message, "Could not add it due to concurrent changes");
+  assert.equal(exhausted.length, 1);
+  assert.equal(classifyActionError(caught), "action.CONCURRENT_CHANGES");
+
+  // Conflicts then success: the value is returned, no refusal.
+  let n = 0;
+  const value = await retryOnSerializationConflict(async (attempt) => {
+    n += 1;
+    if (attempt < 3) throw conflict();
+    return "committed";
+  }, { isConflict, exhaustedMessage: "x" });
+  assert.equal(value, "committed");
+  assert.equal(n, 3);
+
+  // A non-conflict error (or a refusal raised inside the transaction) propagates at once, unchanged.
+  for (const thrown of [new Error("boom"), new ActionRefusalError("CAD_DEPENDENCY_EXISTS", "exists")]) {
+    let tries = 0;
+    await assert.rejects(
+      retryOnSerializationConflict(async () => {
+        tries += 1;
+        throw thrown;
+      }, { isConflict, exhaustedMessage: "x" }),
+      (error) => error === thrown,
+    );
+    assert.equal(tries, 1, "never retried");
+  }
+
+  // maxAttempts is honoured.
+  let m = 0;
+  await assert.rejects(
+    retryOnSerializationConflict(async () => {
+      m += 1;
+      throw conflict();
+    }, { isConflict, exhaustedMessage: "x", maxAttempts: 5 }),
+    ActionRefusalError,
+  );
+  assert.equal(m, 5);
+
+  // FE-I1: an invalid maxAttempts is rejected before any attempt runs (never an endless retry).
+  for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    let ran = 0;
+    await assert.rejects(
+      retryOnSerializationConflict(async () => {
+        ran += 1;
+        throw conflict();
+      }, { isConflict, exhaustedMessage: "x", maxAttempts: bad }),
+      RangeError,
+    );
+    assert.equal(ran, 0, `maxAttempts ${bad}: nothing attempted`);
+  }
+});
+
+// FE-L2: the two guards below are regression TRIPWIRES based on text
+// matching, not a parser: they do not see `throw Error(` without `new`,
+// errors thrown by imported helpers, or a wrapper closed before a later
+// field read. Review still has to cover those.
+function actionsSourceWithoutComments(): string {
+  return readFileSync(new URL("../app/actions.ts", import.meta.url), "utf8")
+    .replace(/\r\n/g, "\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'`])\/\/[^\n]*/g, "$1");
+}
+
+test("form errors guard: the only plain `throw new Error` left in actions.ts is the database enum narrowing", () => {
+  const source = actionsSourceWithoutComments();
+  const plain = [...source.matchAll(/throw new Error\(/g)].map((m) => m.index!);
+  const enumFn = source.indexOf("function enumValue<");
+  const enumEnd = source.indexOf("\n}\n", enumFn);
+  assert.ok(enumFn !== -1 && enumEnd !== -1, "enumValue() exists");
+  assert.equal(plain.length, 1, `expected exactly 1 plain throw, found ${plain.length}; use ActionRefusalError for user-correctable refusals`);
+  assert.ok(plain[0] > enumFn && plain[0] < enumEnd, "the one plain throw is inside enumValue (data integrity, not user input)");
+});
+
+test("form errors guard: every Server Action reads form fields only inside its refusal wrapper", () => {
+  const source = actionsSourceWithoutComments();
+  for (const body of source.split(/\nexport async function /).slice(1)) {
+    const name = body.slice(0, body.indexOf("("));
+    const end = body.indexOf("\n}\n");
+    const fn = end === -1 ? body : body.slice(0, end);
+    const wrapStart = fn.lastIndexOf("await runWithRefusalNotice(");
+    for (const m of fn.matchAll(/\b(requiredValue|formEnumValue)\(/g)) {
+      assert.ok(wrapStart !== -1 && m.index! > wrapStart, `${name}: ${m[1]}() must be called inside runWithRefusalNotice`);
+    }
   }
 });
 

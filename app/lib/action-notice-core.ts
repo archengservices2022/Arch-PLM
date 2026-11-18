@@ -81,7 +81,23 @@ export type ActionRefusalCode =
   | "CREATE_NEXT_REVISION_LIMIT"
   | "CREATE_NEXT_REVISION_EXISTS"
   | "CREATE_NEXT_ROLE_NOT_PERMITTED"
-  | "ROLE_NOT_PERMITTED";
+  | "ROLE_NOT_PERMITTED"
+  // Form / data refusals (form-errors follow-up to SD-I1):
+  | "FIELD_REQUIRED"
+  | "FIELD_INVALID"
+  | "REVISION_LETTER_INVALID"
+  | "ITEM_NUMBER_EXISTS"
+  | "PROJECT_NOT_FOUND"
+  | "ITEM_REVISION_NOT_FOUND"
+  | "CAD_DOCUMENT_NOT_FOUND"
+  | "CAD_DOCUMENT_NOT_ON_SOURCE"
+  | "CAD_DOCUMENT_EXISTS"
+  | "REVISION_TERMINAL_FOR_CAD"
+  | "CAD_SELF_DEPENDENCY"
+  | "CAD_DEPENDENCY_CYCLE"
+  | "CAD_DEPENDENCY_EXISTS"
+  | "CAD_GRAPH_TOO_LARGE"
+  | "CONCURRENT_CHANGES";
 
 /**
  * An expected refusal raised by a Server Action itself. `message` keeps the
@@ -112,7 +128,83 @@ export const ACTION_REFUSAL_MESSAGES: Record<ActionRefusalCode, string> = {
   CREATE_NEXT_ROLE_NOT_PERMITTED:
     "Your role does not allow creating new revisions.",
   ROLE_NOT_PERMITTED: "Your role does not allow making changes. Ask an administrator if you need access.",
+  FIELD_REQUIRED: "Fill in all required fields, then try again.",
+  FIELD_INVALID: "One of the submitted values is not valid. Refresh the page and try again.",
+  REVISION_LETTER_INVALID: "The revision must be a single letter A–Z.",
+  ITEM_NUMBER_EXISTS: "An item with that item number already exists.",
+  PROJECT_NOT_FOUND: "That project was not found. Refresh the page and try again.",
+  ITEM_REVISION_NOT_FOUND: "That revision was not found. Refresh the page and try again.",
+  CAD_DOCUMENT_NOT_FOUND: "That CAD document was not found. Refresh the page and try again.",
+  CAD_DOCUMENT_NOT_ON_SOURCE:
+    "A selected CAD document is not linked to the source revision. Refresh the page and try again.",
+  CAD_DOCUMENT_EXISTS: "A CAD document with that document number and type already exists.",
+  REVISION_TERMINAL_FOR_CAD:
+    "CAD documents cannot be added to or linked to a released or terminal revision.",
+  CAD_SELF_DEPENDENCY: "A CAD document cannot depend on itself.",
+  CAD_DEPENDENCY_CYCLE: "That dependency would create a circular reference between CAD documents.",
+  CAD_DEPENDENCY_EXISTS: "That CAD dependency already exists.",
+  CAD_GRAPH_TOO_LARGE:
+    "The CAD reference graph is too large to check safely. Contact an administrator.",
+  CONCURRENT_CHANGES:
+    "The change could not be saved because of concurrent changes. Please try again.",
 };
+
+/**
+ * FE-M1: bounded retry for SERIALIZABLE transactions. `attempt` runs the whole
+ * transaction; an error `isConflict` accepts (Prisma P2034) is retried until
+ * `maxAttempts` have failed, and the LAST conflict becomes the typed
+ * CONCURRENT_CHANGES refusal (the transaction has rolled back, the user can
+ * simply try again). Any other error - including an ActionRefusalError raised
+ * inside the transaction - propagates unchanged on the attempt it occurs.
+ * `onExhausted` receives the final conflict (server-side logging only).
+ */
+export async function retryOnSerializationConflict<T>(
+  attempt: (attemptNumber: number) => Promise<T>,
+  options: {
+    isConflict: (error: unknown) => boolean;
+    exhaustedMessage: string;
+    maxAttempts?: number;
+    onExhausted?: (error: unknown) => void;
+  },
+): Promise<T> {
+  const maxAttempts = options.maxAttempts ?? 3;
+  // FE-I1: a non-integer (e.g. NaN) would never satisfy `>=` and retry forever.
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError(`maxAttempts must be a positive integer (got ${String(maxAttempts)})`);
+  }
+  for (let attemptNumber = 1; ; attemptNumber += 1) {
+    try {
+      return await attempt(attemptNumber);
+    } catch (error) {
+      if (!options.isConflict(error)) throw error;
+      if (attemptNumber >= maxAttempts) {
+        options.onExhausted?.(error);
+        throw new ActionRefusalError("CONCURRENT_CHANGES", options.exhaustedMessage);
+      }
+    }
+  }
+}
+
+/**
+ * True for a unique-constraint violation (Prisma P2002) whose target names
+ * EVERY one of `fields` (array form) or contains each of them (the string /
+ * index-name form, e.g. "Item_organizationId_itemNumber_key"). Duck-typed on
+ * `code` + `meta.target` so this stays pure; callers decide which constraint
+ * means which refusal, and any other P2002 is left alone.
+ */
+export function isUniqueViolationOn(error: unknown, fields: readonly string[]): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  if ((error as { code?: unknown }).code !== "P2002") return false;
+  const target = (error as { meta?: { target?: unknown } }).meta?.target;
+  if (Array.isArray(target)) {
+    const names = target.filter((field): field is string => typeof field === "string");
+    return fields.every((field) => names.includes(field));
+  }
+  if (typeof target === "string") {
+    return fields.every((field) => target.includes(field));
+  }
+  return false;
+}
 
 /**
  * SD-I1: the typed refusal for a role that may not mutate (e.g. VIEWER), so a

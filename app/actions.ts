@@ -27,8 +27,10 @@ import {
 import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
 import {
   ActionRefusalError,
+  isUniqueViolationOn,
   noticeHref,
   refuseUnlessCanMutate,
+  retryOnSerializationConflict,
   runRefusable,
 } from "@/app/lib/action-notice-core";
 import {
@@ -43,7 +45,7 @@ function requiredValue(formData: FormData, name: string) {
   const value = formData.get(name);
 
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${name} is required`);
+    throw new ActionRefusalError("FIELD_REQUIRED", `${name} is required`);
   }
 
   return value.trim();
@@ -90,6 +92,11 @@ async function refuseUnlessWriteRole(actor: Actor): Promise<void> {
   });
 }
 
+/**
+ * Narrow a value READ FROM THE DATABASE to an enum. A mismatch here is a data
+ * integrity fault, not a user mistake, so it stays a plain Error (error page).
+ * Form input uses `formEnumValue` instead.
+ */
 function enumValue<T extends Record<string, string>>(
   options: T,
   value: string,
@@ -97,6 +104,19 @@ function enumValue<T extends Record<string, string>>(
 ): T[keyof T] {
   if (!Object.values(options).includes(value)) {
     throw new Error(`${fieldName} is invalid`);
+  }
+
+  return value as T[keyof T];
+}
+
+/** Narrow a SUBMITTED form value to an enum; an unknown value is refused with a notice. */
+function formEnumValue<T extends Record<string, string>>(
+  options: T,
+  value: string,
+  fieldName: string,
+): T[keyof T] {
+  if (!Object.values(options).includes(value)) {
+    throw new ActionRefusalError("FIELD_INVALID", `${fieldName} is invalid`);
   }
 
   return value as T[keyof T];
@@ -115,22 +135,21 @@ async function runSerializable<T>(
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
   exhaustedMessage: string,
 ): Promise<T> {
-  const MAX_ATTEMPTS = 3;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await prisma.$transaction(fn, {
+  // FE-M1: the final conflict becomes the CONCURRENT_CHANGES notice (it was
+  // previously rethrown raw on the last attempt, i.e. an HTTP 500).
+  return retryOnSerializationConflict(
+    () =>
+      prisma.$transaction(fn, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-      });
-    } catch (error) {
-      if (isSerializationError(error) && attempt < MAX_ATTEMPTS) {
-        continue;
-      }
-      throw error;
-    }
-  }
+      }),
+    { isConflict: isSerializationError, exhaustedMessage, onExhausted: logRetryExhausted },
+  );
+}
 
-  throw new Error(exhaustedMessage);
+/** Server-side record of a retry exhaustion; the user only sees the fixed notice. */
+function logRetryExhausted(error: unknown): void {
+  const code = (error as { code?: unknown } | null)?.code;
+  console.warn(`Server Action: serializable retries exhausted (${typeof code === "string" ? code : "unknown"})`);
 }
 
 interface LockedItemRevision {
@@ -191,43 +210,66 @@ export async function createItem(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  // Engineering revisions are single letters A–Z. "a" -> "A"; reject "01"/"BETA"/"A1".
-  const rawRevision = optionalValue(formData, "revision");
-  const revision = rawRevision ? normalizeRevision(rawRevision) : "A";
-
-  // If a project is supplied, it must belong to the actor's organization.
-  const projectId = optionalValue(formData, "projectId");
-
-  if (projectId) {
-    const project = await prisma.project.findFirst({
-      where: {
-        id: projectId,
-        organizationId: actor.organizationId,
-      },
-      select: { id: true },
-    });
-
-    if (!project) {
-      throw new Error("Project not found in your organization");
+  // Form-errors follow-up: user-correctable refusals become a dashboard
+  // notice; nothing is written when one occurs.
+  await runWithRefusalNotice(async () => {
+    // Engineering revisions are single letters A–Z. "a" -> "A"; reject "01"/"BETA"/"A1".
+    const rawRevision = optionalValue(formData, "revision");
+    let revision = "A";
+    if (rawRevision) {
+      try {
+        revision = normalizeRevision(rawRevision);
+      } catch (error) {
+        throw new ActionRefusalError(
+          "REVISION_LETTER_INVALID",
+          error instanceof Error ? error.message : "Revision must be a single letter A–Z.",
+        );
+      }
     }
-  }
 
-  await prisma.item.create({
-    data: {
-      organizationId: actor.organizationId,
-      projectId: projectId ?? undefined,
-      itemNumber: requiredValue(formData, "itemNumber").toUpperCase(),
-      description: requiredValue(formData, "description"),
-      type: enumValue(ItemType, requiredValue(formData, "type"), "type"),
-      revisions: {
-        create: {
-          revision,
-          description: requiredValue(formData, "revisionDescription"),
-          // Milestone 3: audit lineage. Initial revision has no source.
-          createdById: actor.userId,
+    // If a project is supplied, it must belong to the actor's organization.
+    const projectId = optionalValue(formData, "projectId");
+
+    if (projectId) {
+      const project = await prisma.project.findFirst({
+        where: {
+          id: projectId,
+          organizationId: actor.organizationId,
         },
-      },
-    },
+        select: { id: true },
+      });
+
+      if (!project) {
+        throw new ActionRefusalError("PROJECT_NOT_FOUND", "Project not found in your organization");
+      }
+    }
+
+    const itemNumber = requiredValue(formData, "itemNumber").toUpperCase();
+    try {
+      await prisma.item.create({
+        data: {
+          organizationId: actor.organizationId,
+          projectId: projectId ?? undefined,
+          itemNumber,
+          description: requiredValue(formData, "description"),
+          type: formEnumValue(ItemType, requiredValue(formData, "type"), "type"),
+          revisions: {
+            create: {
+              revision,
+              description: requiredValue(formData, "revisionDescription"),
+              // Milestone 3: audit lineage. Initial revision has no source.
+              createdById: actor.userId,
+            },
+          },
+        },
+      });
+    } catch (error) {
+      // Only @@unique([organizationId, itemNumber]) means "duplicate item number".
+      if (isUniqueViolationOn(error, ["organizationId", "itemNumber"])) {
+        throw new ActionRefusalError("ITEM_NUMBER_EXISTS", `Item ${itemNumber} already exists.`);
+      }
+      throw error;
+    }
   });
 
   revalidatePath("/");
@@ -275,17 +317,17 @@ export async function advanceRevision(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  const revisionId = requiredValue(formData, "revisionId");
   const comment = optionalValue(formData, "comment");
 
   await runWithRefusalNotice(async () => {
+    const revisionId = requiredValue(formData, "revisionId");
     // KI-3: the dashboard no longer pre-selects a state; a submission
     // without an explicit choice is refused with a message.
     const rawTarget = optionalValue(formData, "lifecycle");
     if (rawTarget === undefined) {
       throw new ActionRefusalError("TARGET_STATE_REQUIRED", "lifecycle is required");
     }
-    const target = enumValue(LifecycleState, rawTarget, "lifecycle");
+    const target = formEnumValue(LifecycleState, rawTarget, "lifecycle");
 
     await advanceRevisionForActor(actor, revisionId, target, prisma, getStorageProvider(), {
       comment,
@@ -366,175 +408,180 @@ export async function createEngineeringRevision(formData: FormData) {
   });
   assertCanMutate(actor);
 
-  const sourceRevisionId = requiredValue(formData, "sourceRevisionId");
+  // KI-2 + form-errors follow-up: the expected refusals below (form input
+  // included) are ActionRefusalErrors (same server messages as before); they
+  // roll the transaction back and are shown as a notice.
+  await runWithRefusalNotice(async () => {
+    const sourceRevisionId = requiredValue(formData, "sourceRevisionId");
 
-  // Explicit carry-forward mode. Default "all"; unknown values are rejected.
-  const carryForwardMode = optionalValue(formData, "carryForwardMode") ?? "all";
-  if (!isCarryForwardMode(carryForwardMode)) {
-    throw new Error(`Unknown carry-forward mode: "${carryForwardMode}"`);
-  }
-
-  // Submitted document ids (only meaningful in "selected" mode).
-  const selectedDocumentIds = new Set<string>();
-  for (const value of formData.getAll("carryForwardDocumentId")) {
-    if (typeof value === "string" && value.trim() !== "") {
-      selectedDocumentIds.add(value.trim());
-    }
-  }
-  const csv = optionalValue(formData, "carryForwardDocumentIds");
-  if (csv) {
-    for (const part of csv.split(",")) {
-      if (part.trim() !== "") selectedDocumentIds.add(part.trim());
-    }
-  }
-
-  const providedDescription = optionalValue(formData, "description");
-
-  // KI-2: the expected refusals below are ActionRefusalErrors (same messages
-  // as before); they roll the transaction back and are shown as a notice.
-  await runWithRefusalNotice(() => prisma.$transaction(async (tx) => {
-    // 1-2. Source revision + its Item must be in the actor's organization.
-    const source = await tx.itemRevision.findFirst({
-      where: { id: sourceRevisionId, organizationId: actor.organizationId },
-      select: {
-        id: true,
-        itemId: true,
-        revision: true,
-        lifecycle: true,
-        description: true,
-        item: { select: { organizationId: true } },
-        documentLinks: { select: { cadDocumentId: true } },
-        legacyLifecycleHold: { select: { itemRevisionId: true } },
-      },
-    });
-
-    if (!source || source.item.organizationId !== actor.organizationId) {
-      throw new ActionRefusalError(
-        "CREATE_NEXT_SOURCE_NOT_FOUND",
-        "Source revision not found in your organization",
-      );
+    // Explicit carry-forward mode. Default "all"; unknown values are rejected.
+    const carryForwardMode = optionalValue(formData, "carryForwardMode") ?? "all";
+    if (!isCarryForwardMode(carryForwardMode)) {
+      throw new ActionRefusalError("FIELD_INVALID", `Unknown carry-forward mode: "${carryForwardMode}"`);
     }
 
-    // Option A: a held, non-terminal legacy revision (in practice a held
-    // APPROVED one) may only be continued through "Revalidate as new
-    // revision", which closes it, records the reason and applies the O-2
-    // exclusions. Held RELEASED/SUPERSEDED/OBSOLETE sources are unaffected.
-    if (
-      isHeldNonTerminalSource({
-        lifecycle: source.lifecycle,
-        legacyHold: source.legacyLifecycleHold !== null,
-      })
-    ) {
-      throw new ActionRefusalError("CREATE_NEXT_HELD_SOURCE", CREATE_NEXT_FROM_HELD_MESSAGE);
-    }
-
-    // 9. Eligibility: only APPROVED / RELEASED sources.
-    if (!canCreateSuccessorFrom(source.lifecycle)) {
-      throw new ActionRefusalError(
-        "CREATE_NEXT_NOT_ELIGIBLE",
-        `A successor revision can only be created from an APPROVED or RELEASED revision (this revision is ${source.lifecycle}).`,
-      );
-    }
-
-    // 6 + 10. Next revision letter is derived on the server. Revision Z has
-    // no successor yet (same message nextRevisionLetter has always used).
-    if (source.revision.trim().toUpperCase() === "Z") {
-      throw new ActionRefusalError(
-        "CREATE_NEXT_REVISION_LIMIT",
-        "Revisions beyond Z are not supported yet.",
-      );
-    }
-    const newRevision = nextRevisionLetter(source.revision);
-
-    // 7. Reject an existing revision for the same Item (fast path; the unique
-    // constraint below is the real guard against races).
-    const clash = await tx.itemRevision.findFirst({
-      where: { itemId: source.itemId, revision: newRevision },
-      select: { id: true },
-    });
-    if (clash) {
-      throw new ActionRefusalError(
-        "CREATE_NEXT_REVISION_EXISTS",
-        `Revision ${newRevision} already exists for this item.`,
-      );
-    }
-
-    // 5. Resolve carry-forward set from the EXPLICIT mode.
-    const sourceDocumentIds = source.documentLinks.map(
-      (link) => link.cadDocumentId,
-    );
-    let carryForwardIds: string[];
-    if (carryForwardMode === "none") {
-      carryForwardIds = [];
-    } else if (carryForwardMode === "all") {
-      carryForwardIds = sourceDocumentIds;
-    } else {
-      // "selected": carry only the submitted ids, each of which must be
-      // linked to the source revision.
-      for (const id of selectedDocumentIds) {
-        if (!sourceDocumentIds.includes(id)) {
-          throw new Error(
-            "A selected CAD document is not linked to the source revision.",
-          );
-        }
+    // Submitted document ids (only meaningful in "selected" mode).
+    const selectedDocumentIds = new Set<string>();
+    for (const value of formData.getAll("carryForwardDocumentId")) {
+      if (typeof value === "string" && value.trim() !== "") {
+        selectedDocumentIds.add(value.trim());
       }
-      carryForwardIds = [...selectedDocumentIds];
+    }
+    const csv = optionalValue(formData, "carryForwardDocumentIds");
+    if (csv) {
+      for (const part of csv.split(",")) {
+        if (part.trim() !== "") selectedDocumentIds.add(part.trim());
+      }
     }
 
-    // Defense in depth: every carry-forward document is in the actor's org.
-    if (carryForwardIds.length > 0) {
-      const owned = await tx.cadDocument.findMany({
-        where: {
-          id: { in: carryForwardIds },
-          organizationId: actor.organizationId,
+    const providedDescription = optionalValue(formData, "description");
+
+    await prisma.$transaction(async (tx) => {
+      // 1-2. Source revision + its Item must be in the actor's organization.
+      const source = await tx.itemRevision.findFirst({
+        where: { id: sourceRevisionId, organizationId: actor.organizationId },
+        select: {
+          id: true,
+          itemId: true,
+          revision: true,
+          lifecycle: true,
+          description: true,
+          item: { select: { organizationId: true } },
+          documentLinks: { select: { cadDocumentId: true } },
+          legacyLifecycleHold: { select: { itemRevisionId: true } },
         },
-        select: { id: true },
       });
-      if (owned.length !== carryForwardIds.length) {
-        throw new Error(
-          "A selected CAD document was not found in your organization.",
+
+      if (!source || source.item.organizationId !== actor.organizationId) {
+        throw new ActionRefusalError(
+          "CREATE_NEXT_SOURCE_NOT_FOUND",
+          "Source revision not found in your organization",
         );
       }
-    }
 
-    // 8-10. Create the new revision (WORKING) with lineage.
-    let created;
-    try {
-      created = await tx.itemRevision.create({
-        data: {
-          organizationId: actor.organizationId,
-          itemId: source.itemId,
-          revision: newRevision,
-          lifecycle: LifecycleState.WORKING,
-          // description: user's value if non-empty, else carry the source's.
-          description: providedDescription ?? source.description,
-          createdById: actor.userId,
-          sourceRevisionId: source.id,
-        },
-        select: { id: true, revision: true },
+      // Option A: a held, non-terminal legacy revision (in practice a held
+      // APPROVED one) may only be continued through "Revalidate as new
+      // revision", which closes it, records the reason and applies the O-2
+      // exclusions. Held RELEASED/SUPERSEDED/OBSOLETE sources are unaffected.
+      if (
+        isHeldNonTerminalSource({
+          lifecycle: source.lifecycle,
+          legacyHold: source.legacyLifecycleHold !== null,
+        })
+      ) {
+        throw new ActionRefusalError("CREATE_NEXT_HELD_SOURCE", CREATE_NEXT_FROM_HELD_MESSAGE);
+      }
+
+      // 9. Eligibility: only APPROVED / RELEASED sources.
+      if (!canCreateSuccessorFrom(source.lifecycle)) {
+        throw new ActionRefusalError(
+          "CREATE_NEXT_NOT_ELIGIBLE",
+          `A successor revision can only be created from an APPROVED or RELEASED revision (this revision is ${source.lifecycle}).`,
+        );
+      }
+
+      // 6 + 10. Next revision letter is derived on the server. Revision Z has
+      // no successor yet (same message nextRevisionLetter has always used).
+      if (source.revision.trim().toUpperCase() === "Z") {
+        throw new ActionRefusalError(
+          "CREATE_NEXT_REVISION_LIMIT",
+          "Revisions beyond Z are not supported yet.",
+        );
+      }
+      const newRevision = nextRevisionLetter(source.revision);
+
+      // 7. Reject an existing revision for the same Item (fast path; the unique
+      // constraint below is the real guard against races).
+      const clash = await tx.itemRevision.findFirst({
+        where: { itemId: source.itemId, revision: newRevision },
+        select: { id: true },
       });
-    } catch (error) {
-      if (isDuplicateRevisionError(error)) {
+      if (clash) {
         throw new ActionRefusalError(
           "CREATE_NEXT_REVISION_EXISTS",
           `Revision ${newRevision} already exists for this item.`,
         );
       }
-      throw error;
-    }
 
-    // 5 + 15. Carry forward the SAME logical CadDocuments (no cloning).
-    if (carryForwardIds.length > 0) {
-      await tx.itemRevisionDocument.createMany({
-        data: carryForwardIds.map((cadDocumentId) => ({
-          organizationId: actor.organizationId,
-          itemRevisionId: created.id,
-          cadDocumentId,
-          createdById: actor.userId,
-        })),
-      });
-    }
-  }));
+      // 5. Resolve carry-forward set from the EXPLICIT mode.
+      const sourceDocumentIds = source.documentLinks.map(
+        (link) => link.cadDocumentId,
+      );
+      let carryForwardIds: string[];
+      if (carryForwardMode === "none") {
+        carryForwardIds = [];
+      } else if (carryForwardMode === "all") {
+        carryForwardIds = sourceDocumentIds;
+      } else {
+        // "selected": carry only the submitted ids, each of which must be
+        // linked to the source revision.
+        for (const id of selectedDocumentIds) {
+          if (!sourceDocumentIds.includes(id)) {
+            throw new ActionRefusalError(
+              "CAD_DOCUMENT_NOT_ON_SOURCE",
+              "A selected CAD document is not linked to the source revision.",
+            );
+          }
+        }
+        carryForwardIds = [...selectedDocumentIds];
+      }
+
+      // Defense in depth: every carry-forward document is in the actor's org.
+      if (carryForwardIds.length > 0) {
+        const owned = await tx.cadDocument.findMany({
+          where: {
+            id: { in: carryForwardIds },
+            organizationId: actor.organizationId,
+          },
+          select: { id: true },
+        });
+        if (owned.length !== carryForwardIds.length) {
+          throw new ActionRefusalError(
+            "CAD_DOCUMENT_NOT_FOUND",
+            "A selected CAD document was not found in your organization.",
+          );
+        }
+      }
+
+      // 8-10. Create the new revision (WORKING) with lineage.
+      let created;
+      try {
+        created = await tx.itemRevision.create({
+          data: {
+            organizationId: actor.organizationId,
+            itemId: source.itemId,
+            revision: newRevision,
+            lifecycle: LifecycleState.WORKING,
+            // description: user's value if non-empty, else carry the source's.
+            description: providedDescription ?? source.description,
+            createdById: actor.userId,
+            sourceRevisionId: source.id,
+          },
+          select: { id: true, revision: true },
+        });
+      } catch (error) {
+        if (isDuplicateRevisionError(error)) {
+          throw new ActionRefusalError(
+            "CREATE_NEXT_REVISION_EXISTS",
+            `Revision ${newRevision} already exists for this item.`,
+          );
+        }
+        throw error;
+      }
+
+      // 5 + 15. Carry forward the SAME logical CadDocuments (no cloning).
+      if (carryForwardIds.length > 0) {
+        await tx.itemRevisionDocument.createMany({
+          data: carryForwardIds.map((cadDocumentId) => ({
+            organizationId: actor.organizationId,
+            itemRevisionId: created.id,
+            cadDocumentId,
+            createdById: actor.userId,
+          })),
+        });
+      }
+    });
+  });
 
   revalidatePath("/");
 }
@@ -553,19 +600,18 @@ export async function revalidateLegacyRevision(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  const legacyRevisionId = requiredValue(formData, "legacyRevisionId");
   const carryForward = optionalValue(formData, "carryForwardMode") ?? "all";
   const selected: string[] = [];
   for (const value of formData.getAll("carryForwardDocumentId")) {
     if (typeof value === "string" && value.trim() !== "") selected.push(value.trim());
   }
 
-  // KI-2: expected refusals (reason required, revision Z, role, ...) are
-  // shown as a notice; nothing is written when they occur.
+  // KI-2: expected refusals (reason required, revision Z, role, missing
+  // legacy revision id, ...) are shown as a notice; nothing is written.
   await runWithRefusalNotice(() =>
     revalidateLegacyRevisionForActor(
       actor,
-      legacyRevisionId,
+      requiredValue(formData, "legacyRevisionId"),
       {
         carryForward,
         selectedCadDocumentIds: selected,
@@ -601,55 +647,66 @@ export async function linkExistingCadDocumentToRevision(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  const itemRevisionId = requiredValue(formData, "itemRevisionId");
-  const cadDocumentId = requiredValue(formData, "cadDocumentId");
+  // Form-errors follow-up: refusals become a notice; the transaction has
+  // rolled back (or nothing was started) when one occurs.
+  await runWithRefusalNotice(async () => {
+    const itemRevisionId = requiredValue(formData, "itemRevisionId");
+    const cadDocumentId = requiredValue(formData, "cadDocumentId");
 
-  try {
-    await runSerializable(async (tx) => {
-      // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
-      const revision = await lockItemRevisionForCadMutation(
-        tx,
-        actor.organizationId,
-        itemRevisionId,
-      );
-      if (!revision) {
-        throw new Error("Item revision not found in your organization");
-      }
-
-      // 2. Validate lifecycle from the LOCKED row.
-      if (isTerminalLifecycle(revision.lifecycle)) {
-        throw new Error(
-          "CAD documents cannot be linked to a released or terminal revision.",
+    try {
+      await runSerializable(async (tx) => {
+        // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
+        const revision = await lockItemRevisionForCadMutation(
+          tx,
+          actor.organizationId,
+          itemRevisionId,
         );
-      }
+        if (!revision) {
+          throw new ActionRefusalError(
+            "ITEM_REVISION_NOT_FOUND",
+            "Item revision not found in your organization",
+          );
+        }
 
-      // 3. Validate the existing CadDocument belongs to the actor's org.
-      const document = await tx.cadDocument.findFirst({
-        where: { id: cadDocumentId, organizationId: actor.organizationId },
-        select: { id: true },
-      });
-      if (!document) {
-        throw new Error("CAD document not found in your organization");
-      }
+        // 2. Validate lifecycle from the LOCKED row.
+        if (isTerminalLifecycle(revision.lifecycle)) {
+          throw new ActionRefusalError(
+            "REVISION_TERMINAL_FOR_CAD",
+            "CAD documents cannot be linked to a released or terminal revision.",
+          );
+        }
 
-      // 4. Only now — still holding the row lock — create the link.
-      await tx.itemRevisionDocument.create({
-        data: {
-          organizationId: actor.organizationId,
-          itemRevisionId: revision.id,
-          cadDocumentId: document.id,
-          createdById: actor.userId,
-        },
-      });
-    }, "Could not link the CAD document due to concurrent changes, please retry");
-  } catch (error) {
-    if (isUniqueConstraintError(error)) {
-      // Already linked — treat as success (idempotent).
-      revalidatePath("/");
-      return;
+        // 3. Validate the existing CadDocument belongs to the actor's org.
+        const document = await tx.cadDocument.findFirst({
+          where: { id: cadDocumentId, organizationId: actor.organizationId },
+          select: { id: true },
+        });
+        if (!document) {
+          throw new ActionRefusalError(
+            "CAD_DOCUMENT_NOT_FOUND",
+            "CAD document not found in your organization",
+          );
+        }
+
+        // 4. Only now — still holding the row lock — create the link.
+        await tx.itemRevisionDocument.create({
+          data: {
+            organizationId: actor.organizationId,
+            itemRevisionId: revision.id,
+            cadDocumentId: document.id,
+            createdById: actor.userId,
+          },
+        });
+      }, "Could not link the CAD document due to concurrent changes, please retry");
+    } catch (error) {
+      // FE-L1: only @@unique([itemRevisionId, cadDocumentId]) means "already
+      // linked" (idempotent success); any other P2002 propagates unchanged.
+      if (isUniqueViolationOn(error, ["itemRevisionId", "cadDocumentId"])) {
+        return;
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 
   revalidatePath("/");
 }
@@ -673,13 +730,6 @@ export async function linkExistingCadDocumentToRevision(formData: FormData) {
 // here and does not change the current FileVersion architecture.
 // ============================================================
 
-function isUniqueConstraintError(error: unknown): boolean {
-  return (
-    error instanceof Prisma.PrismaClientKnownRequestError &&
-    error.code === "P2002"
-  );
-}
-
 /**
  * Create a new CAD document identity (owned by the organization) and link it
  * to the selected ItemRevision through ItemRevisionDocument.
@@ -702,59 +752,79 @@ export async function createCadDocument(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  const itemRevisionId = requiredValue(formData, "itemRevisionId");
-  const fileName = requiredValue(formData, "fileName");
-  const documentNumber = optionalValue(formData, "documentNumber") ?? fileName;
-  const documentType = enumValue(
-    CadDocumentType,
-    requiredValue(formData, "documentType"),
-    "documentType",
-  );
-  const description = optionalValue(formData, "description");
-
-  await runSerializable(async (tx) => {
-    // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
-    const revision = await lockItemRevisionForCadMutation(
-      tx,
-      actor.organizationId,
-      itemRevisionId,
+  // Form-errors follow-up: refusals become a notice; the transaction has
+  // rolled back (or nothing was started) when one occurs.
+  await runWithRefusalNotice(async () => {
+    const itemRevisionId = requiredValue(formData, "itemRevisionId");
+    const fileName = requiredValue(formData, "fileName");
+    const documentNumber = optionalValue(formData, "documentNumber") ?? fileName;
+    const documentType = formEnumValue(
+      CadDocumentType,
+      requiredValue(formData, "documentType"),
+      "documentType",
     );
+    const description = optionalValue(formData, "description");
 
-    if (!revision) {
-      throw new Error("Item revision not found in your organization");
+    try {
+      await runSerializable(async (tx) => {
+        // 1. Lock the target ItemRevision row (tenant-scoped) FOR UPDATE.
+        const revision = await lockItemRevisionForCadMutation(
+          tx,
+          actor.organizationId,
+          itemRevisionId,
+        );
+
+        if (!revision) {
+          throw new ActionRefusalError(
+            "ITEM_REVISION_NOT_FOUND",
+            "Item revision not found in your organization",
+          );
+        }
+
+        // 2. Validate lifecycle from the LOCKED row. A RELEASED / SUPERSEDED /
+        //    OBSOLETE revision is immutable: its CAD associations cannot change.
+        if (isTerminalLifecycle(revision.lifecycle)) {
+          throw new ActionRefusalError(
+            "REVISION_TERMINAL_FOR_CAD",
+            "CAD documents cannot be added to a released or terminal revision.",
+          );
+        }
+
+        // 3. Only now — still holding the row lock — create the document + link.
+        const cadDocument = await tx.cadDocument.create({
+          data: {
+            organizationId: actor.organizationId,
+            documentNumber,
+            fileName,
+            documentType,
+            description,
+            // Identity comes only from the authenticated actor.
+            createdById: actor.userId,
+          },
+          select: { id: true },
+        });
+
+        await tx.itemRevisionDocument.create({
+          data: {
+            organizationId: actor.organizationId,
+            itemRevisionId: revision.id,
+            cadDocumentId: cadDocument.id,
+            createdById: actor.userId,
+          },
+        });
+      }, "Could not add the CAD document due to concurrent changes, please retry");
+    } catch (error) {
+      // Only @@unique([organizationId, documentNumber, documentType]) means
+      // "duplicate CAD document"; any other P2002 propagates unchanged.
+      if (isUniqueViolationOn(error, ["organizationId", "documentNumber", "documentType"])) {
+        throw new ActionRefusalError(
+          "CAD_DOCUMENT_EXISTS",
+          `CAD document ${documentNumber} (${documentType}) already exists.`,
+        );
+      }
+      throw error;
     }
-
-    // 2. Validate lifecycle from the LOCKED row. A RELEASED / SUPERSEDED /
-    //    OBSOLETE revision is immutable: its CAD associations cannot change.
-    if (isTerminalLifecycle(revision.lifecycle)) {
-      throw new Error(
-        "CAD documents cannot be added to a released or terminal revision.",
-      );
-    }
-
-    // 3. Only now — still holding the row lock — create the document + link.
-    const cadDocument = await tx.cadDocument.create({
-      data: {
-        organizationId: actor.organizationId,
-        documentNumber,
-        fileName,
-        documentType,
-        description,
-        // Identity comes only from the authenticated actor.
-        createdById: actor.userId,
-      },
-      select: { id: true },
-    });
-
-    await tx.itemRevisionDocument.create({
-      data: {
-        organizationId: actor.organizationId,
-        itemRevisionId: revision.id,
-        cadDocumentId: cadDocument.id,
-        createdById: actor.userId,
-      },
-    });
-  }, "Could not add the CAD document due to concurrent changes, please retry");
+  });
 
   revalidatePath("/");
 }
@@ -832,7 +902,8 @@ async function edgeWouldCreateCycle(
         next.push(edge.childDocumentId);
 
         if (visited.size > CAD_GRAPH_TRAVERSAL_LIMIT) {
-          throw new Error(
+          throw new ActionRefusalError(
+            "CAD_GRAPH_TOO_LARGE",
             "The CAD reference graph is too large to validate safely. " +
               "Please contact an administrator.",
           );
@@ -867,108 +938,109 @@ export async function createCadDependency(formData: FormData) {
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  const parentDocumentId = requiredValue(formData, "parentDocumentId");
-  const childDocumentId = requiredValue(formData, "childDocumentId");
-  const dependencyType = enumValue(
-    CadDependencyType,
-    requiredValue(formData, "dependencyType"),
-    "dependencyType",
-  );
+  // Form-errors follow-up: refusals become a notice; each transaction attempt
+  // has rolled back when one occurs. Success revalidates inside the loop.
+  await runWithRefusalNotice(async () => {
+    const parentDocumentId = requiredValue(formData, "parentDocumentId");
+    const childDocumentId = requiredValue(formData, "childDocumentId");
+    const dependencyType = formEnumValue(
+      CadDependencyType,
+      requiredValue(formData, "dependencyType"),
+      "dependencyType",
+    );
 
-  if (parentDocumentId === childDocumentId) {
-    throw new Error("A CAD document cannot depend on itself");
-  }
-
-  const MAX_ATTEMPTS = 3;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      await prisma.$transaction(
-        async (tx) => {
-          // Both endpoints must exist inside the actor's organization.
-          // (The composite FKs are a second, database-level guard.)
-          const documents = await tx.cadDocument.findMany({
-            where: {
-              organizationId: actor.organizationId,
-              id: { in: [parentDocumentId, childDocumentId] },
-            },
-            select: { id: true },
-          });
-          const foundIds = new Set(documents.map((document) => document.id));
-
-          if (
-            !foundIds.has(parentDocumentId) ||
-            !foundIds.has(childDocumentId)
-          ) {
-            throw new Error(
-              "Both CAD documents must exist in your organization",
-            );
-          }
-
-          // P3D-3: serialize this edge write against a release freezing its
-          // dependency closure. A release locks EVERY closure CadDocument
-          // row (`lockCadDocumentForVersionMutation`) in ascending-id order;
-          // taking the SAME lock on this edge's endpoints, in the SAME
-          // order, means a release either sees this edge fully (it committed
-          // first) or cannot start freezing until this commits - never a
-          // torn graph. Sorted order also prevents an AB/BA deadlock against
-          // a release or another concurrent dependency write.
-          for (const id of [parentDocumentId, childDocumentId].sort()) {
-            await lockCadDocumentForVersionMutation(
-              tx,
-              actor.organizationId,
-              id,
-            );
-          }
-
-          if (
-            await edgeWouldCreateCycle(
-              tx,
-              actor.organizationId,
-              parentDocumentId,
-              childDocumentId,
-            )
-          ) {
-            throw new Error(
-              "That dependency would create a circular reference in the CAD graph",
-            );
-          }
-
-          await tx.cadDependency.create({
-            data: {
-              organizationId: actor.organizationId,
-              parentDocumentId,
-              childDocumentId,
-              dependencyType,
-              createdById: actor.userId,
-            },
-          });
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-      );
-
-      revalidatePath("/");
-      return;
-    } catch (error) {
-      // Only the parent+child+type edge-uniqueness constraint means
-      // "duplicate edge". Any other P2002 (e.g. the [organizationId, id]
-      // constraint) is unexpected and must not be masked.
-      if (isDuplicateDependencyEdgeError(error)) {
-        throw new Error("That CAD dependency already exists");
-      }
-
-      // Serialization failure under concurrent writes: retry a couple of times.
-      if (isSerializationError(error) && attempt < MAX_ATTEMPTS) {
-        continue;
-      }
-
-      throw error;
+    if (parentDocumentId === childDocumentId) {
+      throw new ActionRefusalError("CAD_SELF_DEPENDENCY", "A CAD document cannot depend on itself");
     }
-  }
 
-  throw new Error(
-    "Could not record the CAD dependency due to concurrent changes, please retry",
-  );
+    // FE-M1: bounded retry; the final serialization conflict becomes the
+    // CONCURRENT_CHANGES notice instead of a raw P2034 (HTTP 500).
+    await retryOnSerializationConflict(async () => {
+      try {
+        await prisma.$transaction(
+          async (tx) => {
+            // Both endpoints must exist inside the actor's organization.
+            // (The composite FKs are a second, database-level guard.)
+            const documents = await tx.cadDocument.findMany({
+              where: {
+                organizationId: actor.organizationId,
+                id: { in: [parentDocumentId, childDocumentId] },
+              },
+              select: { id: true },
+            });
+            const foundIds = new Set(documents.map((document) => document.id));
+
+            if (
+              !foundIds.has(parentDocumentId) ||
+              !foundIds.has(childDocumentId)
+            ) {
+              throw new ActionRefusalError(
+                "CAD_DOCUMENT_NOT_FOUND",
+                "Both CAD documents must exist in your organization",
+              );
+            }
+
+            // P3D-3: serialize this edge write against a release freezing its
+            // dependency closure. A release locks EVERY closure CadDocument
+            // row (`lockCadDocumentForVersionMutation`) in ascending-id order;
+            // taking the SAME lock on this edge's endpoints, in the SAME
+            // order, means a release either sees this edge fully (it committed
+            // first) or cannot start freezing until this commits - never a
+            // torn graph. Sorted order also prevents an AB/BA deadlock against
+            // a release or another concurrent dependency write.
+            for (const id of [parentDocumentId, childDocumentId].sort()) {
+              await lockCadDocumentForVersionMutation(
+                tx,
+                actor.organizationId,
+                id,
+              );
+            }
+
+            if (
+              await edgeWouldCreateCycle(
+                tx,
+                actor.organizationId,
+                parentDocumentId,
+                childDocumentId,
+              )
+            ) {
+              throw new ActionRefusalError(
+                "CAD_DEPENDENCY_CYCLE",
+                "That dependency would create a circular reference in the CAD graph",
+              );
+            }
+
+            await tx.cadDependency.create({
+              data: {
+                organizationId: actor.organizationId,
+                parentDocumentId,
+                childDocumentId,
+                dependencyType,
+                createdById: actor.userId,
+              },
+            });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+
+      } catch (error) {
+        // Only the parent+child+type edge-uniqueness constraint means
+        // "duplicate edge". Any other P2002 (e.g. the [organizationId, id]
+        // constraint) is unexpected and must not be masked. A serialization
+        // failure is rethrown unchanged so the retry helper can retry it.
+        if (isDuplicateDependencyEdgeError(error)) {
+          throw new ActionRefusalError("CAD_DEPENDENCY_EXISTS", "That CAD dependency already exists");
+        }
+        throw error;
+      }
+    }, {
+      isConflict: isSerializationError,
+      exhaustedMessage: "Could not record the CAD dependency due to concurrent changes, please retry",
+      onExhausted: logRetryExhausted,
+    });
+  });
+
+  revalidatePath("/");
 }
 
 function isSerializationError(error: unknown): boolean {
