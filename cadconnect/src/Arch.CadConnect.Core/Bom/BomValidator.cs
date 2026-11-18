@@ -81,7 +81,10 @@ public sealed record BomValidationResult(IReadOnlyList<BomIssue> Issues)
 
 /// <summary>
 /// Validates a BOM extract. Pure and deterministic: the same extract always
-/// yields the same issues in the same order (canonical row order, then code).
+/// yields the same issues in the same order, grouped by check: an integrity
+/// failure alone (nothing else examined), else file-name issues, then the
+/// assembly's own text, then each row's checks in canonical row order, then
+/// duplicate part / item numbers.
 /// Nothing is fixed or changed - problems are only reported.
 /// </summary>
 public static class BomValidator

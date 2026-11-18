@@ -681,7 +681,7 @@ public sealed class BomTraversalSafetyAndOrderingTests
         // Each variant must genuinely present the rows in a different input order.
         static string InputOrder(BomExtract e) =>
             string.Join("|", e.Rows.Select(r => $"{r.ItemNumber}/{r.PartNumber}/{r.Description}/{r.Children.FirstOrDefault()?.PartNumber}"));
-        var variants = new[] { shuffled, Structured(permuted), Structured(Siblings().Reverse().ToArray()) };
+        var variants = new[] { shuffled, Structured(permuted), Structured(Enumerable.Reverse(Siblings()).ToArray()) };
         foreach (var variant in variants)
         {
             Assert.NotEqual(InputOrder(reference), InputOrder(variant));

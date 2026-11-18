@@ -277,7 +277,7 @@ public sealed class BomValidatorTests
         ];
 
         var forward = BomValidator.Validate(Structured(rows)).Issues;
-        var reversed = BomValidator.Validate(Structured(rows.Reverse().ToArray())).Issues;
+        var reversed = BomValidator.Validate(Structured(Enumerable.Reverse(rows).ToArray())).Issues;
 
         Assert.Equal(forward, reversed);
         Assert.Equal(5, forward.Count);
