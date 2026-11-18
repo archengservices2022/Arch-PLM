@@ -11,6 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { CredentialsSignin, CallbackRouteError, AuthError } from "@auth/core/errors";
 
@@ -25,6 +26,7 @@ import {
   noticeHref,
   noticeMessage,
   parseNoticeCode,
+  refuseUnlessCanMutate,
   runRefusable,
   runSignInAttempt,
   SIGN_IN_ERROR_PARAM,
@@ -132,6 +134,65 @@ test("F-1: plain errors are never classified by their message text (assertCanMut
   assert.equal(classifyActionError(renamed), null);
   const fakeCode = Object.assign(new Error("x"), { name: "ActionRefusalError", code: "CREATE_NEXT_ROLE_NOT_PERMITTED" });
   assert.equal(classifyActionError(fakeCode), null);
+});
+
+test("SD-I1: refuseUnlessCanMutate(false) raises the typed role refusal; its notice has a fixed message", async () => {
+  assert.doesNotThrow(() => refuseUnlessCanMutate(true));
+  let caught: unknown;
+  try {
+    refuseUnlessCanMutate(false);
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof ActionRefusalError);
+  assert.equal((caught as ActionRefusalError).code, "ROLE_NOT_PERMITTED");
+  assert.equal((caught as Error).message, "You do not have permission to perform this action.", "server-side wording unchanged");
+
+  const notice = classifyActionError(caught);
+  assert.equal(notice, "action.ROLE_NOT_PERMITTED");
+  assert.equal(noticeMessage(notice!), "Your role does not allow making changes. Ask an administrator if you need access.");
+  assert.equal(parseNoticeCode("action.ROLE_NOT_PERMITTED"), "action.ROLE_NOT_PERMITTED");
+
+  // Through runRefusable (what the Server Action wrapper uses): a notice, never a throw.
+  assert.equal(await runRefusable(async () => refuseUnlessCanMutate(false)), "action.ROLE_NOT_PERMITTED");
+  assert.equal(await runRefusable(async () => refuseUnlessCanMutate(true)), null);
+});
+
+test("SD-I1: plain errors with the role-refusal wording are still never classified", () => {
+  for (const message of [
+    "Your role does not allow making changes. Ask an administrator if you need access.",
+    "ROLE_NOT_PERMITTED",
+    "action.ROLE_NOT_PERMITTED",
+  ]) {
+    assert.equal(classifyActionError(new Error(message)), null, message);
+  }
+  const fakeCode = Object.assign(new Error("x"), { name: "ActionRefusalError", code: "ROLE_NOT_PERMITTED" });
+  assert.equal(classifyActionError(fakeCode), null);
+});
+
+test("SD-I1 guard: every Server Action that calls assertCanMutate first refuses a non-write role with a typed notice", () => {
+  // A regression tripwire, not a parser (SD-I1-L1): comments are stripped so a
+  // commented-out call does not count; any role enforcement (assertCanMutate /
+  // assertRole) must be preceded by a typed refusal; and arrow-function
+  // exports are rejected outright so they cannot slip past the split.
+  const source = readFileSync(new URL("../app/actions.ts", import.meta.url), "utf8")
+    .replace(/\r\n/g, "\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'`])\/\/[^\n]*/g, "$1");
+  assert.ok(!/\nexport const \w+\s*=\s*async/.test(source), "Server Actions must be `export async function` so this guard sees them");
+  const bodies = source.split(/\nexport async function /).slice(1);
+  const ENFORCE = /\b(assertCanMutate|assertRole)\(/;
+  const mutating = bodies.filter((body) => ENFORCE.test(body));
+  assert.ok(mutating.length >= 7, `expected the 7 mutating actions, found ${mutating.length}`);
+  for (const body of mutating) {
+    const name = body.slice(0, body.indexOf("("));
+    const enforce = body.search(ENFORCE);
+    const refuse = Math.max(
+      body.indexOf("await refuseUnlessWriteRole(actor);"),
+      body.indexOf('"CREATE_NEXT_ROLE_NOT_PERMITTED"'), // F-1's specific refusal (createEngineeringRevision)
+    );
+    assert.ok(refuse !== -1 && refuse < enforce, `${name}: typed role refusal must come before role enforcement`);
+  }
 });
 
 test("an over-long comment or reason maps to one fixed message", () => {

@@ -80,7 +80,8 @@ export type ActionRefusalCode =
   | "CREATE_NEXT_NOT_ELIGIBLE"
   | "CREATE_NEXT_REVISION_LIMIT"
   | "CREATE_NEXT_REVISION_EXISTS"
-  | "CREATE_NEXT_ROLE_NOT_PERMITTED";
+  | "CREATE_NEXT_ROLE_NOT_PERMITTED"
+  | "ROLE_NOT_PERMITTED";
 
 /**
  * An expected refusal raised by a Server Action itself. `message` keeps the
@@ -110,7 +111,24 @@ export const ACTION_REFUSAL_MESSAGES: Record<ActionRefusalCode, string> = {
     "The next revision already exists for this item. Refresh the page to see it.",
   CREATE_NEXT_ROLE_NOT_PERMITTED:
     "Your role does not allow creating new revisions.",
+  ROLE_NOT_PERMITTED: "Your role does not allow making changes. Ask an administrator if you need access.",
 };
+
+/**
+ * SD-I1: the typed refusal for a role that may not mutate (e.g. VIEWER), so a
+ * direct Server Action request gets an allowlisted notice instead of an
+ * error page (HTTP 500). `canMutate` is the caller's role check
+ * (hasRole(actor, PLM_WRITE_ROLES)); assertCanMutate stays the enforcing check.
+ * The server-side message keeps assertCanMutate's existing wording.
+ */
+export function refuseUnlessCanMutate(canMutate: boolean): void {
+  if (!canMutate) {
+    throw new ActionRefusalError(
+      "ROLE_NOT_PERMITTED",
+      "You do not have permission to perform this action.",
+    );
+  }
+}
 
 const LIFECYCLE_STATE_MESSAGES: Record<LifecycleStateErrorCode, string> = {
   REVISION_NOT_FOUND: "That revision was not found. Refresh the page and try again.",

@@ -15,6 +15,7 @@ import {
   hasRole,
   PLM_WRITE_ROLES,
   requireActor,
+  type Actor,
 } from "@/app/lib/authz";
 import { getStorageProvider } from "@/app/lib/storage";
 import { advanceRevisionForActor } from "@/app/lib/release-db";
@@ -27,6 +28,7 @@ import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
 import {
   ActionRefusalError,
   noticeHref,
+  refuseUnlessCanMutate,
   runRefusable,
 } from "@/app/lib/action-notice-core";
 import {
@@ -74,6 +76,18 @@ async function runWithRefusalNotice(run: () => Promise<unknown>): Promise<void> 
   if (notice !== null) {
     redirect(noticeHref(notice));
   }
+}
+
+/**
+ * SD-I1: a role that may not mutate (e.g. VIEWER) is sent to the dashboard
+ * with the allowlisted `action.ROLE_NOT_PERMITTED` notice instead of an error
+ * page (HTTP 500). Runs before any read or write. Each caller keeps
+ * assertCanMutate(actor) directly after it as the enforcing check.
+ */
+async function refuseUnlessWriteRole(actor: Actor): Promise<void> {
+  await runWithRefusalNotice(async () => {
+    refuseUnlessCanMutate(hasRole(actor, PLM_WRITE_ROLES));
+  });
 }
 
 function enumValue<T extends Record<string, string>>(
@@ -174,6 +188,7 @@ async function lockItemRevisionForCadMutation(
 export async function createItem(formData: FormData) {
   // Tenant + identity come only from the authenticated session.
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   // Engineering revisions are single letters A–Z. "a" -> "A"; reject "01"/"BETA"/"A1".
@@ -257,6 +272,7 @@ export async function createItem(formData: FormData) {
  */
 export async function advanceRevision(formData: FormData) {
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   const revisionId = requiredValue(formData, "revisionId");
@@ -534,6 +550,7 @@ export async function createEngineeringRevision(formData: FormData) {
  */
 export async function revalidateLegacyRevision(formData: FormData) {
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   const legacyRevisionId = requiredValue(formData, "legacyRevisionId");
@@ -581,6 +598,7 @@ export async function revalidateLegacyRevision(formData: FormData) {
  */
 export async function linkExistingCadDocumentToRevision(formData: FormData) {
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   const itemRevisionId = requiredValue(formData, "itemRevisionId");
@@ -681,6 +699,7 @@ function isUniqueConstraintError(error: unknown): boolean {
  */
 export async function createCadDocument(formData: FormData) {
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   const itemRevisionId = requiredValue(formData, "itemRevisionId");
@@ -845,6 +864,7 @@ async function edgeWouldCreateCycle(
  */
 export async function createCadDependency(formData: FormData) {
   const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   const parentDocumentId = requiredValue(formData, "parentDocumentId");
