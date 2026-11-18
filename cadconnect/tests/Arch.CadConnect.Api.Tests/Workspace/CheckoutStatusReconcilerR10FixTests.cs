@@ -142,14 +142,14 @@ public class CheckoutStatusReconcilerR10FixTests
             Interlocked.Increment(ref started);
             try
             {
-                await Task.Delay(100); // ignores cancellation
+                await Task.Delay(1000); // ignores cancellation (CI: scaled 100 -> 1000 ms with the deadline)
                 return Available;
             }
             finally
             {
                 Interlocked.Increment(ref ended);
             }
-        }, TimeSpan.FromMilliseconds(30), new());
+        }, TimeSpan.FromMilliseconds(300), new()); // CI: scaled 30 -> 300 ms, still shorter than each query
 
         Assert.Equal(started, Volatile.Read(ref ended));
         Assert.InRange(started, 1, 12);
@@ -193,7 +193,8 @@ public class CheckoutStatusReconcilerR10FixTests
             Interlocked.Increment(ref asked);
             blocker.Wait(Bound); // synchronous, ignores cancellation
             return Task.FromResult(Available);
-        }, TimeSpan.FromMilliseconds(100), new(OnStopLatched: latched.SetResult, OnClosed: p => permits = p));
+        }, TimeSpan.FromSeconds(1), new( // CI: generous; workers block until released after the stop
+            OnStopLatched: latched.SetResult, OnClosed: p => permits = p));
 
         // The stop latches while every worker is still blocked inside its query.
         await latched.Task.WaitAsync(Bound);

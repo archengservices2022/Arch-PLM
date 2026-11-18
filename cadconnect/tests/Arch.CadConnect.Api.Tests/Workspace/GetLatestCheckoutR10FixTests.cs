@@ -288,7 +288,7 @@ public partial class GetLatestCheckoutConsistencyTests
         var latched = new TaskCompletionSource();
         var answered = false;
         var hooks = new GetLatestTestHooks(
-            StatusDeadline: TimeSpan.FromMilliseconds(50),
+            StatusDeadline: TimeSpan.FromSeconds(1), // CI: generous; the answer still arrives only after the stop
             Reconciler: new CheckoutStatusReconcilerHooks(OnStopLatched: latched.SetResult));
 
         var report = await OrchestratorFor(Server(RootPart), WorkspaceTestSession.Server, hooks, async (_, _, _) =>

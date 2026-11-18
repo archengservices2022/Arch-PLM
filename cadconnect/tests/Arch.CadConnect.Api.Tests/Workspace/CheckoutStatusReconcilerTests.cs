@@ -132,7 +132,7 @@ public class CheckoutStatusReconcilerTests
             Interlocked.Increment(ref asked);
             await Task.Delay(Timeout.Infinite, token);
             return Available;
-        }, TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        }, TimeSpan.FromSeconds(1), CancellationToken.None); // CI: generous; queries block until cancelled either way
 
         Assert.Equal(CheckoutStatusReconciler.MaxConcurrency, asked);
         Assert.All(outcomes.Values, o => Assert.True(o.NotAsked));
@@ -177,9 +177,9 @@ public class CheckoutStatusReconcilerTests
             await release.Task;
             ended = true;
             return Available;
-        }, TimeSpan.FromMilliseconds(20), CancellationToken.None);
+        }, TimeSpan.FromMilliseconds(500), CancellationToken.None); // CI: scaled 20 ms -> 500 ms (still well before the 1500 ms check)
 
-        await Task.Delay(200);
+        await Task.Delay(1500); // CI: scaled with the deadline; the run must still be waiting AFTER it
         Assert.False(run.IsCompleted);
 
         release.SetResult();
