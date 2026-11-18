@@ -97,7 +97,7 @@
  * source CadDocument, or any source FileVersion. Never touches ItemRevision,
  * ReleaseBaseline, CadCheckout, or CadDependency.
  */
-import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
+import type { PrismaClient } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
 import type { Readable } from "node:stream";
 import { UserRole } from "../generated/prisma/enums.ts";

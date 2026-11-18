@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
+    "test:routes": "node --experimental-strip-types --import ./tests/support/register-route-loader.mjs --test \"tests-routes/**/*.test.ts\"",
     "workspace:get": "node --experimental-strip-types cli/workspace-get.ts",
     "workspace:get-released": "node --experimental-strip-types cli/workspace-get-released.ts",
     "itest:p4b-get-latest": "node --experimental-strip-types --env-file=.env scripts/itest-p4b-get-latest.ts",

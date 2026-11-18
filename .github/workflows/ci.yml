@@ -1,0 +1,73 @@
+# WP-2B (2B-4): continuous integration for Arch PLM.
+# Verification only: no secrets, no database, no deployment, no publishing.
+name: ci
+
+on:
+  push:
+    branches:
+      - hema-development
+      - "hema/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: web (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Placeholder only: Prisma client generation and `next build` need a
+      # syntactically valid URL. No job step connects to a database.
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci_placeholder
+      AUTH_SECRET: ci-placeholder-not-a-secret-0000000000000000
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Unit tests
+        run: npm test
+      - name: Route guard tests
+        run: npm run test:routes
+      - name: Route type generation
+        run: npx next typegen
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint -- --max-warnings=0
+      - name: Production build
+        run: npx next build
+
+  addin:
+    name: add-in (.NET 8, Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    defaults:
+      run:
+        working-directory: cadconnect
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.427  # WP2B-L4: pinned to the locally tested SDK (TreatWarningsAsErrors)
+      - name: Core tests
+        run: dotnet test tests/Arch.CadConnect.Core.Tests/Arch.CadConnect.Core.Tests.csproj -c Release
+      - name: Api tests
+        run: dotnet test tests/Arch.CadConnect.Api.Tests/Arch.CadConnect.Api.Tests.csproj -c Release
+      - name: Ui tests
+        run: dotnet test tests/Arch.CadConnect.Ui.Tests/Arch.CadConnect.Ui.Tests.csproj -c Release
