@@ -1,6 +1,7 @@
 import {
   authenticateDesktopClient,
   DesktopAuthError,
+  DesktopLoginThrottledError,
 } from "@/app/lib/desktop-auth";
 import {
   assertRequestTransportAllowed,
@@ -23,7 +24,8 @@ export const dynamic = "force-dynamic";
  *   ONCE here and never again.
  *
  * Status codes: 400 malformed JSON; 401 bad credentials (generic - never
- * says which part failed); 413 body too large; 415 non-JSON content-type;
+ * says which part failed); 429 too many failed attempts for this account
+ * (WP-2A, with Retry-After); 413 body too large; 415 non-JSON content-type;
  * and 400 for a non-HTTPS non-loopback request (transport policy - checked
  * BEFORE the body is read). organizationId / userId are derived server-side
  * from the verified user and are never read from the request.
@@ -48,6 +50,16 @@ export async function POST(request: Request): Promise<Response> {
       headers: { "Cache-Control": "private, no-store" },
     });
   } catch (error) {
+    if (error instanceof DesktopLoginThrottledError) {
+      // WP-2A (2A-1): too many failed attempts for this account.
+      return Response.json(
+        { error: error.publicMessage },
+        {
+          status: 429,
+          headers: { "Retry-After": String(error.retryAfterSeconds), "Cache-Control": "private, no-store" },
+        },
+      );
+    }
     if (error instanceof DesktopAuthError) {
       return Response.json({ error: error.publicMessage }, { status: error.status });
     }

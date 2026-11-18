@@ -1,4 +1,4 @@
-import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
+import { DesktopAuthError, resolveDesktopApiActor } from "@/app/lib/api-actor";
 import { assertRequestTransportAllowed } from "@/app/lib/desktop-auth-core";
 import { CopyDesignOperationStatusValidationError, parseOperationId } from "@/app/lib/copy-design-operation-status-core";
 import { copyDesignVerificationSupportHttpResult } from "@/app/lib/copy-design-verification-support";
@@ -27,7 +27,7 @@ export const dynamic = "force-dynamic";
  * itself - it only surfaces facts. It never creates, updates, or deletes
  * anything.
  *
- * Bearer-authenticated (P4A desktop session) OR NextAuth cookie, tenant-
+ * Bearer-authenticated (P4A desktop session) ONLY - WP-2A: no cookie fallback -, tenant-
  * scoped, VIEWER-ok, strictly READ-ONLY. An operation id belonging to a
  * different organization is INDISTINGUISHABLE from one that does not exist
  * at all - both are 404, never leaked (identical to `.../status`).
@@ -51,7 +51,7 @@ export async function GET(
 
   let actor;
   try {
-    actor = await resolveApiActor(request);
+    actor = await resolveDesktopApiActor(request);
   } catch (error) {
     if (error instanceof DesktopAuthError) {
       return Response.json({ error: error.publicMessage }, { status: error.status });

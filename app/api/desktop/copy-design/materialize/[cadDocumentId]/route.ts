@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 
-import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
+import { DesktopAuthError, resolveDesktopApiActor } from "@/app/lib/api-actor";
 import { CopyDesignMaterializeValidationError, parseMaterializeRequestHeaders } from "@/app/lib/copy-design-materialize-core";
 import { copyDesignMaterializeHttpResult } from "@/app/lib/copy-design-materialize";
 
@@ -40,8 +40,9 @@ export const dynamic = "force-dynamic";
  * sole seam. organizationId / userId / createdById are always server-derived
  * from the authenticated actor, never the request.
  *
- * AUTH: bearer (P4A desktop session) OR NextAuth cookie, subject to the same
- * desktop transport policy as every other desktop route (`resolveApiActor`).
+ * AUTH (WP-2A): bearer (P4A desktop session) ONLY - no browser-cookie
+ * fallback - and the desktop transport policy (HTTPS unless loopback) is
+ * enforced for every request (`resolveDesktopApiActor`).
  * Requires the same mutation floor as check-in/checkout (VIEWER is 403).
  *
  * Status codes: 400 disallowed transport / malformed headers / empty upload /
@@ -59,7 +60,7 @@ export async function POST(
 ): Promise<Response> {
   let actor;
   try {
-    actor = await resolveApiActor(request);
+    actor = await resolveDesktopApiActor(request);
   } catch (error) {
     if (error instanceof DesktopAuthError) {
       return Response.json({ error: error.publicMessage }, { status: error.status });

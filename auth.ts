@@ -3,6 +3,16 @@ import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 
 import { prisma } from "@/app/lib/prisma";
+import {
+  getSharedLoginThrottle,
+  loginThrottleKey,
+} from "@/app/lib/login-throttle-core";
+
+/** WP-2A (Codex WP2A-L1): compared against when no account / no password
+ *  hash exists, so a missing account costs the same bcrypt work. Same value
+ *  as the CAD Connect desktop login (`desktop-auth-db.ts`). */
+const DUMMY_PASSWORD_HASH =
+  "$2a$12$0000000000000000000000000000000000000000000000000000a";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   session: {
@@ -44,36 +54,62 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         const email = credentials.email.trim().toLowerCase();
 
         // -----------------------------------------------------
-        // Find active Arch PLM user
+        // WP-2A (2A-1): throttle repeated failures per account.
+        // Shared with the CAD Connect desktop login. While refused,
+        // the password is not checked and the browser sees the
+        // normal generic "sign-in failed" (PD-2A-2).
         // -----------------------------------------------------
 
-        const user = await prisma.user.findFirst({
-          where: {
-            email: {
-              equals: email,
-              mode: "insensitive",
+        const throttle = getSharedLoginThrottle();
+        const throttleKey = loginThrottleKey(email);
+
+        // Reserve the attempt BEFORE any await (Codex WP2A-H1): parallel
+        // requests cannot get more password checks than the limit allows.
+        if (!throttle.beginAttempt(throttleKey).allowed) {
+          return null;
+        }
+
+        let user;
+        let passwordValid = false;
+        try {
+          // ---------------------------------------------------
+          // Find active Arch PLM user
+          // ---------------------------------------------------
+
+          user = await prisma.user.findFirst({
+            where: {
+              email: {
+                equals: email,
+                mode: "insensitive",
+              },
+
+              active: true,
             },
+          });
 
-            active: true,
-          },
-        });
+          // ---------------------------------------------------
+          // Verify password. A bcrypt comparison is ALWAYS made
+          // (against a dummy hash for an unknown / inactive /
+          // passwordless account) so response timing does not
+          // reveal whether an account exists (Codex WP2A-L1).
+          // ---------------------------------------------------
 
-        if (!user || !user.passwordHash) {
+          passwordValid = await bcrypt.compare(
+            credentials.password,
+            user?.passwordHash ?? DUMMY_PASSWORD_HASH
+          );
+        } catch (error) {
+          // No verdict about the password: release the reservation.
+          throttle.cancelAttempt(throttleKey);
+          throw error;
+        }
+
+        if (!user || !user.passwordHash || !passwordValid) {
+          throttle.recordFailure(throttleKey);
           return null;
         }
 
-        // -----------------------------------------------------
-        // Verify password
-        // -----------------------------------------------------
-
-        const passwordValid = await bcrypt.compare(
-          credentials.password,
-          user.passwordHash
-        );
-
-        if (!passwordValid) {
-          return null;
-        }
+        throttle.recordSuccess(throttleKey);
 
         // -----------------------------------------------------
         // Record successful login

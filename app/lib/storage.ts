@@ -8,6 +8,7 @@ import {
   LocalFilesystemStorage,
   resolveMaxUploadBytes,
   resolveStorageRoot,
+  verifyStoredChecksum,
   type StorageProvider,
   type UploadedFileVersion,
 } from "@/app/lib/storage-core";
@@ -72,6 +73,15 @@ export class StoredFileCorruptError extends Error {
   constructor() {
     super("Stored file failed its integrity check");
     this.name = "StoredFileCorruptError";
+  }
+}
+
+/** WP-2A (2A-2, PD-2A-3): no checksum is recorded, so the file cannot be
+ *  verified and is not served (fail closed). */
+export class StoredFileUnverifiedError extends Error {
+  constructor() {
+    super("This file version has no recorded checksum, so its integrity cannot be verified; it is not served");
+    this.name = "StoredFileUnverifiedError";
   }
 }
 
@@ -176,7 +186,12 @@ export async function readCadFileVersionForActor(
     throw new StoredFileMissingError();
   }
 
-  if (fileVersion.checksum && fileVersion.checksum !== verified.sha256) {
+  // WP-2A (2A-2): fail closed - serve only bytes that match a recorded checksum.
+  const verdict = verifyStoredChecksum(fileVersion.checksum, verified.sha256);
+  if (verdict === "unverifiable") {
+    throw new StoredFileUnverifiedError();
+  }
+  if (verdict === "mismatch") {
     throw new StoredFileCorruptError();
   }
 

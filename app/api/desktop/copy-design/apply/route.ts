@@ -1,5 +1,5 @@
 import type { Actor } from "@/app/lib/authz";
-import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
+import { DesktopAuthError, resolveDesktopApiActor } from "@/app/lib/api-actor";
 import {
   assertRequestTransportAllowed,
   readBoundedJsonBody,
@@ -28,7 +28,7 @@ export const dynamic = "force-dynamic";
  * (no SaveAs, no ReplaceReference, no drawing copy, no Mirror, no
  * Pack & Go, no PDF/DXF/STEP export). That remains P6C and later.
  *
- * Bearer (P4A desktop session) OR NextAuth cookie authenticated, tenant-
+ * Bearer (P4A desktop session) ONLY - WP-2A: no browser-cookie fallback -, tenant-
  * scoped, requires the SAME mutation floor as managed CAD creation
  * (`assertCanMutate`'s role set - VIEWER is rejected). Requires the desktop
  * transport policy (HTTPS unless loopback) exactly like every other desktop
@@ -74,7 +74,7 @@ export async function POST(request: Request): Promise<Response> {
 
   let actor: Actor | null;
   try {
-    actor = await resolveApiActor(request);
+    actor = await resolveDesktopApiActor(request);
   } catch (error) {
     if (error instanceof DesktopAuthError) {
       return Response.json({ error: error.publicMessage }, { status: error.status });

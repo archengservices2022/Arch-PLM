@@ -684,3 +684,17 @@ test("uploadCadFileVersion: retry exhaustion throws and leaves no objects", asyn
   assert.equal(provider.objects.size, 0);
   assert.equal(provider.staged.size, 0);
 });
+
+// ------------------------------------------------------------
+// WP-2A (2A-2): download integrity verdict - fail closed (PD-2A-3)
+// ------------------------------------------------------------
+
+test("verifyStoredChecksum: equal -> verified; different -> mismatch; missing/blank -> unverifiable (never served)", async () => {
+  const { verifyStoredChecksum } = await import("../app/lib/storage-core.ts");
+  const sha = "a".repeat(64);
+  assert.equal(verifyStoredChecksum(sha, sha), "verified");
+  assert.equal(verifyStoredChecksum("b".repeat(64), sha), "mismatch");
+  for (const recorded of [null, undefined, "", "   "]) {
+    assert.equal(verifyStoredChecksum(recorded, sha), "unverifiable", `recorded=${JSON.stringify(recorded)}`);
+  }
+});
