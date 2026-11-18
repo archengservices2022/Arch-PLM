@@ -61,6 +61,34 @@ export class EmptyUploadError extends Error {
 }
 
 // ------------------------------------------------------------
+// Download integrity verdict (WP-2A, item 2A-2)
+// ------------------------------------------------------------
+
+/**
+ * Outcome of comparing a FileVersion's RECORDED checksum with the SHA-256
+ * actually computed from the stored bytes:
+ *  - "verified": both present and equal - the bytes may be served;
+ *  - "mismatch": the stored bytes differ from the record (corrupt / replaced);
+ *  - "unverifiable": no checksum is recorded, so integrity cannot be proven.
+ *
+ * Product Owner decision PD-2A-3 (2026-11-18): an "unverifiable" version is
+ * REFUSED (fail closed) - an engineering file is never served unverified.
+ * Every current upload path (direct upload, check-in, Copy Design
+ * materialize) records a checksum; only legacy rows can be affected.
+ */
+export type StoredChecksumVerdict = "verified" | "mismatch" | "unverifiable";
+
+export function verifyStoredChecksum(
+  recordedChecksum: string | null | undefined,
+  computedSha256: string,
+): StoredChecksumVerdict {
+  if (typeof recordedChecksum !== "string" || recordedChecksum.trim() === "") {
+    return "unverifiable";
+  }
+  return recordedChecksum === computedSha256 ? "verified" : "mismatch";
+}
+
+// ------------------------------------------------------------
 // Provider abstraction
 // ------------------------------------------------------------
 

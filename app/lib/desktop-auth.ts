@@ -7,6 +7,7 @@ import {
   resolveDesktopSession as resolveWith,
   revokeDesktopSession as revokeWith,
   DesktopAuthError,
+  DesktopLoginThrottledError,
   type ResolvedDesktopSession,
 } from "@/app/lib/desktop-auth-db";
 import type {
@@ -21,7 +22,7 @@ import type {
  * drive directly with an in-memory fake. This module only supplies the real
  * `prisma` client.
  */
-export { DesktopAuthError, desktopSessionResponse };
+export { DesktopAuthError, DesktopLoginThrottledError, desktopSessionResponse };
 export type { DesktopLoginResponseDto, DesktopSessionResponseDto, ResolvedDesktopSession };
 
 export function authenticateDesktopClient(
