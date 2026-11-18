@@ -190,14 +190,23 @@ export function evaluateDesktopSession(
 // client (`ArchServerUri`) enforces the identical rule before it sends any
 // credential or bearer token.
 //
-// FORWARDED HEADERS ARE NOT TRUSTED. `x-forwarded-proto` / `x-forwarded-host`
-// are client-settable and a direct remote HTTP caller could spoof
-// `x-forwarded-proto: https` to defeat the check. The guard uses ONLY
-// `new URL(request.url)` (protocol + hostname). If a production deployment
-// terminates TLS at a proxy, that infrastructure MUST be configured so the
-// request URL the application receives already has an https scheme (e.g. via
-// the platform's trusted host/proto handling) - the desktop-auth guard will
-// not infer it from a header. P4A adds no "trusted proxy" mode.
+// SEC-TLS-1 (2026-11-18): WHAT THIS GUARD CAN AND CANNOT SEE under `next start`.
+// Next.js 16 builds `request.url` from the server's BIND address (e.g.
+// http://127.0.0.1:3000) and takes the scheme from the socket or from the
+// `x-forwarded-proto` header (next/dist/server/lib/router-utils/resolve-routes.js).
+// The URL's hostname is therefore NEVER the client's, so judging "loopback"
+// from it made the plain-HTTP exemption apply to every request. The guard now
+// takes the host the CLIENT addressed from the `Host` header (strictly parsed;
+// anything unusual counts as non-loopback), and the scheme from the URL.
+//
+// Threat model: this refuses credentials/bearers from a client that talks
+// plain HTTP to a non-loopback address (a misconfigured script or client) -
+// it then names the server in `Host` and sends no `x-forwarded-proto`. A client
+// that deliberately forges `Host`/`x-forwarded-proto` only exposes its OWN
+// traffic. In production the HTTPS-only property additionally RESTS ON THE
+// DEPLOYMENT: Node bound to 127.0.0.1 only, and a TLS proxy that refuses plain
+// HTTP and OVERWRITES the x-forwarded-* headers (A1 plan, SEC-TLS-1). There is
+// still no "trusted proxy" switch.
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
@@ -226,18 +235,43 @@ export function assertTransportAllowed(protocol: string, hostname: string): void
   );
 }
 
+/** A Host header value: a DNS name or IPv4 address, or a bracketed IPv6
+ *  address, with an optional port - and nothing else (no userinfo, path,
+ *  query, fragment, whitespace or control characters). */
+const HOST_HEADER = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?$/;
+
 /**
- * Enforce the transport policy for an incoming request, using ONLY
- * `new URL(request.url)` - the protocol and hostname the application itself
- * sees. No request header (`x-forwarded-*` included) is consulted, so a
- * direct remote HTTP client cannot spoof its way past the HTTPS requirement.
+ * SEC-TLS-1: the hostname the CLIENT addressed - from the `Host` header when
+ * present (strictly validated; an invalid value returns "" so it can never
+ * count as loopback), otherwise from the request URL. Lowercased; an IPv6
+ * literal keeps its brackets ("[::1]").
  *
- * Every desktop-auth route (login, session, logout) calls this BEFORE it
- * looks at any credential or bearer token.
+ * With NO Host header in production (only an HTTP/1.0 client can do that; the
+ * URL hostname would then be the bind host) the result is "" - fail-closed
+ * whatever the bind address (Codex SEC-L1). Outside production the URL is
+ * used, which keeps directly constructed Requests in tests working.
+ */
+export function requestClientHostname(request: Request, env: NodeJS.ProcessEnv = process.env): string {
+  const host = request.headers.get("host");
+  if (host === null) {
+    return env.NODE_ENV === "production" ? "" : new URL(request.url).hostname;
+  }
+  const match = HOST_HEADER.exec(host.trim());
+  return match ? match[1].toLowerCase() : "";
+}
+
+/**
+ * Enforce the transport policy for an incoming request: the scheme from
+ * `new URL(request.url)` (TLS socket or the proxy-set `x-forwarded-proto`),
+ * the host from {@link requestClientHostname}. See the SEC-TLS-1 note above
+ * for what this does and does not guarantee.
+ *
+ * Every desktop route (and the shared file-content route via api-actor) calls
+ * this BEFORE it looks at any credential or bearer token.
  */
 export function assertRequestTransportAllowed(request: Request): void {
   const url = new URL(request.url);
-  assertTransportAllowed(url.protocol, url.hostname);
+  assertTransportAllowed(url.protocol, requestClientHostname(request));
 }
 
 // ------------------------------------------------------------

@@ -21,6 +21,7 @@ import {
   isLoopbackHostname,
   parseBearerToken,
   readBoundedJsonBody,
+  requestClientHostname,
   resolveDesktopSessionTtlHours,
   sanitizeClientLabel,
 } from "../app/lib/desktop-auth-core.ts";
@@ -128,7 +129,67 @@ test("no environment variable can loosen the transport policy", () => {
   }
 });
 
-test("assertRequestTransportAllowed: uses ONLY new URL(request.url) - forwarded headers are never trusted", () => {
+// ---- SEC-TLS-1: under `next start`, request.url carries the BIND host, so the
+// client's host comes from the Host header ----------------------------------
+
+test("SEC-TLS-1: plain HTTP is refused when the CLIENT addressed a non-loopback host, even though the bind URL is loopback", () => {
+  // What `next start -H 127.0.0.1 -p 3000` hands a route for a direct plain-HTTP
+  // request to http://plm.example.com: URL = bind address, Host = what the client used.
+  for (const host of ["plm.example.com", "plm.example.com:3000", "192.168.1.50:3000", "workstation-01", "127.0.0.2"]) {
+    assert.throws(
+      () => assertRequestTransportAllowed(new Request("http://127.0.0.1:3000/api/desktop/auth/login", { headers: { host } })),
+      (err: unknown) => err instanceof DesktopAuthError && err.status === 400 && !err.message.includes(host),
+      `Host ${host} over plain HTTP must be refused`,
+    );
+  }
+  // Same with the default bind name Next uses when no -H is given.
+  assert.throws(
+    () => assertRequestTransportAllowed(new Request("http://localhost:3000/api/desktop/session", { headers: { host: "10.0.0.5:3000" } })),
+    DesktopAuthError,
+  );
+});
+
+test("SEC-TLS-1: behind the TLS proxy (scheme https from the proxy-set x-forwarded-proto) the public host is allowed", () => {
+  // Next builds https://127.0.0.1:3000/... when x-forwarded-proto contains "https".
+  assert.doesNotThrow(() =>
+    assertRequestTransportAllowed(new Request("https://127.0.0.1:3000/api/desktop/auth/login", { headers: { host: "plm.example.com" } })),
+  );
+});
+
+test("SEC-TLS-1: a client that really addressed loopback keeps the plain-HTTP exemption (local smoke runs, dev)", () => {
+  for (const host of ["127.0.0.1:3100", "localhost:3000", "LOCALHOST", "[::1]:3000", "127.0.0.1"]) {
+    assert.doesNotThrow(
+      () => assertRequestTransportAllowed(new Request("http://127.0.0.1:3100/api/desktop/session", { headers: { host } })),
+      `Host ${host} over loopback HTTP must be allowed`,
+    );
+  }
+});
+
+test("SEC-TLS-1 (SEC-L1): with NO Host header in production the client host is unknown (fail-closed), elsewhere the URL is used", () => {
+  const noHost = new Request("http://127.0.0.1:3000/api/desktop/auth/login");
+  assert.equal(requestClientHostname(noHost, { NODE_ENV: "production" }), "");
+  assert.equal(requestClientHostname(noHost, { NODE_ENV: "development" }), "127.0.0.1");
+  assert.equal(requestClientHostname(noHost, {}), "127.0.0.1");
+  // A present Host is judged the same way in every environment.
+  assert.equal(requestClientHostname(new Request("http://127.0.0.1:3000/x", { headers: { host: "localhost:3000" } }), { NODE_ENV: "production" }), "localhost");
+});
+
+test("SEC-TLS-1: a malformed Host can never count as loopback (userinfo, path, query, spaces, control chars, empty)", () => {
+  for (const host of ["evil@127.0.0.1", "127.0.0.1/x", "127.0.0.1?a", "127.0.0.1#f", "127.0.0.1 x", "127.0.0.1\tx", "", "[::1", "127.0.0.1:99999x", "local host"]) {
+    assert.equal(requestClientHostname(new Request("http://127.0.0.1:3000/x", { headers: { host } })), "", `Host ${JSON.stringify(host)} must not parse`);
+    assert.throws(
+      () => assertRequestTransportAllowed(new Request("http://127.0.0.1:3000/api/desktop/auth/login", { headers: { host } })),
+      DesktopAuthError,
+      `Host ${JSON.stringify(host)} over plain HTTP must be refused`,
+    );
+  }
+  assert.equal(requestClientHostname(new Request("http://127.0.0.1:3000/x", { headers: { host: "[::1]:3000" } })), "[::1]");
+  assert.equal(requestClientHostname(new Request("http://127.0.0.1:3000/x", { headers: { host: "PLM.Example.COM:443" } })), "plm.example.com");
+  // No Host header at all (e.g. tests constructing Requests): fall back to the URL.
+  assert.equal(requestClientHostname(new Request("http://plm.example.com/x")), "plm.example.com");
+});
+
+test("assertRequestTransportAllowed: x-forwarded-* headers are never read by the guard itself", () => {
   const spoofHeaders = [
     { "x-forwarded-proto": "https" },
     { "x-forwarded-host": "localhost" },
