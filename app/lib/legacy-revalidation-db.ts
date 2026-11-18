@@ -13,8 +13,11 @@
  * ONE SERIALIZABLE TRANSACTION (bounded retry via runSerializableTransaction):
  *   1. read the legacy revision (organization-scoped) with its hold, its
  *      revalidation row (if any), its document links and the Item's letters;
- *      re-read the acting user (active, role);
- *   2. idempotency: already revalidated -> return that successor, write nothing;
+ *      re-read the acting user (same organization, active, role) - BEFORE
+ *      any result is returned, including the idempotent one (PD-G1);
+ *   2. idempotency: already revalidated -> the CURRENT database role must be
+ *      a write role (the original lifecycle eligibility is NOT re-applied to
+ *      the now-OBSOLETE legacy revision); return that successor, write nothing;
  *   3. eligibility + role (O-3); successor letter (highest + 1, refuse at Z)
  *      and carry-forward set are resolved BEFORE any write;
  *   4. close the legacy revision through existing transitions only
@@ -30,11 +33,21 @@
  * with recorded events AND exactly one successor exists linked by one audit
  * row, or nothing changed. The legacy hold, creator, history, document links
  * and release baselines are never modified.
+ *
+ * CONCURRENT DUPLICATE RECOVERY (PD-G1 / PD-G3): if a concurrent revalidation
+ * of the same legacy revision commits first, our insert fails with a unique
+ * violation on legacyRevisionId and our transaction rolls back. The existing
+ * successor is then reported only from a FRESH, bounded, read-only
+ * SERIALIZABLE transaction that re-checks the acting user (same organization,
+ * active, current write role) in the same snapshot as the organization-scoped
+ * read of the existing row. No row found, or retries exhausted, is the
+ * controlled refusal CONCURRENT_CHANGE - never a raw Prisma error.
  */
-import type { PrismaClient } from "@/app/generated/prisma/client";
+import type { Prisma, PrismaClient } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
-import { LifecycleEventTrigger, LifecycleState } from "../generated/prisma/enums.ts";
+import { LifecycleEventTrigger, LifecycleState, type UserRole } from "../generated/prisma/enums.ts";
 import { runSerializableTransaction, SerializableTransactionExhaustedError } from "./db-concurrency-db.ts";
+import { LIFECYCLE_WRITE_ROLES } from "./lifecycle-policy-core.ts";
 import {
   evaluateLegacyRevalidation,
   legacyClosurePath,
@@ -83,6 +96,87 @@ function isUniqueViolationOn(error: unknown, field: string): boolean {
 }
 
 /**
+ * PD-G1: re-read the acting user INSIDE the current transaction - same
+ * organization, active - and return the role stored in the database (the
+ * supplied `Actor.role` is never consulted).
+ *
+ * @throws LegacyRevalidationError(ACTOR_NOT_ACTIVE) when the user is missing,
+ *   inactive or not in the actor's organization. Nothing is written.
+ */
+async function requireCurrentActingUser(
+  tx: Pick<Prisma.TransactionClient, "user">,
+  actor: Actor,
+): Promise<{ id: string; role: UserRole }> {
+  const actingUser = await tx.user.findFirst({
+    where: { id: actor.userId, organizationId: actor.organizationId, active: true },
+    select: { id: true, role: true },
+  });
+  if (!actingUser) throw new LegacyRevalidationError("ACTOR_NOT_ACTIVE");
+  return actingUser;
+}
+
+/**
+ * PD-G1: may this CURRENT database role retrieve an existing revalidation
+ * result? Any write role (every role except VIEWER). The original lifecycle
+ * eligibility (e.g. APPROVER/ADMIN for an APPROVED legacy revision) is not
+ * re-applied: the legacy revision is OBSOLETE now and nothing is written.
+ *
+ * @throws LegacyRevalidationError(ROLE_NOT_PERMITTED) otherwise (PD-G2: the
+ *   existing code and message are used unchanged).
+ */
+function assertMayRetrieveExistingRevalidation(role: UserRole): void {
+  if (!LIFECYCLE_WRITE_ROLES.includes(role)) {
+    throw new LegacyRevalidationError("ROLE_NOT_PERMITTED");
+  }
+}
+
+/**
+ * Path B: a concurrent revalidation of the same legacy revision committed
+ * first (our transaction rolled back on the unique violation). Report its
+ * successor only after re-authorizing the actor in a FRESH SERIALIZABLE
+ * snapshot - the aborted attempt's check is stale - and only from an
+ * organization-scoped read in that same snapshot. Read-only: writes nothing.
+ *
+ * @throws LegacyRevalidationError(ACTOR_NOT_ACTIVE | ROLE_NOT_PERMITTED) when
+ *   the actor is no longer authorized; (CONCURRENT_CHANGE) when retries are
+ *   exhausted or no organization-scoped row is found (PD-G3).
+ */
+async function recoverConcurrentRevalidation(
+  actor: Actor,
+  legacyRevisionId: string,
+  db: LegacyRevalidationDb,
+): Promise<LegacyRevalidationResult> {
+  let existing: {
+    legacyRevisionId: string;
+    successorRevision: { id: string; revision: string };
+  } | null;
+  try {
+    existing = await runSerializableTransaction(db, async (tx) => {
+      const actingUser = await requireCurrentActingUser(tx, actor);
+      assertMayRetrieveExistingRevalidation(actingUser.role);
+      return tx.itemRevisionLegacyRevalidation.findFirst({
+        where: { legacyRevisionId, organizationId: actor.organizationId },
+        select: { legacyRevisionId: true, successorRevision: { select: { id: true, revision: true } } },
+      });
+    });
+  } catch (error) {
+    if (error instanceof SerializableTransactionExhaustedError) {
+      throw new LegacyRevalidationError("CONCURRENT_CHANGE");
+    }
+    throw error;
+  }
+  // PD-G3: the unique violation named legacyRevisionId but no row of THIS
+  // organization exists - a controlled refusal, never the raw Prisma error.
+  if (!existing) throw new LegacyRevalidationError("CONCURRENT_CHANGE");
+  return {
+    status: "ALREADY_REVALIDATED",
+    legacyRevisionId: existing.legacyRevisionId,
+    successorRevisionId: existing.successorRevision.id,
+    successorRevision: existing.successorRevision.revision,
+  };
+}
+
+/**
  * Revalidate a held legacy revision into a fresh successor revision.
  *
  * @throws LegacyRevalidationError for every refusal (codes in
@@ -121,9 +215,15 @@ export async function revalidateLegacyRevisionForActor(
       });
       if (!legacy) throw new LegacyRevalidationError("NOT_FOUND");
 
+      // PD-G1: the acting user is re-read in THIS snapshot before any result
+      // is returned - including the idempotent one below.
+      const actingUser = await requireCurrentActingUser(tx, actor);
+
       // Idempotency (spec section 6): a repeated request reports the
-      // existing successor and writes nothing.
+      // existing successor and writes nothing - but only to a user whose
+      // CURRENT database role is a write role (PD-G1).
       if (legacy.legacyRevalidationAsLegacy) {
+        assertMayRetrieveExistingRevalidation(actingUser.role);
         return {
           status: "ALREADY_REVALIDATED" as const,
           legacyRevisionId: legacy.id,
@@ -131,12 +231,6 @@ export async function revalidateLegacyRevisionForActor(
           successorRevision: legacy.legacyRevalidationAsLegacy.successorRevision.revision,
         };
       }
-
-      const actingUser = await tx.user.findFirst({
-        where: { id: actor.userId, organizationId: actor.organizationId, active: true },
-        select: { id: true, role: true },
-      });
-      if (!actingUser) throw new LegacyRevalidationError("ACTOR_NOT_ACTIVE");
 
       const decision = evaluateLegacyRevalidation({
         actorRole: actingUser.role,
@@ -243,20 +337,10 @@ export async function revalidateLegacyRevisionForActor(
       throw new LegacyRevalidationError("CONCURRENT_CHANGE");
     }
     // A concurrent revalidation of the SAME legacy revision committed first:
-    // report its successor (idempotent), nothing of ours was written.
+    // nothing of ours was written. Report its successor (idempotent) only
+    // after a fresh authorization in a new snapshot (Path B, PD-G1/PD-G3).
     if (isUniqueViolationOn(error, "legacyRevisionId")) {
-      const existing = await db.itemRevisionLegacyRevalidation.findFirst({
-        where: { legacyRevisionId, organizationId: actor.organizationId },
-        select: { legacyRevisionId: true, successorRevision: { select: { id: true, revision: true } } },
-      });
-      if (existing) {
-        return {
-          status: "ALREADY_REVALIDATED",
-          legacyRevisionId: existing.legacyRevisionId,
-          successorRevisionId: existing.successorRevision.id,
-          successorRevision: existing.successorRevision.revision,
-        };
-      }
+      return recoverConcurrentRevalidation(actor, legacyRevisionId, db);
     }
     // Another revision of the Item took the letter first (spec section 5).
     if (isUniqueViolationOn(error, "revision")) {
