@@ -256,7 +256,17 @@ public sealed class MachineNamedLockTests
             using var readControl = Native.OpenEventW(Native.ReadControl, false, MachineNamedLock.NameFor(LockScope.Operation, key));
             var sddl = Native.Sddl(readControl);
 
-            Assert.StartsWith("O:" + WindowsIdentity.GetCurrent().User!.Value, sddl, StringComparison.Ordinal);
+            // The object takes the creating token's default owner. For a normal
+            // (non-elevated) user that is the user's own SID. For an ELEVATED
+            // administrator token (e.g. a CI runner) Windows makes BUILTIN\
+            // Administrators ("BA") the default owner instead. Accept BA only
+            // in that case; a non-elevated run must still be owned by the user.
+            var me = WindowsIdentity.GetCurrent();
+            var userOwner = "O:" + me.User!.Value;
+            var elevatedAdmin = new WindowsPrincipal(me).IsInRole(WindowsBuiltInRole.Administrator);
+            var ownedAsExpected = sddl.StartsWith(userOwner, StringComparison.Ordinal)
+                || (elevatedAdmin && sddl.StartsWith("O:BA", StringComparison.Ordinal));
+            Assert.True(ownedAsExpected, $"unexpected owner (elevated admin: {elevatedAdmin}): {sddl}");
             Assert.Contains("D:", sddl, StringComparison.Ordinal);
             Assert.DoesNotContain("D:NO_ACCESS_CONTROL", sddl, StringComparison.Ordinal); // never a NULL DACL
             foreach (var everyoneLike in new[] { ";;;WD)", ";;;AU)", ";;;BU)", ";;;IU)", ";;;AN)" })
