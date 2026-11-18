@@ -1,5 +1,5 @@
 import type { Actor } from "@/app/lib/authz";
-import { DesktopAuthError, resolveApiActor } from "@/app/lib/api-actor";
+import { DesktopAuthError, resolveDesktopApiActor } from "@/app/lib/api-actor";
 import { assertRequestTransportAllowed } from "@/app/lib/desktop-auth-core";
 import { desktopResolveHttpResult } from "@/app/lib/desktop-cad-documents";
 
@@ -42,7 +42,7 @@ export async function GET(request: Request): Promise<Response> {
 
   let actor: Actor | null;
   try {
-    actor = await resolveApiActor(request);
+    actor = await resolveDesktopApiActor(request);
   } catch (error) {
     if (error instanceof DesktopAuthError) {
       return Response.json({ error: error.publicMessage }, { status: error.status });

@@ -12,11 +12,13 @@ import bcrypt from "bcryptjs";
 import { UserRole } from "../app/generated/prisma/enums.ts";
 import {
   DesktopAuthError,
+  DesktopLoginThrottledError,
   authenticateDesktopClient,
   resolveDesktopSession,
   revokeDesktopSession,
   type DesktopAuthDb,
 } from "../app/lib/desktop-auth-db.ts";
+import { LoginThrottle, loginThrottleKey as loginThrottleKeyFor } from "../app/lib/login-throttle-core.ts";
 import {
   DESKTOP_TOKEN_PREFIX,
   hashDesktopToken,
@@ -322,4 +324,127 @@ test("no raw token is ever written into a stored session row", async () => {
   const token = await mint(fake);
   const serialized = JSON.stringify(fake.sessions);
   assert.ok(!serialized.includes(token), "the raw bearer token must not appear anywhere in the DB rows");
+});
+
+// ------------------------------------------------------------
+// WP-2A (2A-1): login throttling on the desktop sign-in path
+// ------------------------------------------------------------
+
+function throttleWithClock() {
+  let t = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const throttle = new LoginThrottle(undefined, () => t);
+  return { throttle, advance: (ms: number) => { t += ms; } };
+}
+
+test("throttle: the 6th attempt after 5 wrong passwords is refused with 429 + retry-after, even with the RIGHT password; no session", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  const { throttle } = throttleWithClock();
+
+  for (let i = 0; i < 5; i += 1) {
+    await assert.rejects(
+      () => authenticateDesktopClient("eng@orga.com", "wrong", null, fake.db, { throttle }),
+      (err: unknown) => err instanceof DesktopAuthError && err.status === 401 && !(err instanceof DesktopLoginThrottledError),
+    );
+  }
+  await assert.rejects(
+    () => authenticateDesktopClient("eng@orga.com", PASSWORD, null, fake.db, { throttle }),
+    (err: unknown) => {
+      assert.ok(err instanceof DesktopLoginThrottledError);
+      assert.equal(err.status, 429);
+      assert.equal(err.retryAfterSeconds, 60);
+      // Generic: never says whether the account exists or which factor failed.
+      assert.ok(!err.publicMessage.includes("eng@orga.com"));
+      assert.doesNotMatch(err.publicMessage.toLowerCase(), /password is|wrong|not found|no such/);
+      return true;
+    },
+  );
+  assert.equal(fake.sessions.length, 0, "no session while throttled");
+});
+
+test("throttle: after the block expires the right password works, and success resets the counter", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  const { throttle, advance } = throttleWithClock();
+
+  for (let i = 0; i < 5; i += 1) {
+    await assert.rejects(() => authenticateDesktopClient("eng@orga.com", "wrong", null, fake.db, { throttle }));
+  }
+  advance(60_000);
+  const res = await authenticateDesktopClient("ENG@orga.com", PASSWORD, null, fake.db, { throttle });
+  assert.ok(res.token);
+  assert.equal(fake.sessions.length, 1);
+  // Counter reset: 4 more wrong attempts are still plain 401s.
+  for (let i = 0; i < 4; i += 1) {
+    await assert.rejects(
+      () => authenticateDesktopClient("eng@orga.com", "wrong", null, fake.db, { throttle }),
+      (err: unknown) => err instanceof DesktopAuthError && err.status === 401,
+    );
+  }
+});
+
+test("throttle: unknown, inactive and passwordless accounts count as failures too (no enumeration through the throttle)", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "off", organizationId: "orgA", email: "off@orga.com", active: false });
+  const { throttle } = throttleWithClock();
+  for (const email of ["nobody@nowhere.com", "off@orga.com"]) {
+    for (let i = 0; i < 5; i += 1) {
+      await assert.rejects(() => authenticateDesktopClient(email, PASSWORD, null, fake.db, { throttle }));
+    }
+    await assert.rejects(
+      () => authenticateDesktopClient(email, PASSWORD, null, fake.db, { throttle }),
+      (err: unknown) => err instanceof DesktopLoginThrottledError && err.status === 429,
+    );
+  }
+});
+
+test("throttle (Codex WP2A-H1): 50 PARALLEL wrong-password logins -> only 5 reach the password check (401), 45 refused (429), no session", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  const { throttle } = throttleWithClock();
+  const results = await Promise.allSettled(
+    Array.from({ length: 50 }, () => authenticateDesktopClient("eng@orga.com", "wrong", null, fake.db, { throttle })),
+  );
+  const statuses = results.map((r) => (r.status === "rejected" && r.reason instanceof DesktopAuthError ? r.reason.status : -1));
+  assert.equal(statuses.filter((s) => s === 401).length, 5, "exactly maxFailures password checks");
+  assert.equal(statuses.filter((s) => s === 429).length, 45);
+  assert.equal(fake.sessions.length, 0);
+  assert.equal(throttle.check(loginThrottleKeyFor("eng@orga.com")).allowed, false, "account now blocked");
+});
+
+test("throttle (Codex WP2A-H1): a correct password inside a burst succeeds only if its reservation was admitted", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  const { throttle } = throttleWithClock();
+  const passwords = [PASSWORD, ...Array.from({ length: 9 }, () => "wrong")];
+  const results = await Promise.allSettled(
+    passwords.map((pw) => authenticateDesktopClient("eng@orga.com", pw, null, fake.db, { throttle })),
+  );
+  assert.equal(results[0]!.status, "fulfilled", "the correct password was among the 5 admitted reservations");
+  const rest = results.slice(1).map((r) => (r.status === "rejected" && r.reason instanceof DesktopAuthError ? r.reason.status : -1));
+  assert.equal(rest.filter((s) => s === 401).length, 4);
+  assert.equal(rest.filter((s) => s === 429).length, 5);
+  assert.equal(fake.sessions.length, 1);
+});
+
+test("throttle: an unexpected database error releases the reservation (no failure counted)", async () => {
+  const fake = new FakeDb();
+  const { throttle } = throttleWithClock();
+  const broken = { ...fake.db, user: { ...fake.db.user, findFirst: async () => { throw new Error("db down"); } } } as unknown as DesktopAuthDb;
+  for (let i = 0; i < 10; i += 1) {
+    await assert.rejects(() => authenticateDesktopClient("eng@orga.com", "x", null, broken, { throttle }), /db down/);
+  }
+  assert.equal(throttle.size, 0, "nothing counted or reserved after errors");
+});
+
+test("throttle: missing fields stay a 400 and are not counted against an account", async () => {
+  const fake = new FakeDb();
+  const { throttle } = throttleWithClock();
+  for (let i = 0; i < 10; i += 1) {
+    await assert.rejects(
+      () => authenticateDesktopClient(undefined, undefined, null, fake.db, { throttle }),
+      (err: unknown) => err instanceof DesktopAuthError && err.status === 400,
+    );
+  }
+  assert.equal(throttle.size, 0);
 });

@@ -33,8 +33,27 @@ import {
   type DesktopLoginResponseDto,
   type DesktopSessionResponseDto,
 } from "./desktop-auth-core.ts";
+import {
+  getSharedLoginThrottle,
+  loginThrottleKey,
+  type LoginThrottle,
+} from "./login-throttle-core.ts";
 
 export { DesktopAuthError };
+
+/**
+ * WP-2A (2A-1): too many failed sign-ins for this account - a controlled 429
+ * with a Retry-After value. The message stays generic (it never says whether
+ * the account exists) and the password is not checked while refused.
+ */
+export class DesktopLoginThrottledError extends DesktopAuthError {
+  readonly retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super(429, "Too many failed sign-in attempts. Wait a few minutes and try again.");
+    this.name = "DesktopLoginThrottledError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
 
 /** The slice of PrismaClient this module needs. */
 export type DesktopAuthDb = Pick<PrismaClient, "user" | "desktopSession">;
@@ -71,42 +90,66 @@ function identityOf(user: AuthedUserRow): DesktopIdentityDto {
  * A bcrypt comparison is always performed (against a dummy hash when the
  * user does not exist) so response timing does not reveal whether an email
  * is registered.
+ *
+ * WP-2A (2A-1): sign-ins are throttled per account (shared with the browser
+ * sign-in). While an account is refused, `DesktopLoginThrottledError` (429)
+ * is thrown BEFORE any lookup or password check; every credential failure is
+ * recorded; a success clears the record. `opts.throttle` exists for tests -
+ * production always uses the shared process-wide instance.
  */
 export async function authenticateDesktopClient(
   email: unknown,
   password: unknown,
   clientLabelInput: unknown,
   db: DesktopAuthDb,
-  opts: { ttlHours?: number; now?: Date } = {},
+  opts: { ttlHours?: number; now?: Date; throttle?: LoginThrottle } = {},
 ): Promise<DesktopLoginResponseDto> {
   if (typeof email !== "string" || typeof password !== "string") {
     throw new DesktopAuthError(400, "email and password are required.");
   }
   const normalizedEmail = email.trim().toLowerCase();
 
-  const user = (await db.user.findFirst({
-    where: { email: { equals: normalizedEmail, mode: "insensitive" } },
-    select: {
-      id: true,
-      organizationId: true,
-      role: true,
-      name: true,
-      email: true,
-      passwordHash: true,
-      active: true,
-      organization: { select: { id: true, code: true, name: true } },
-    },
-  })) as AuthedUserRow | null;
+  const throttle = opts.throttle ?? getSharedLoginThrottle();
+  const throttleKey = loginThrottleKey(normalizedEmail);
+  // Reserve the attempt BEFORE any await (Codex WP2A-H1).
+  const decision = throttle.beginAttempt(throttleKey);
+  if (!decision.allowed) {
+    throw new DesktopLoginThrottledError(decision.retryAfterSeconds);
+  }
 
-  // Constant-ish work whether or not the user exists.
-  const hashToCompare =
-    user?.passwordHash ??
-    "$2a$12$0000000000000000000000000000000000000000000000000000a";
-  const passwordOk = await bcrypt.compare(password, hashToCompare);
+  let user: AuthedUserRow | null;
+  let passwordOk: boolean;
+  try {
+    user = (await db.user.findFirst({
+      where: { email: { equals: normalizedEmail, mode: "insensitive" } },
+      select: {
+        id: true,
+        organizationId: true,
+        role: true,
+        name: true,
+        email: true,
+        passwordHash: true,
+        active: true,
+        organization: { select: { id: true, code: true, name: true } },
+      },
+    })) as AuthedUserRow | null;
+
+    // Constant-ish work whether or not the user exists.
+    const hashToCompare =
+      user?.passwordHash ??
+      "$2a$12$0000000000000000000000000000000000000000000000000000a";
+    passwordOk = await bcrypt.compare(password, hashToCompare);
+  } catch (error) {
+    // No verdict about the password: release the reservation.
+    throttle.cancelAttempt(throttleKey);
+    throw error;
+  }
 
   if (!user || !user.passwordHash || !user.active || !passwordOk) {
+    throttle.recordFailure(throttleKey);
     throw new DesktopAuthError(401, GENERIC_CREDENTIAL_ERROR);
   }
+  throttle.recordSuccess(throttleKey);
 
   const now = opts.now ?? new Date();
   const ttlHours = opts.ttlHours ?? resolveDesktopSessionTtlHours();

@@ -5,6 +5,7 @@ import {
   FileVersionNotFoundError,
   StoredFileCorruptError,
   StoredFileMissingError,
+  StoredFileUnverifiedError,
   readCadFileVersionForActor,
 } from "@/app/lib/storage";
 
@@ -18,8 +19,9 @@ export const dynamic = "force-dynamic";
  * lookup is tenant-scoped (organizationId = actor.organizationId), so a caller
  * can never download another organization's version. The stored object is
  * streamed through SHA-256 and checked against the recorded checksum before
- * any bytes are served (a corrupt object -> 500, never served); the file is
- * never loaded into memory whole.
+ * any bytes are served (a corrupt object -> 500, never served; WP-2A: a
+ * version with NO recorded checksum -> 422, never served unverified); the
+ * file is never loaded into memory whole.
  *
  * AUTH (P4B): accepts EITHER the browser NextAuth cookie (unchanged) OR a
  * P4A desktop bearer token; a bearer request must also satisfy the transport
@@ -73,6 +75,9 @@ export async function GET(
     }
     if (error instanceof StoredFileCorruptError) {
       return Response.json({ error: error.message }, { status: 500 });
+    }
+    if (error instanceof StoredFileUnverifiedError) {
+      return Response.json({ error: error.message }, { status: 422 });
     }
     throw error;
   }

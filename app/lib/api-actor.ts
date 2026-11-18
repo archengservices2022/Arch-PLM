@@ -2,6 +2,7 @@ import "server-only";
 
 import { getActor, type Actor } from "@/app/lib/authz";
 import {
+  assertDesktopBearerPresent,
   assertRequestTransportAllowed,
   DesktopAuthError,
   parseBearerToken,
@@ -62,4 +63,27 @@ export async function resolveApiActor(request: Request): Promise<Actor | null> {
 
   const resolved = await resolveDesktopSession(bearer);
   return resolved?.actor ?? null;
+}
+
+/**
+ * WP-2A (2A-3 / 2A-4): actor resolution for the `/api/desktop/*` data
+ * endpoints, which serve ONLY the CAD Connect add-in.
+ *
+ *  1. The transport policy is enforced first, for EVERY request (HTTPS unless
+ *     a loopback host) - not only for bearer requests.
+ *  2. A request without an `Authorization` header is refused (401): there is
+ *     NO fallback to the browser cookie session, so a signed-in browser cannot
+ *     be used to call these endpoints cross-site.
+ *  3. Otherwise exactly `resolveApiActor`'s bearer path (null => caller 401).
+ *
+ * Shared endpoints used by both the browser and the add-in (checkout,
+ * check-in, workspace plan, file content) keep `resolveApiActor`.
+ *
+ * @throws DesktopAuthError(400) disallowed transport; DesktopAuthError(401)
+ *   missing or malformed Authorization.
+ */
+export async function resolveDesktopApiActor(request: Request): Promise<Actor | null> {
+  assertRequestTransportAllowed(request);
+  assertDesktopBearerPresent(request);
+  return resolveApiActor(request);
 }

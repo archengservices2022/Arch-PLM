@@ -120,6 +120,24 @@ export function parseBearerToken(
   return token;
 }
 
+/**
+ * WP-2A (2A-3): the `/api/desktop/*` data endpoints serve ONLY the CAD Connect
+ * add-in, which always authenticates with its bearer token. A request with no
+ * `Authorization` header (i.e. a browser cookie request) is refused with 401
+ * instead of falling back to the browser session - this closes cross-site
+ * request use of those endpoints by a signed-in browser.
+ *
+ * @throws DesktopAuthError(401) when the request carries no Authorization header.
+ */
+export function assertDesktopBearerPresent(request: Request): void {
+  if (request.headers.get("authorization") === null) {
+    throw new DesktopAuthError(
+      401,
+      "This endpoint requires an Arch desktop bearer token (CAD Connect sign-in).",
+    );
+  }
+}
+
 /** Constant-time compare of two token hashes (both lowercase hex of equal
  *  length). Defensive - the DB lookup is already by unique `tokenHash`, but
  *  any in-code comparison stays timing-safe. */

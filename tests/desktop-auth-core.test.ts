@@ -271,3 +271,25 @@ test("sanitizeClientLabel: strips control chars, caps length, empties -> null", 
   assert.equal(sanitizeClientLabel("x".repeat(500))!.length, 120);
   assert.equal(sanitizeClientLabel("  trimmed  "), "trimmed");
 });
+
+// ------------------------------------------------------------
+// WP-2A (2A-3): /api/desktop/* data endpoints require a bearer token
+// ------------------------------------------------------------
+
+test("assertDesktopBearerPresent: no Authorization header (browser cookie request) -> 401; any Authorization header passes to bearer parsing", async () => {
+  const { assertDesktopBearerPresent, DesktopAuthError: Err } = await import("../app/lib/desktop-auth-core.ts");
+  const cookieOnly = new Request("http://127.0.0.1:3000/api/desktop/copy-design/apply", {
+    method: "POST",
+    headers: { cookie: "authjs.session-token=abc", "content-type": "application/json" },
+  });
+  assert.throws(() => assertDesktopBearerPresent(cookieOnly), (err: unknown) => {
+    assert.ok(err instanceof Err);
+    assert.equal(err.status, 401);
+    return true;
+  });
+  const withBearer = new Request("http://127.0.0.1:3000/api/desktop/session", { headers: { authorization: "Bearer arch_dt_x" } });
+  assert.doesNotThrow(() => assertDesktopBearerPresent(withBearer));
+  // A malformed Authorization is NOT accepted here - it is passed on and rejected by parseBearerToken (401).
+  const malformed = new Request("http://127.0.0.1:3000/api/desktop/session", { headers: { authorization: "Basic abc" } });
+  assert.doesNotThrow(() => assertDesktopBearerPresent(malformed));
+});
