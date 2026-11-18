@@ -795,6 +795,19 @@ public sealed class ArchConnectionManager
             return;
         }
 
+        // M2: a 429 (e.g. the sign-in throttle) means the server IS reachable -
+        // "server unavailable" would be wrong. A refused sign-in returns to
+        // SignedOut (no session was ever adopted); an existing session keeps
+        // its state and stays valid.
+        if (ex.Kind == ArchApiFailureKind.RateLimited)
+        {
+            if (_machine.State == ConnectionState.Connecting && CurrentSession is null)
+            {
+                _machine.SignOut();
+            }
+            return;
+        }
+
         // Everything else (network, timeout, 5xx, a rejected request) leaves
         // the user in "server unavailable" - retryable without re-auth.
         _machine.ServerUnreachable();

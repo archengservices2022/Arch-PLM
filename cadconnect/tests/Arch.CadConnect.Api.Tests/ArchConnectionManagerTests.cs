@@ -223,6 +223,50 @@ public partial class ArchConnectionManagerTests
         Assert.Equal(ConnectionState.ServerUnavailable, mgr.State);
     }
 
+    // ---- M2: 429 sign-in throttle -------------------------------------
+
+    [Fact]
+    public async Task SignIn_rate_limited_returns_to_SignedOut_not_ServerUnavailable_and_stores_nothing()
+    {
+        var store = new InMemorySessionStore();
+        var mgr = new ArchConnectionManager(
+            server => new FakeApi(server)
+            {
+                OnSignIn = () => throw new ArchApiException(
+                    ArchApiFailureKind.RateLimited, "Too many failed sign-in attempts. Try again in 2 minutes.", 429,
+                    retryAfter: TimeSpan.FromMinutes(2)),
+            },
+            store);
+        var states = new List<ConnectionState>();
+        mgr.StateChanged += c => states.Add(c.Current);
+
+        var ex = await Assert.ThrowsAsync<ArchApiException>(
+            () => mgr.SignInAsync("https://plm.example.com", "t@o.com", "pw"));
+
+        Assert.Equal(ArchApiFailureKind.RateLimited, ex.Kind);
+        Assert.Equal("Too many failed sign-in attempts. Try again in 2 minutes.", ex.Message); // rethrown for the dialog
+        Assert.Equal(ConnectionState.SignedOut, mgr.State); // NOT ServerUnavailable, NOT Unauthorized, NOT stuck Connecting
+        Assert.Equal(new[] { ConnectionState.Connecting, ConnectionState.SignedOut }, states);
+        Assert.Null(store.TryLoad());
+        Assert.Null(mgr.CurrentSession);
+    }
+
+    [Fact]
+    public async Task A_rate_limited_status_refresh_keeps_a_valid_session_Connected()
+    {
+        var store = new InMemorySessionStore();
+        var api = new FakeApi(ArchServerUri.Parse("https://plm.example.com")) { OnSignIn = () => Session() };
+        var mgr = new ArchConnectionManager(_ => api, store);
+        await mgr.SignInAsync("https://plm.example.com", "t@o.com", "pw");
+
+        api.OnGetSession = () => throw new ArchApiException(ArchApiFailureKind.RateLimited, "Too many requests. Try again in 1 minute.", 429);
+        await mgr.RefreshServerStatusAsync();
+
+        Assert.Equal(ConnectionState.Connected, mgr.State); // the server is reachable and the session is valid
+        Assert.NotNull(store.TryLoad());
+        Assert.NotNull(mgr.CurrentSession);
+    }
+
     [Fact]
     public async Task Status_refresh_timeout_keeps_the_session_and_reports_ServerUnavailable()
     {

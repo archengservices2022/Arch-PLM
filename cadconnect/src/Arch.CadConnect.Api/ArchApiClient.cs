@@ -94,8 +94,8 @@ public sealed class ArchApiClient : IArchApi
             Content = JsonContent.Create(body, options: Json),
         };
 
-        var (status, text) = await SendAndReadAsync(request, session: null, ct).ConfigureAwait(false);
-        EnsureSuccess(status, text);
+        var (status, text, retryAfter) = await SendAndReadAsync(request, session: null, ct).ConfigureAwait(false);
+        EnsureSuccess(status, text, retryAfter, signIn: true);
 
         var dto = Deserialize<LoginResponseDto>(text);
         if (!string.Equals(dto.Contract, DesktopAuthContract, StringComparison.Ordinal)
@@ -134,8 +134,8 @@ public sealed class ArchApiClient : IArchApi
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, Server.ResolvePath("/api/desktop/session"));
 
-        var (status, text) = await SendAndReadAsync(request, session, ct).ConfigureAwait(false);
-        EnsureSuccess(status, text);
+        var (status, text, retryAfter) = await SendAndReadAsync(request, session, ct).ConfigureAwait(false);
+        EnsureSuccess(status, text, retryAfter);
 
         var dto = Deserialize<SessionResponseDto>(text);
         if (!string.Equals(dto.Contract, DesktopAuthContract, StringComparison.Ordinal))
@@ -328,7 +328,7 @@ public sealed class ArchApiClient : IArchApi
     /// (capped) body text. Any failure - including a body that stalls after
     /// the headers arrive - is thrown as a mapped <see cref="ArchApiException"/>.
     /// </summary>
-    private async Task<(HttpStatusCode Status, string Body)> SendAndReadAsync(
+    private async Task<(HttpStatusCode Status, string Body, TimeSpan? RetryAfter)> SendAndReadAsync(
         HttpRequestMessage request,
         IArchSession? session,
         CancellationToken ct)
@@ -370,7 +370,8 @@ public sealed class ArchApiClient : IArchApi
             // Read the body under the SAME linked token: a body that stalls
             // after headers is a timeout, not an unbounded wait.
             var bytes = await ReadCappedAsync(response.Content, linked.Token).ConfigureAwait(false);
-            return (response.StatusCode, Encoding.UTF8.GetString(bytes));
+            return (response.StatusCode, Encoding.UTF8.GetString(bytes),
+                RetryAfterFrom(response.Headers.RetryAfter, DateTimeOffset.UtcNow));
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
@@ -424,9 +425,39 @@ public sealed class ArchApiClient : IArchApi
         return buffer.ToArray();
     }
 
+    /// <summary>Longest Retry-After we accept; anything larger (or not positive) is ignored.</summary>
+    private static readonly TimeSpan MaxRetryAfter = TimeSpan.FromDays(1);
+
+    /// <summary>
+    /// M2: the wait a Retry-After header asks for - a delta in seconds, or an
+    /// HTTP date relative to <paramref name="now"/>. Null when absent, not
+    /// positive, or implausibly long (more than a day), so a bad header can
+    /// never produce a misleading message.
+    /// </summary>
+    internal static TimeSpan? RetryAfterFrom(RetryConditionHeaderValue? header, DateTimeOffset now)
+    {
+        TimeSpan? wait = header?.Delta ?? (header?.Date is { } date ? date - now : null);
+        return wait is { } w && w > TimeSpan.Zero && w <= MaxRetryAfter ? w : null;
+    }
+
+    /// <summary>
+    /// M2: the fixed, user-safe text for a 429. Whole minutes, rounded UP (a
+    /// 61-second wait says 2 minutes, never "try again now"), at least 1.
+    /// </summary>
+    internal static string TooManyAttemptsMessage(TimeSpan? retryAfter, bool signIn)
+    {
+        var what = signIn ? "Too many failed sign-in attempts." : "Too many requests.";
+        if (retryAfter is not { } wait)
+        {
+            return $"{what} Wait a few minutes and try again.";
+        }
+        var minutes = Math.Max(1, (int)Math.Ceiling(wait.TotalSeconds / 60.0));
+        return $"{what} Try again in {minutes} minute{(minutes == 1 ? "" : "s")}.";
+    }
+
     /// <summary>Throw a mapped exception for a non-2xx status; the server's short
     ///  {"error":"..."} string is used only for user-safe cases.</summary>
-    private static void EnsureSuccess(HttpStatusCode status, string body)
+    private static void EnsureSuccess(HttpStatusCode status, string body, TimeSpan? retryAfter = null, bool signIn = false)
     {
         var code = (int)status;
         if (code is >= 200 and < 300)
@@ -437,6 +468,11 @@ public sealed class ArchApiClient : IArchApi
         var serverError = TryExtractError(body);
         throw code switch
         {
+            // M2: the server's sign-in throttle (WP-2A). A fixed message built
+            // from Retry-After only - the server body is never shown here.
+            429 => new ArchApiException(
+                ArchApiFailureKind.RateLimited, TooManyAttemptsMessage(retryAfter, signIn), code,
+                diagnostic: "http 429", retryAfter: retryAfter),
             400 => new ArchApiException(ArchApiFailureKind.BadRequest, serverError ?? "The request was rejected.", code),
             401 => new ArchApiException(ArchApiFailureKind.Unauthorized, serverError ?? "Your session is not valid. Sign in again.", code),
             403 => new ArchApiException(ArchApiFailureKind.Unauthorized, "You do not have permission for that.", code),

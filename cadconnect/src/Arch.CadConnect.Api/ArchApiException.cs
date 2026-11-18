@@ -29,6 +29,13 @@ public enum ArchApiFailureKind
 
     /// <summary>The operation is not implemented in this client milestone.</summary>
     NotImplemented,
+
+    /// <summary>
+    /// 429 - too many attempts (e.g. the server's sign-in throttle). The server
+    /// is reachable and nothing is wrong with it; wait <see cref="ArchApiException.RetryAfter"/>
+    /// (when known) and try again. Not an auth failure and not "server unavailable".
+    /// </summary>
+    RateLimited,
 }
 
 /// <summary>
@@ -45,13 +52,21 @@ public sealed class ArchApiException : Exception
         string userMessage,
         int? httpStatus = null,
         string? diagnostic = null,
-        Exception? inner = null)
+        Exception? inner = null,
+        TimeSpan? retryAfter = null)
         : base(userMessage, inner)
     {
         Kind = kind;
         HttpStatus = httpStatus;
         Diagnostic = diagnostic;
+        RetryAfter = retryAfter;
     }
+
+    /// <summary>
+    /// For <see cref="ArchApiFailureKind.RateLimited"/>: how long the server asked
+    /// the client to wait (from a valid Retry-After header), otherwise null.
+    /// </summary>
+    public TimeSpan? RetryAfter { get; }
 
     public ArchApiFailureKind Kind { get; }
 

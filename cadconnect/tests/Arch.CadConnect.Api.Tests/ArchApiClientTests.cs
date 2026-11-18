@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 
 using Arch.CadConnect.Api;
 using Arch.CadConnect.Core.Session;
@@ -58,6 +59,82 @@ public class ArchApiClientTests
         Assert.Equal(ArchApiFailureKind.Unauthorized, ex.Kind);
         Assert.Equal(401, ex.HttpStatus);
         Assert.DoesNotContain("bad", ex.Message);
+    }
+
+    // ---- M2: 429 sign-in throttle -------------------------------------
+
+    private static FakeHttpHandler TooManyRequests(Action<HttpResponseMessage>? configure = null) => new(_ =>
+    {
+        var response = FakeHttpHandler.Json((HttpStatusCode)429,
+            """{"error":"SERVER-SIDE-TEXT Too many failed sign-in attempts."}""");
+        configure?.Invoke(response);
+        return response;
+    });
+
+    [Fact]
+    public async Task SignIn_429_with_Retry_After_is_RateLimited_with_the_wait_in_whole_minutes()
+    {
+        var client = Client(TooManyRequests(r => r.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(120))));
+
+        var ex = await Assert.ThrowsAsync<ArchApiException>(() => client.SignInAsync("t@orga.com", "pw", null));
+        Assert.Equal(ArchApiFailureKind.RateLimited, ex.Kind);
+        Assert.Equal(429, ex.HttpStatus);
+        Assert.Equal(TimeSpan.FromSeconds(120), ex.RetryAfter);
+        Assert.Equal("Too many failed sign-in attempts. Try again in 2 minutes.", ex.Message);
+        Assert.False(ex.IsAuthFailure, "a throttled sign-in is not a credential rejection");
+        Assert.False(ex.IsServerUnavailable, "the server is reachable - not an outage");
+        Assert.DoesNotContain("SERVER-SIDE-TEXT", ex.Message);
+    }
+
+    [Fact]
+    public async Task SignIn_429_without_a_usable_Retry_After_still_gets_a_clear_message()
+    {
+        foreach (var configure in new Action<HttpResponseMessage>?[]
+                 {
+                     null,                                                                         // no header
+                     r => r.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.Zero),     // not positive
+                     r => r.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromDays(3)), // implausible
+                 })
+        {
+            var ex = await Assert.ThrowsAsync<ArchApiException>(() => Client(TooManyRequests(configure)).SignInAsync("t@orga.com", "pw", null));
+            Assert.Equal(ArchApiFailureKind.RateLimited, ex.Kind);
+            Assert.Null(ex.RetryAfter);
+            Assert.Equal("Too many failed sign-in attempts. Wait a few minutes and try again.", ex.Message);
+        }
+    }
+
+    [Fact]
+    public async Task A_429_outside_sign_in_says_too_many_requests()
+    {
+        var client = Client(TooManyRequests(r => r.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(30))));
+
+        var ex = await Assert.ThrowsAsync<ArchApiException>(() => client.GetSessionAsync(FakeSession()));
+        Assert.Equal(ArchApiFailureKind.RateLimited, ex.Kind);
+        Assert.Equal("Too many requests. Try again in 1 minute.", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(1, "Try again in 1 minute.")]
+    [InlineData(60, "Try again in 1 minute.")]
+    [InlineData(61, "Try again in 2 minutes.")] // rounded UP - never sooner than the server allows
+    [InlineData(240, "Try again in 4 minutes.")]
+    [InlineData(900, "Try again in 15 minutes.")]
+    public void TooManyAttemptsMessage_rounds_up_to_whole_minutes(int seconds, string expectedTail)
+    {
+        Assert.Equal($"Too many failed sign-in attempts. {expectedTail}",
+            ArchApiClient.TooManyAttemptsMessage(TimeSpan.FromSeconds(seconds), signIn: true));
+    }
+
+    [Fact]
+    public void RetryAfterFrom_accepts_a_delta_or_a_future_date_and_rejects_anything_else()
+    {
+        var now = new DateTimeOffset(2026, 11, 18, 12, 0, 0, TimeSpan.Zero);
+        Assert.Equal(TimeSpan.FromSeconds(60), ArchApiClient.RetryAfterFrom(new RetryConditionHeaderValue(TimeSpan.FromSeconds(60)), now));
+        Assert.Equal(TimeSpan.FromMinutes(5), ArchApiClient.RetryAfterFrom(new RetryConditionHeaderValue(now.AddMinutes(5)), now));
+        Assert.Null(ArchApiClient.RetryAfterFrom(null, now));
+        Assert.Null(ArchApiClient.RetryAfterFrom(new RetryConditionHeaderValue(TimeSpan.Zero), now));
+        Assert.Null(ArchApiClient.RetryAfterFrom(new RetryConditionHeaderValue(now.AddMinutes(-5)), now)); // date in the past
+        Assert.Null(ArchApiClient.RetryAfterFrom(new RetryConditionHeaderValue(TimeSpan.FromDays(2)), now)); // implausible
     }
 
     [Fact]
