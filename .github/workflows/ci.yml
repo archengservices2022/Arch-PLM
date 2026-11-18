@@ -20,9 +20,16 @@ concurrency:
 
 jobs:
   web:
-    name: web (Node 22)
-    runs-on: ubuntu-latest
+    name: web (Node 22, Windows)
+    # Windows on purpose: the app, the CLI workspace tools and the add-in run on
+    # Windows, and workspace-materialize-core deliberately uses Windows path
+    # semantics (path.win32) against the real filesystem in its tests.
+    runs-on: windows-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        # bash so `npm run lint -- --max-warnings=0` passes the flag through as-is.
+        shell: bash
     env:
       # Placeholder only: Prisma client generation and `next build` need a
       # syntactically valid URL. No job step connects to a database.
