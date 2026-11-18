@@ -281,6 +281,50 @@ async function main() {
       for (const r of results) if (r.status === "rejected") assert(r.reason instanceof LegacyRevalidationError && ["CONCURRENT_CHANGE", "REVISION_COLLISION"].includes(r.reason.code), `round ${i}: ${String(r.reason)}`);
     }
   });
+  // ---------- Phase 1G (WP-1G): authorization of BOTH ALREADY_REVALIDATED paths ----------
+  await check("4d Phase 1G sequential duplicate re-checks the CURRENT database user: deactivated -> ACTOR_NOT_ACTIVE, demoted to VIEWER (claiming ADMIN) -> ROLE_NOT_PERMITTED; a DESIGNER retrieves an APPROVER's APPROVED revalidation; nothing written", async () => {
+    const item = await makeItem(orgA.id);
+    const l = await makeLegacy(orgA.id, item.id, "A", S.APPROVED, creator.userId);
+    const first = await reval(appr1, l.id);
+    assert(first.status === "REVALIDATED", JSON.stringify(first));
+    const gone = await makeUser(orgA.id, "p1g-gone", UserRole.ENGINEER);
+    const demoted = await makeUser(orgA.id, "p1g-demoted", UserRole.ENGINEER);
+    await prisma.user.update({ where: { id: gone.userId }, data: { active: false } });
+    await prisma.user.update({ where: { id: demoted.userId }, data: { role: UserRole.VIEWER } });
+    await expectRefused("deactivated duplicate", l.id, "ACTOR_NOT_ACTIVE", () => reval(gone, l.id));
+    await expectRefused("demoted duplicate claiming ADMIN", l.id, "ROLE_NOT_PERMITTED", () => reval({ ...demoted, role: UserRole.ADMIN }, l.id));
+    await expectRefused("other organization's approver", l.id, "NOT_FOUND", () => reval(apprB, l.id));
+    const before = await stateOf(l.id);
+    const again = await reval(des2, l.id, { comment: "again" });
+    assert(again.status === "ALREADY_REVALIDATED" && again.successorRevisionId === first.successorRevisionId, JSON.stringify(again));
+    assert((await stateOf(l.id)) === before, "changed");
+  });
+  // Scope (Codex WP1G-M1 / INFO-1): the unauthorized request is refused before
+  // any write, so it never reaches the P2002 recovery (Path B). This check
+  // covers Path A and the new-revalidation refusal under a race; Path B is
+  // covered only by the fake-database tests (probably unreachable under
+  // PostgreSQL SERIALIZABLE, where the losing writer gets 40001 and retries).
+  await check("4e Phase 1G 10 rounds: Path A / new-revalidation refusal under race - an authorized revalidation races a request whose CURRENT database user is VIEWER (ROLE_NOT_PERMITTED) or inactive (ACTOR_NOT_ACTIVE) while claiming ENGINEER; the unauthorized request is refused with exactly that code; exactly one successor and one audit row", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      const item = await makeItem(orgA.id);
+      const l = await makeLegacy(orgA.id, item.id, "A", i % 2 ? S.WORKING : S.IN_REVIEW, creator.userId);
+      const bad = await makeUser(orgA.id, `p1g-race-${i}`, UserRole.ENGINEER);
+      await prisma.user.update({ where: { id: bad.userId }, data: i % 2 ? { role: UserRole.VIEWER } : { active: false } });
+      const [good, unauthorized] = await Promise.allSettled([reval(eng, l.id), reval(bad, l.id)]);
+      note(good);
+      note(unauthorized);
+      assert(good.status === "fulfilled" && good.value.status === "REVALIDATED", `round ${i}: authorized request ${JSON.stringify(good)}`);
+      // Codex WP1G-L1: the refusal happens before any write, so only the exact
+      // authorization code is acceptable (odd rounds VIEWER, even rounds inactive).
+      const expectedCode = i % 2 ? "ROLE_NOT_PERMITTED" : "ACTOR_NOT_ACTIVE";
+      assert(unauthorized.status === "rejected" && unauthorized.reason instanceof LegacyRevalidationError &&
+        unauthorized.reason.code === expectedCode,
+        `round ${i}: unauthorized request expected ${expectedCode}, got ${unauthorized.status === "fulfilled" ? JSON.stringify(unauthorized.value) : String(unauthorized.reason)}`);
+      const succ = await prisma.itemRevision.count({ where: { sourceRevisionId: l.id } });
+      const audit = await prisma.itemRevisionLegacyRevalidation.count({ where: { legacyRevisionId: l.id } });
+      assert(succ === 1 && audit === 1, `round ${i}: successors=${succ} audit=${audit}`);
+    }
+  });
   await check("4c 10 rounds: two DIFFERENT held revisions of the same item revalidated concurrently - letters never duplicate; each legacy is closed iff it has exactly one successor", async () => {
     for (let i = 0; i < 10; i += 1) {
       const item = await makeItem(orgA.id);
