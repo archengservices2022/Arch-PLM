@@ -103,6 +103,7 @@ export type ActionRefusalCode =
   | "CAD_DEPENDENCY_CYCLE"
   | "CAD_DEPENDENCY_EXISTS"
   | "CAD_GRAPH_TOO_LARGE"
+  | "CAD_DEPENDENCY_NOT_FOUND"
   | "CONCURRENT_CHANGES";
 
 /**
@@ -151,6 +152,8 @@ export const ACTION_REFUSAL_MESSAGES: Record<ActionRefusalCode, string> = {
   CAD_DEPENDENCY_EXISTS: "That CAD dependency already exists.",
   CAD_GRAPH_TOO_LARGE:
     "The CAD reference graph is too large to check safely. Contact an administrator.",
+  CAD_DEPENDENCY_NOT_FOUND:
+    "That CAD dependency was not found - it may already have been removed. Refresh the page and try again.",
   CONCURRENT_CHANGES:
     "The change could not be saved because of concurrent changes. Please try again.",
 };

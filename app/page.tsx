@@ -7,6 +7,7 @@ import {
 import {
   advanceRevision,
   createCadDependency,
+  removeCadDependency,
   createCadDocument,
   createEngineeringRevision,
   createItem,
@@ -798,11 +799,27 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                     <p className="font-semibold">{group.parent.fileName}</p>
                     <ul className="mt-1 flex flex-col gap-1">
                       {group.edges.map((edge) => (
-                        <li key={edge.id} className="text-sm text-slate-700">
-                          <span className="font-mono text-xs uppercase text-teal-700">
-                            {edge.dependencyType}
-                          </span>{" "}
-                          → {edge.childDocument.fileName}
+                        <li
+                          key={edge.id}
+                          className="flex items-center justify-between gap-2 text-sm text-slate-700"
+                        >
+                          <span>
+                            <span className="font-mono text-xs uppercase text-teal-700">
+                              {edge.dependencyType}
+                            </span>{" "}
+                            → {edge.childDocument.fileName}
+                          </span>
+                          {/* B06 G-3: remove a wrong or out-of-date link (write roles; logged). */}
+                          <form action={removeCadDependency}>
+                            <input type="hidden" name="dependencyId" value={edge.id} />
+                            <button
+                              type="submit"
+                              className="rounded border border-slate-300 px-2 py-0.5 text-xs text-slate-600 transition hover:border-red-400 hover:text-red-700"
+                              aria-label={`Remove link ${edge.dependencyType} to ${edge.childDocument.fileName}`}
+                            >
+                              Remove
+                            </button>
+                          </form>
                         </li>
                       ))}
                     </ul>

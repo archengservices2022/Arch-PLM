@@ -25,6 +25,7 @@ import {
   isHeldNonTerminalSource,
 } from "@/app/lib/legacy-revalidation-core";
 import { lockCadDocumentForVersionMutation } from "@/app/lib/db-concurrency-db";
+import { removeCadDependencyForActor } from "@/app/lib/cad-dependency-remove-db";
 import {
   ActionRefusalError,
   isUniqueViolationOn,
@@ -1042,6 +1043,34 @@ export async function createCadDependency(formData: FormData) {
       exhaustedMessage: "Could not record the CAD dependency due to concurrent changes, please retry",
       onExhausted: logRetryExhausted,
     });
+  });
+
+  revalidatePath("/");
+}
+
+/**
+ * B06 G-3: remove a CAD structure link (PO-signed B06 plan Rev1, G-3(a)).
+ * Write roles only, tenant-scoped, serialized against a release with the
+ * same sorted two-endpoint lock as createCadDependency, bounded retry
+ * (final conflict -> CONCURRENT_CHANGES). Each committed removal writes one
+ * structured server log line (interim trace until F00). See
+ * app/lib/cad-dependency-remove-db.ts.
+ */
+export async function removeCadDependency(formData: FormData) {
+  const actor = await requireActor();
+  await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
+  assertCanMutate(actor);
+
+  await runWithRefusalNotice(async () => {
+    const dependencyId = requiredValue(formData, "dependencyId");
+    await retryOnSerializationConflict(
+      () => removeCadDependencyForActor(actor, dependencyId, prisma),
+      {
+        isConflict: isSerializationError,
+        exhaustedMessage: "Could not remove the CAD dependency due to concurrent changes, please retry",
+        onExhausted: logRetryExhausted,
+      },
+    );
   });
 
   revalidatePath("/");
