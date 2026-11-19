@@ -20,6 +20,7 @@ import {
   parseNoticeCode,
   parseNoticeSubject,
 } from "@/app/lib/action-notice-core";
+import { STRUCTURE_ATTESTATION_PHRASE } from "@/app/lib/release-structure-guard-core";
 import { prisma } from "@/app/lib/prisma";
 import {
   hasRole,
@@ -1173,10 +1174,11 @@ function RevisionCard({
             </select>
           </label>
           <label className="flex min-w-48 flex-1 flex-col gap-1 text-xs font-medium text-slate-600">
-            Comment (optional)
+            Comment (required to release an assembly or drawing)
             <input
               name="comment"
               maxLength={MAX_LIFECYCLE_COMMENT_LENGTH}
+              placeholder={`To release an assembly or drawing: ${STRUCTURE_ATTESTATION_PHRASE}: <date>, <documents>`}
               className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
             />
           </label>

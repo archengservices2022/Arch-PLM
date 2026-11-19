@@ -14,7 +14,9 @@ import {
   type LifecycleStateErrorCode,
 } from "./lifecycle-errors-core.ts";
 import {
+  ReleaseAttestationRequiredError,
   ReleaseStructureIncompleteError,
+  STRUCTURE_ATTESTATION_PHRASE,
   type StructureGapKind,
 } from "./release-structure-guard-core.ts";
 
@@ -246,7 +248,9 @@ const COMMENT_TOO_LONG_MESSAGE = `The comment or reason is too long (maximum ${M
 // structure. These notices may NAME the document (see NoticeSubject below).
 // ------------------------------------------------------------
 
-export type ReleaseRefusalCode = "STRUCTURE_ASSEMBLY" | "STRUCTURE_DRAWING";
+export type ReleaseRefusalCode = "STRUCTURE_ASSEMBLY" | "STRUCTURE_DRAWING" | "ATTESTATION_REQUIRED";
+/** The release refusals that are about ONE document (may name it). */
+type ReleaseStructureCode = "STRUCTURE_ASSEMBLY" | "STRUCTURE_DRAWING";
 
 const RELEASE_STRUCTURE_ADVICE =
   "Record its structure following the structure procedure, then release again.";
@@ -255,15 +259,17 @@ const RELEASE_STRUCTURE_ADVICE =
 const RELEASE_REFUSAL_MESSAGES: Record<ReleaseRefusalCode, string> = {
   STRUCTURE_ASSEMBLY: `Release refused: an assembly in this release has no components recorded in Arch PLM. ${RELEASE_STRUCTURE_ADVICE}`,
   STRUCTURE_DRAWING: `Release refused: a drawing in this release has no model recorded in Arch PLM. ${RELEASE_STRUCTURE_ADVICE}`,
+  // B06 G-2: the recorded sign-off is missing.
+  ATTESTATION_REQUIRED: `Release refused: this release contains an assembly or drawing. Check its structure as the structure procedure describes, then release with a comment starting “${STRUCTURE_ATTESTATION_PHRASE}”.`,
 };
 
-const RELEASE_CODE_FOR_GAP: Record<StructureGapKind, ReleaseRefusalCode> = {
+const RELEASE_CODE_FOR_GAP: Record<StructureGapKind, ReleaseStructureCode> = {
   ASSEMBLY_WITHOUT_COMPONENTS: "STRUCTURE_ASSEMBLY",
   DRAWING_WITHOUT_MODEL: "STRUCTURE_DRAWING",
 };
 
 /** The messages that name the document (`label` = its document number). */
-function namedReleaseMessage(code: ReleaseRefusalCode, label: string, more: number): string {
+function namedReleaseMessage(code: ReleaseStructureCode, label: string, more: number): string {
   const what =
     code === "STRUCTURE_ASSEMBLY"
       ? `assembly ${label} has no components recorded in Arch PLM`
@@ -341,10 +347,13 @@ export function noticeMessage(code: NoticeCode): string {
 // fails, the generic message is shown and the id itself is never rendered.
 // ------------------------------------------------------------
 
-/** The notice codes that may carry a subject document. */
-const SUBJECT_NOTICE_CODES: ReadonlySet<string> = new Set(
-  (Object.keys(RELEASE_REFUSAL_MESSAGES) as ReleaseRefusalCode[]).map((code) => `release.${code}`),
-);
+/** The notice codes that may carry a subject document - EXPLICITLY the two
+ *  structure refusals (never derived from the whole release namespace, so a
+ *  later release code can never be paired with a document by a crafted URL). */
+const SUBJECT_NOTICE_CODES: ReadonlySet<string> = new Set([
+  "release.STRUCTURE_ASSEMBLY",
+  "release.STRUCTURE_DRAWING",
+] satisfies `release.${ReleaseStructureCode}`[]);
 
 /** Server-generated ids (cuid) - letters, digits, '-' and '_' only. */
 const SUBJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -382,7 +391,7 @@ export function noticeMessageFor(
   subject: { label: string | null; more: number } | null,
 ): string {
   if (subject !== null && subject.label !== null && SUBJECT_NOTICE_CODES.has(code)) {
-    const releaseCode = code.slice("release.".length) as ReleaseRefusalCode;
+    const releaseCode = code.slice("release.".length) as ReleaseStructureCode;
     return namedReleaseMessage(releaseCode, subject.label, subject.more);
   }
   return NOTICE_MESSAGES[code];
@@ -429,6 +438,9 @@ export function classifyActionError(error: unknown): NoticeCode | null {
   }
   if (error instanceof ReleaseStructureIncompleteError) {
     return allowlisted(`release.${RELEASE_CODE_FOR_GAP[error.kind]}`);
+  }
+  if (error instanceof ReleaseAttestationRequiredError) {
+    return allowlisted("release.ATTESTATION_REQUIRED");
   }
   if (error.name === "LifecyclePermissionError") {
     const code = (error as { code?: unknown }).code;

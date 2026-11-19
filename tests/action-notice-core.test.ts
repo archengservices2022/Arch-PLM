@@ -51,7 +51,11 @@ import {
   type LegacyRevalidationCode,
 } from "../app/lib/legacy-revalidation-core.ts";
 import { LifecycleStateError } from "../app/lib/lifecycle-errors-core.ts";
-import { ReleaseStructureIncompleteError } from "../app/lib/release-structure-guard-core.ts";
+import {
+  ReleaseAttestationRequiredError,
+  ReleaseStructureIncompleteError,
+  STRUCTURE_ATTESTATION_PHRASE,
+} from "../app/lib/release-structure-guard-core.ts";
 import { ReleaseBaselineIncompleteError } from "../app/lib/release-baseline-core.ts";
 import { ReleaseClosureInvalidError, ReleaseClosureTooLargeError } from "../app/lib/release-closure-core.ts";
 
@@ -629,6 +633,24 @@ test("B06: the message names the document by its NUMBER; without a resolved numb
     noticeMessage("action.FIELD_REQUIRED" as NoticeCode),
   );
   assert.equal(noticeMessageFor(code, null), noticeMessage(code));
+});
+
+test("G-2: a missing sign-off is an allowlisted notice that quotes the phrase and never names a document", () => {
+  const error = new ReleaseAttestationRequiredError();
+  assert.equal(classifyActionError(error), "release.ATTESTATION_REQUIRED");
+  assert.equal(noticeSubjectOf(error), null);
+  const code = "release.ATTESTATION_REQUIRED" as NoticeCode;
+  assert.ok(noticeMessage(code).includes(STRUCTURE_ATTESTATION_PHRASE));
+  // A crafted URL cannot pair this code with a document.
+  assert.equal(parseNoticeSubject(code, "cm3asm0000000000000000001", "1"), null);
+  assert.equal(noticeHref(code, { cadDocumentId: "abc", more: 1 }), "/?notice=release.ATTESTATION_REQUIRED");
+  assert.equal(noticeMessageFor(code, { label: "ASM-1001", more: 0 }), noticeMessage(code));
+});
+
+test("G-2: the comment field tells the user the phrase", () => {
+  const page = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /Comment \(required to release an assembly or drawing\)/);
+  assert.match(page, /placeholder=\{`To release an assembly or drawing: \$\{STRUCTURE_ATTESTATION_PHRASE\}/);
 });
 
 test("B06: the dashboard resolves the subject among the organization's own documents and clears doc/more", () => {

@@ -30,6 +30,7 @@ import {
   LifecyclePermissionError,
   ReleaseBaselineIncompleteError,
   ReleaseClosureInvalidError,
+  ReleaseAttestationRequiredError,
   ReleaseClosureTooLargeError,
   ReleaseStructureIncompleteError,
   advanceRevisionForActor,
@@ -42,6 +43,7 @@ import {
 } from "../app/lib/lifecycle-policy-core.ts";
 import { LifecycleStateError } from "../app/lib/lifecycle-errors-core.ts";
 import { classifyActionError, noticeSubjectOf } from "../app/lib/action-notice-core.ts";
+import { STRUCTURE_ATTESTATION_PHRASE } from "../app/lib/release-structure-guard-core.ts";
 
 // ------------------------------------------------------------
 // Fake database + storage: REAL per-row async mutex behind $transaction +
@@ -2083,6 +2085,9 @@ test("Option A O-4: no lineage supersession when the legacy source is not RELEAS
 // NOTHING is written (no RELEASED state, no baseline, no lifecycle event).
 // ============================================================
 
+/** G-2: the recorded sign-off a release of an assembly or drawing needs. */
+const ATTESTED = { comment: `${STRUCTURE_ATTESTATION_PHRASE}: 2026-11-19, asm` };
+
 async function expectStructureRefusal(
   db: FakeDatabase,
   expected: { cadDocumentId: string; kind: string; gapCount: number },
@@ -2133,7 +2138,7 @@ test("B06: a complete structure releases and its baseline contains every compone
   db.addDependency("orgA", "asm", "p1", "COMPONENT");
   db.addDependency("orgA", "asm", "p2", "COMPONENT");
 
-  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider, ATTESTED);
 
   assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
   assert.deepEqual(kindByDoc(db), { asm: "DIRECT", p1: "DEPENDENCY", p2: "DEPENDENCY" });
@@ -2172,7 +2177,7 @@ test("B06-M1 (i): assembly AND its drawing linked to the revision -> the baselin
   db.addDependency("orgA", "asm", "p1", "COMPONENT");
   db.addDependency("orgA", "drw", "asm", "DRAWING_REFERENCE");
 
-  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider, ATTESTED);
 
   assert.deepEqual(kindByDoc(db), { asm: "DIRECT", drw: "DIRECT", p1: "DEPENDENCY" });
 });
@@ -2187,7 +2192,7 @@ test("B06-M1 (ii) KNOWN LIMITATION: only the assembly linked -> the release succ
   db.addDependency("orgA", "asm", "p1", "COMPONENT");
   db.addDependency("orgA", "drw", "asm", "DRAWING_REFERENCE");
 
-  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider, ATTESTED);
 
   assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
   assert.deepEqual(kindByDoc(db), { asm: "DIRECT", p1: "DEPENDENCY" }, "the unlinked drawing is not in the release");
@@ -2256,4 +2261,120 @@ test("B06: the refusal is an allowlisted notice that names its document (by serv
       return true;
     },
   );
+});
+
+// ------------------------------------------------------------
+// B06 G-2 (PO-signed, B06-L1): recorded sign-off before every release of an
+// assembly or drawing - the comment must START WITH the fixed phrase.
+// ------------------------------------------------------------
+
+/** A complete assembly + drawing, both linked to rev-1. */
+function seedCompleteAssembly(db: FakeDatabase): void {
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  db.addLink("orgA", "rev-1", "drw");
+  for (const d of ["asm", "drw", "p1"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.setDocType("orgA", "drw", "IDW");
+  db.addDependency("orgA", "asm", "p1", "COMPONENT");
+  db.addDependency("orgA", "drw", "asm", "DRAWING_REFERENCE");
+}
+
+async function expectAttestationRefusal(db: FakeDatabase, options: { comment?: unknown }): Promise<void> {
+  const before = snapshot(db);
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider, options),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseAttestationRequiredError, String(error));
+      assert.equal(classifyActionError(error), "release.ATTESTATION_REQUIRED");
+      assert.equal(noticeSubjectOf(error), null, "the sign-off notice never names a document");
+      return true;
+    },
+  );
+  assert.deepEqual(snapshot(db), before, "nothing written");
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+}
+
+test("G-2: releasing a complete assembly WITHOUT a comment is refused; nothing written", async () => {
+  const db = new FakeDatabase();
+  seedCompleteAssembly(db);
+  await expectAttestationRefusal(db, {});
+});
+
+test("G-2: a comment that does not START WITH the phrase is refused (blank, other text, phrase later in the text)", async () => {
+  for (const comment of [
+    "   ",
+    "Looks good",
+    `Checked. ${STRUCTURE_ATTESTATION_PHRASE}`,
+    "Structure checked against Scan",
+  ]) {
+    const db = new FakeDatabase();
+    seedCompleteAssembly(db);
+    await expectAttestationRefusal(db, { comment });
+  }
+});
+
+test("G-2: the phrase (any letter case, after normalisation) releases, and the comment is stored on the RELEASED event", async () => {
+  for (const comment of [
+    `${STRUCTURE_ATTESTATION_PHRASE}: 2026-11-19, ASM-1001, DRW-1001`,
+    `  \u0007${STRUCTURE_ATTESTATION_PHRASE.toUpperCase()} 2026-11-19  `,
+  ]) {
+    const db = new FakeDatabase();
+    seedCompleteAssembly(db);
+    await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider, { comment });
+    assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+    assert.deepEqual(kindByDoc(db), { asm: "DIRECT", drw: "DIRECT", p1: "DEPENDENCY" });
+    const released = db.eventsFor("rev-1").find((e) => e.toState === LifecycleState.RELEASED);
+    assert.ok(released, "a RELEASED event is written");
+    assert.ok(
+      released.comment !== null &&
+        released.comment.toLowerCase().startsWith(STRUCTURE_ATTESTATION_PHRASE.toLowerCase()),
+      "the normalized attestation is the event's comment",
+    );
+  }
+});
+
+test("G-2: a nested assembly (reached only as a DEPENDENCY) also requires the sign-off", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "p-top");
+  for (const d of ["p-top", "sub", "p1"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "sub", "IAM");
+  db.addDependency("orgA", "p-top", "sub", "REFERENCE");
+  db.addDependency("orgA", "sub", "p1", "COMPONENT");
+  await expectAttestationRefusal(db, {});
+});
+
+test("G-2: missing structure is reported BEFORE a missing sign-off", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  db.setDocType("orgA", "asm", "IAM");
+  await expectStructureRefusal(db, { cadDocumentId: "asm", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("G-2: the rule does NOT apply when the release holds no assembly or drawing (parts, PDFs, empty)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "p1");
+  db.addLink("orgA", "rev-1", "pdf");
+  seedDocumentWithVersion(db, "p1", "fv-p1", 1);
+  seedDocumentWithVersion(db, "pdf", "fv-pdf", 1);
+  db.setDocType("orgA", "pdf", "PDF");
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+});
+
+test("G-2: buildReleaseBaselineInTransaction is fail-closed - its default (null) comment refuses an assembly closure", async () => {
+  const db = new FakeDatabase();
+  seedCompleteAssembly(db);
+  await assert.rejects(
+    () =>
+      db.db.$transaction((tx) =>
+        buildReleaseBaselineInTransaction(tx as never, "orgA", "rev-1", "user-orgA", db.provider),
+      ),
+    ReleaseAttestationRequiredError,
+  );
+  assert.equal(db.baselines.length, 0);
 });

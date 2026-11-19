@@ -94,6 +94,41 @@ export function findStructureGaps(
   );
 }
 
+// ------------------------------------------------------------
+// G-2 (PO-signed B06 plan, B06-L1): recorded sign-off before every release.
+// When the release closure contains an assembly or a drawing, the release
+// comment must START WITH this fixed phrase (case-insensitive, after the
+// existing comment normalisation). It is stored in the append-only
+// ItemRevisionLifecycleEvent. It is the releaser's ATTESTATION that the
+// structure procedure was followed - not a proof that the structure is
+// complete.
+// ------------------------------------------------------------
+
+export const STRUCTURE_ATTESTATION_PHRASE = "Structure checked against Scan References";
+
+/** True when the closure holds a document type the structure rule covers. */
+export function closureNeedsAttestation(nodes: readonly StructureGuardNode[]): boolean {
+  return nodes.some((n) => requiredLinkType(n.documentType) !== null);
+}
+
+/** True when the normalized comment starts with the attestation phrase. */
+export function hasStructureAttestation(comment: string | null): boolean {
+  return (
+    comment !== null &&
+    comment.toLowerCase().startsWith(STRUCTURE_ATTESTATION_PHRASE.toLowerCase())
+  );
+}
+
+/** Thrown inside the release transaction when the sign-off is missing. */
+export class ReleaseAttestationRequiredError extends Error {
+  constructor() {
+    super(
+      `Release refused: releasing an assembly or drawing needs a comment starting with "${STRUCTURE_ATTESTATION_PHRASE}"`,
+    );
+    this.name = "ReleaseAttestationRequiredError";
+  }
+}
+
 /**
  * Thrown inside the release transaction when the closure has structure gaps.
  * The transaction rolls back: the revision is not RELEASED, no baseline and

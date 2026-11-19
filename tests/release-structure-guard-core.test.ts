@@ -7,8 +7,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  closureNeedsAttestation,
   findStructureGaps,
+  hasStructureAttestation,
+  ReleaseAttestationRequiredError,
   ReleaseStructureIncompleteError,
+  STRUCTURE_ATTESTATION_PHRASE,
   STRUCTURE_LINK_TYPES,
   type StructureGuardEdge,
   type StructureGuardNode,
@@ -94,4 +98,31 @@ test("ReleaseStructureIncompleteError carries the first gap and the count, and n
   assert.equal(error.kind, "DRAWING_WITHOUT_MODEL");
   assert.equal(error.gapCount, 2);
   assert.throws(() => new ReleaseStructureIncompleteError([]), RangeError);
+});
+
+// G-2: recorded sign-off
+
+test("G-2: the fixed phrase is exactly as signed in the B06 plan", () => {
+  assert.equal(STRUCTURE_ATTESTATION_PHRASE, "Structure checked against Scan References");
+});
+
+test("G-2: the sign-off is needed only when the closure holds an IAM, IDW or DWG", () => {
+  for (const type of ["IAM", "IDW", "DWG"]) assert.equal(closureNeedsAttestation([node("a", "IPT"), node("b", type)]), true, type);
+  assert.equal(closureNeedsAttestation([node("a", "IPT"), node("b", "PDF"), node("c", "OTHER")]), false);
+  assert.equal(closureNeedsAttestation([]), false);
+});
+
+test("G-2: the comment must START WITH the phrase (letter case ignored); null, other text or a later phrase do not count", () => {
+  assert.equal(hasStructureAttestation(`${STRUCTURE_ATTESTATION_PHRASE}: 2026-11-19, ASM-1`), true);
+  assert.equal(hasStructureAttestation(STRUCTURE_ATTESTATION_PHRASE), true);
+  assert.equal(hasStructureAttestation(STRUCTURE_ATTESTATION_PHRASE.toLowerCase()), true);
+  for (const comment of [null, "", "ok", `Done. ${STRUCTURE_ATTESTATION_PHRASE}`, "Structure checked against Scan"]) {
+    assert.equal(hasStructureAttestation(comment), false, JSON.stringify(comment));
+  }
+});
+
+test("G-2: ReleaseAttestationRequiredError names the phrase and nothing else", () => {
+  const error = new ReleaseAttestationRequiredError();
+  assert.equal(error.name, "ReleaseAttestationRequiredError");
+  assert.ok(error.message.includes(STRUCTURE_ATTESTATION_PHRASE));
 });

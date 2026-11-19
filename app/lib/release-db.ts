@@ -136,11 +136,15 @@ import {
 } from "./release-baseline-core.ts";
 import type { StorageProvider } from "./storage-core.ts";
 import {
+  closureNeedsAttestation,
   findStructureGaps,
+  hasStructureAttestation,
+  ReleaseAttestationRequiredError,
   ReleaseStructureIncompleteError,
 } from "./release-structure-guard-core.ts";
 
 export {
+  ReleaseAttestationRequiredError,
   ReleaseBaselineIncompleteError,
   ReleaseClosureInvalidError,
   ReleaseClosureTooLargeError,
@@ -266,12 +270,19 @@ async function resolveStableLockedClosure(
  * transaction ends (createCadDependency takes the same lock - P3D-3); the
  * SERIALIZABLE transaction is additional protection.
  *
- * @throws ReleaseStructureIncompleteError (the caller's transaction rolls back).
+ * G-2: when the closure holds any IAM or IDW/DWG, the (normalized) release
+ * comment must start with STRUCTURE_ATTESTATION_PHRASE - the releaser's
+ * recorded sign-off. Checked after the gap check, so missing structure is
+ * reported first.
+ *
+ * @throws ReleaseStructureIncompleteError / ReleaseAttestationRequiredError
+ *   (the caller's transaction rolls back).
  */
 async function assertClosureStructure(
   tx: Prisma.TransactionClient,
   organizationId: string,
   closure: ReleaseClosureResult,
+  releaseComment: string | null,
 ): Promise<void> {
   const ids = closure.cadDocumentIds;
   if (ids.length === 0) return;
@@ -289,8 +300,9 @@ async function assertClosureStructure(
     },
     select: { parentDocumentId: true, childDocumentId: true, dependencyType: true },
   });
+  const nodes = documents.map((d) => ({ cadDocumentId: d.id, documentType: d.documentType }));
   const gaps = findStructureGaps(
-    documents.map((d) => ({ cadDocumentId: d.id, documentType: d.documentType })),
+    nodes,
     edges.map((e) => ({
       parentCadDocumentId: e.parentDocumentId,
       childCadDocumentId: e.childDocumentId,
@@ -299,6 +311,9 @@ async function assertClosureStructure(
   );
   if (gaps.length > 0) {
     throw new ReleaseStructureIncompleteError(gaps);
+  }
+  if (closureNeedsAttestation(nodes) && !hasStructureAttestation(releaseComment)) {
+    throw new ReleaseAttestationRequiredError();
   }
 }
 
@@ -317,6 +332,10 @@ async function assertClosureStructure(
  *   node cap.
  * @throws ReleaseClosureInvalidError if a dependency edge in the closure
  *   points at a document not available in the organization.
+ * @throws ReleaseStructureIncompleteError / ReleaseAttestationRequiredError
+ *   (B06) if an assembly or drawing has no recorded structure, or the
+ *   closure holds one and `releaseComment` lacks the sign-off phrase. The
+ *   default `null` comment is fail-closed for such closures.
  */
 export async function buildReleaseBaselineInTransaction(
   tx: Prisma.TransactionClient,
@@ -325,6 +344,7 @@ export async function buildReleaseBaselineInTransaction(
   actorUserId: string,
   provider: StorageProvider,
   maxClosureNodes: number = DEFAULT_MAX_RELEASE_CLOSURE_NODES,
+  releaseComment: string | null = null,
 ): Promise<ReleaseBaselineResult> {
   const closure = await resolveStableLockedClosure(
     tx,
@@ -334,7 +354,7 @@ export async function buildReleaseBaselineInTransaction(
   );
 
   // B06: cheap structure check first, before any file resolution or hashing.
-  await assertClosureStructure(tx, organizationId, closure);
+  await assertClosureStructure(tx, organizationId, closure, releaseComment);
 
   const entries: Array<{
     cadDocumentId: string;
@@ -468,6 +488,9 @@ export async function buildReleaseBaselineInTransaction(
  * @throws ReleaseStructureIncompleteError (B06) if `target === RELEASED` and
  *   an assembly or drawing in the closure has no recorded structure - also
  *   rolled back, nothing written.
+ * @throws ReleaseAttestationRequiredError (B06 G-2) if `target === RELEASED`,
+ *   the closure holds an assembly or drawing, and the comment does not start
+ *   with the structure sign-off phrase - rolled back, nothing written.
  */
 export async function advanceRevisionForActor(
   actor: Actor,
@@ -716,6 +739,8 @@ export async function advanceRevisionForActor(
           current.id,
           actor.userId,
           provider,
+          DEFAULT_MAX_RELEASE_CLOSURE_NODES,
+          comment, // G-2: the same normalized comment recorded on the event
         );
       }
     });
