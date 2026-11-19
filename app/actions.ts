@@ -31,7 +31,7 @@ import {
   noticeHref,
   refuseUnlessCanMutate,
   retryOnSerializationConflict,
-  runRefusable,
+  runRefusableNotice,
 } from "@/app/lib/action-notice-core";
 import {
   canCreateSuccessorFrom,
@@ -72,11 +72,15 @@ function optionalValue(formData: FormData, name: string) {
  * The refusals are all raised before any write or inside a transaction that
  * has already rolled back, so nothing here changes what is written. The
  * redirect happens OUTSIDE the try/catch, as Next.js requires.
+ *
+ * B06: a refusal that is about one document (a release refused for missing
+ * structure) also carries that document's server-side id, so the dashboard
+ * can name it (resolved within the user's own organization).
  */
 async function runWithRefusalNotice(run: () => Promise<unknown>): Promise<void> {
-  const notice = await runRefusable(run, { rethrowFramework: unstable_rethrow });
+  const notice = await runRefusableNotice(run, { rethrowFramework: unstable_rethrow });
   if (notice !== null) {
-    redirect(noticeHref(notice));
+    redirect(noticeHref(notice.code, notice.subject));
   }
 }
 

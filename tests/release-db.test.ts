@@ -31,6 +31,7 @@ import {
   ReleaseBaselineIncompleteError,
   ReleaseClosureInvalidError,
   ReleaseClosureTooLargeError,
+  ReleaseStructureIncompleteError,
   advanceRevisionForActor,
   buildReleaseBaselineInTransaction,
   type ReleaseDb,
@@ -40,7 +41,7 @@ import {
   MAX_LIFECYCLE_COMMENT_LENGTH,
 } from "../app/lib/lifecycle-policy-core.ts";
 import { LifecycleStateError } from "../app/lib/lifecycle-errors-core.ts";
-import { classifyActionError } from "../app/lib/action-notice-core.ts";
+import { classifyActionError, noticeSubjectOf } from "../app/lib/action-notice-core.ts";
 
 // ------------------------------------------------------------
 // Fake database + storage: REAL per-row async mutex behind $transaction +
@@ -122,11 +123,15 @@ interface VersionRow {
 interface DocRow {
   organizationId: string;
   id: string;
+  /** B06: CadDocumentType; defaults to IPT (no structure requirement). */
+  documentType: string;
 }
 interface DependencyRow {
   organizationId: string;
   parentDocumentId: string;
   childDocumentId: string;
+  /** B06: CadDependencyType; defaults to COMPONENT. */
+  dependencyType: string;
 }
 interface EntryRow {
   id: string;
@@ -166,6 +171,8 @@ class FakeDatabase {
    *  landing between the release's closure passes. */
   dependencyScanHook: ((scanCount: number) => void) | null = null;
   #dependencyScans = 0;
+  /** B06: how many typed (COMPONENT / DRAWING_REFERENCE) structure reads ran. */
+  structureReads = 0;
 
   addRevision(row: RevisionRow): this {
     this.revisions.push(row);
@@ -215,14 +222,26 @@ class FakeDatabase {
     this.links.push({ organizationId, itemRevisionId, cadDocumentId });
     return this;
   }
-  addDoc(organizationId: string, id: string): this {
+  addDoc(organizationId: string, id: string, documentType = "IPT"): this {
     if (!this.docs.some((d) => d.organizationId === organizationId && d.id === id)) {
-      this.docs.push({ organizationId, id });
+      this.docs.push({ organizationId, id, documentType });
     }
     return this;
   }
-  addDependency(organizationId: string, parentDocumentId: string, childDocumentId: string): this {
-    this.dependencies.push({ organizationId, parentDocumentId, childDocumentId });
+  /** B06: set the CadDocumentType of an existing (or new) document. */
+  setDocType(organizationId: string, id: string, documentType: string): this {
+    this.addDoc(organizationId, id, documentType);
+    const doc = this.docs.find((d) => d.organizationId === organizationId && d.id === id)!;
+    doc.documentType = documentType;
+    return this;
+  }
+  addDependency(
+    organizationId: string,
+    parentDocumentId: string,
+    childDocumentId: string,
+    dependencyType = "COMPONENT",
+  ): this {
+    this.dependencies.push({ organizationId, parentDocumentId, childDocumentId, dependencyType });
     return this;
   }
   addVersion(
@@ -442,25 +461,38 @@ class FakeDatabase {
               const ids = new Set(args.where.id.in);
               return self.docs
                 .filter((d) => d.organizationId === args.where.organizationId && ids.has(d.id))
-                .map((d) => ({ id: d.id }));
+                .map((d) => ({ id: d.id, documentType: d.documentType }));
             }) as unknown,
           },
           cadDependency: {
             findMany: (async (args: {
-              where: { organizationId: string; parentDocumentId: { in: string[] } };
+              where: {
+                organizationId: string;
+                parentDocumentId: { in: string[] };
+                dependencyType?: { in: string[] };
+              };
             }) => {
-              self.#dependencyScans += 1;
-              self.dependencyScanHook?.(self.#dependencyScans);
+              const typeFilter = args.where.dependencyType?.in;
+              // The closure walk's scans are counted (and hooked); the B06
+              // guard's typed read, after the closure is locked, is not.
+              if (typeFilter === undefined) {
+                self.#dependencyScans += 1;
+                self.dependencyScanHook?.(self.#dependencyScans);
+              } else {
+                self.structureReads += 1;
+              }
               const parents = new Set(args.where.parentDocumentId.in);
               return self.dependencies
                 .filter(
                   (e) =>
                     e.organizationId === args.where.organizationId &&
-                    parents.has(e.parentDocumentId),
+                    parents.has(e.parentDocumentId) &&
+                    (typeFilter === undefined || typeFilter.includes(e.dependencyType)),
                 )
                 .map((e) => ({
                   parentDocumentId: e.parentDocumentId,
                   childDocumentId: e.childDocumentId,
+                  dependencyType: e.dependencyType,
                 }));
             }) as unknown,
           },
@@ -2042,4 +2074,186 @@ test("Option A O-4: no lineage supersession when the legacy source is not RELEAS
   );
   assert.deepEqual(snapshot(c), before);
   assert.equal(c.revisions.find((r) => r.id === "rev-B")!.lifecycle, LifecycleState.RELEASED);
+});
+
+// ============================================================
+// B06 (pilot rule D-B = BOM-1(a)): assembly release guard.
+// Every IAM in the release closure needs a COMPONENT link and every
+// IDW/DWG a DRAWING_REFERENCE link; otherwise the release is refused and
+// NOTHING is written (no RELEASED state, no baseline, no lifecycle event).
+// ============================================================
+
+async function expectStructureRefusal(
+  db: FakeDatabase,
+  expected: { cadDocumentId: string; kind: string; gapCount: number },
+): Promise<void> {
+  const before = snapshot(db);
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.ok(error instanceof ReleaseStructureIncompleteError, String(error));
+      assert.equal(error.cadDocumentId, expected.cadDocumentId);
+      assert.equal(error.kind, expected.kind);
+      assert.equal(error.gapCount, expected.gapCount);
+      return true;
+    },
+  );
+  assert.deepEqual(snapshot(db), before, "nothing written");
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.APPROVED);
+  assert.equal(db.baselines.length, 0);
+  assert.equal(db.entries.length, 0);
+}
+
+test("B06: an assembly with no recorded components cannot be released; nothing is written", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  db.setDocType("orgA", "asm", "IAM");
+  await expectStructureRefusal(db, { cadDocumentId: "asm", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("B06: an assembly whose only links are REFERENCE links is still refused", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  seedDocumentWithVersion(db, "p1", "fv-p1", 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.addDependency("orgA", "asm", "p1", "REFERENCE");
+  await expectStructureRefusal(db, { cadDocumentId: "asm", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("B06: a complete structure releases and its baseline contains every component", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  for (const d of ["asm", "p1", "p2"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.addDependency("orgA", "asm", "p1", "COMPONENT");
+  db.addDependency("orgA", "asm", "p2", "COMPONENT");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+  assert.deepEqual(kindByDoc(db), { asm: "DIRECT", p1: "DEPENDENCY", p2: "DEPENDENCY" });
+  assert.equal(db.structureReads, 1, "one typed structure read after the closure is locked");
+});
+
+test("B06: a nested sub-assembly without components is refused even though the top assembly is complete", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "top");
+  for (const d of ["top", "sub", "p1"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "top", "IAM");
+  db.setDocType("orgA", "sub", "IAM");
+  db.addDependency("orgA", "top", "sub", "COMPONENT");
+  db.addDependency("orgA", "top", "p1", "COMPONENT");
+  await expectStructureRefusal(db, { cadDocumentId: "sub", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("B06: a drawing linked to the revision without a DRAWING_REFERENCE link is refused", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "drw");
+  seedDocumentWithVersion(db, "drw", "fv-drw", 1);
+  db.setDocType("orgA", "drw", "IDW");
+  await expectStructureRefusal(db, { cadDocumentId: "drw", kind: "DRAWING_WITHOUT_MODEL", gapCount: 1 });
+});
+
+test("B06-M1 (i): assembly AND its drawing linked to the revision -> the baseline holds the components AND the drawing", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  db.addLink("orgA", "rev-1", "drw");
+  for (const d of ["asm", "drw", "p1"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.setDocType("orgA", "drw", "DWG");
+  db.addDependency("orgA", "asm", "p1", "COMPONENT");
+  db.addDependency("orgA", "drw", "asm", "DRAWING_REFERENCE");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.deepEqual(kindByDoc(db), { asm: "DIRECT", drw: "DIRECT", p1: "DEPENDENCY" });
+});
+
+test("B06-M1 (ii) KNOWN LIMITATION: only the assembly linked -> the release succeeds WITHOUT the drawing (the procedure covers it)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  for (const d of ["asm", "drw", "p1"]) seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.setDocType("orgA", "drw", "IDW");
+  db.addDependency("orgA", "asm", "p1", "COMPONENT");
+  db.addDependency("orgA", "drw", "asm", "DRAWING_REFERENCE");
+
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider);
+
+  assert.equal(db.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+  assert.deepEqual(kindByDoc(db), { asm: "DIRECT", p1: "DEPENDENCY" }, "the unlinked drawing is not in the release");
+});
+
+test("B06: several gaps -> the first (by id) is named and the count is carried", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  for (const d of ["z-asm", "b-drw", "m-asm"]) {
+    db.addLink("orgA", "rev-1", d);
+    seedDocumentWithVersion(db, d, `fv-${d}`, 1);
+  }
+  db.setDocType("orgA", "z-asm", "IAM");
+  db.setDocType("orgA", "m-asm", "IAM");
+  db.setDocType("orgA", "b-drw", "IDW");
+  await expectStructureRefusal(db, { cadDocumentId: "b-drw", kind: "DRAWING_WITHOUT_MODEL", gapCount: 3 });
+});
+
+test("B06: the structure check runs BEFORE file resolution - a missing binary elsewhere does not mask the structure refusal", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  db.addLink("orgA", "rev-1", "broken");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  seedDocumentWithVersion(db, "broken", "fv-broken", 1, { present: false });
+  db.setDocType("orgA", "asm", "IAM");
+  await expectStructureRefusal(db, { cadDocumentId: "asm", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("B06: tenant isolation - a COMPONENT edge recorded in ANOTHER organization does not satisfy the rule", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  db.setDocType("orgA", "asm", "IAM");
+  db.addDependency("orgB", "asm", "p1", "COMPONENT");
+  await expectStructureRefusal(db, { cadDocumentId: "asm", kind: "ASSEMBLY_WITHOUT_COMPONENTS", gapCount: 1 });
+});
+
+test("B06: parts-only and zero-document releases are unaffected", async () => {
+  const parts = new FakeDatabase();
+  seedApprovedRevision(parts);
+  parts.addLink("orgA", "rev-1", "p1");
+  seedDocumentWithVersion(parts, "p1", "fv-p1", 1);
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, parts.db, parts.provider);
+  assert.equal(parts.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+
+  const empty = new FakeDatabase();
+  seedApprovedRevision(empty);
+  await advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, empty.db, empty.provider);
+  assert.equal(empty.revisions[0]!.lifecycle, LifecycleState.RELEASED);
+  assert.equal(empty.structureReads, 0, "no structure read for an empty closure");
+});
+
+test("B06: the refusal is an allowlisted notice that names its document (by server-side id)", async () => {
+  const db = new FakeDatabase();
+  seedApprovedRevision(db);
+  db.addLink("orgA", "rev-1", "asm");
+  seedDocumentWithVersion(db, "asm", "fv-asm", 1);
+  db.setDocType("orgA", "asm", "IAM");
+  await assert.rejects(
+    () => advanceRevisionForActor(actorIn("orgA"), "rev-1", LifecycleState.RELEASED, db.db, db.provider),
+    (error: unknown) => {
+      assert.equal(classifyActionError(error), "release.STRUCTURE_ASSEMBLY");
+      assert.deepEqual(noticeSubjectOf(error), { cadDocumentId: "asm", more: 0 });
+      return true;
+    },
+  );
 });

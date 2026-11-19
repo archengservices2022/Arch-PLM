@@ -100,7 +100,7 @@
  */
 import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
 import type { Actor } from "@/app/lib/authz";
-import { LifecycleEventTrigger, LifecycleState } from "../generated/prisma/enums.ts";
+import { CadDependencyType, LifecycleEventTrigger, LifecycleState } from "../generated/prisma/enums.ts";
 import {
   isTerminalLifecycle,
   isManualTransitionAllowed,
@@ -135,11 +135,16 @@ import {
   type ReleaseBaselineResult,
 } from "./release-baseline-core.ts";
 import type { StorageProvider } from "./storage-core.ts";
+import {
+  findStructureGaps,
+  ReleaseStructureIncompleteError,
+} from "./release-structure-guard-core.ts";
 
 export {
   ReleaseBaselineIncompleteError,
   ReleaseClosureInvalidError,
   ReleaseClosureTooLargeError,
+  ReleaseStructureIncompleteError,
 };
 export type { ReleaseBaselineResult };
 
@@ -253,6 +258,51 @@ async function resolveStableLockedClosure(
 }
 
 /**
+ * B06 (pilot rule D-B): refuse the release when any document in the LOCKED
+ * closure lacks its required structure (an IAM without a COMPONENT link, an
+ * IDW/DWG without a DRAWING_REFERENCE link). Read-only. Runs after
+ * `resolveStableLockedClosure` holds FOR UPDATE on every closure document, so
+ * no edge whose parent is in the closure can be added or removed until this
+ * transaction ends (createCadDependency takes the same lock - P3D-3); the
+ * SERIALIZABLE transaction is additional protection.
+ *
+ * @throws ReleaseStructureIncompleteError (the caller's transaction rolls back).
+ */
+async function assertClosureStructure(
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  closure: ReleaseClosureResult,
+): Promise<void> {
+  const ids = closure.cadDocumentIds;
+  if (ids.length === 0) return;
+  const documents = await tx.cadDocument.findMany({
+    where: { organizationId, id: { in: ids } },
+    select: { id: true, documentType: true },
+  });
+  const edges = await tx.cadDependency.findMany({
+    where: {
+      organizationId,
+      parentDocumentId: { in: ids },
+      dependencyType: {
+        in: [CadDependencyType.COMPONENT, CadDependencyType.DRAWING_REFERENCE],
+      },
+    },
+    select: { parentDocumentId: true, childDocumentId: true, dependencyType: true },
+  });
+  const gaps = findStructureGaps(
+    documents.map((d) => ({ cadDocumentId: d.id, documentType: d.documentType })),
+    edges.map((e) => ({
+      parentCadDocumentId: e.parentDocumentId,
+      childCadDocumentId: e.childDocumentId,
+      dependencyType: e.dependencyType,
+    })),
+  );
+  if (gaps.length > 0) {
+    throw new ReleaseStructureIncompleteError(gaps);
+  }
+}
+
+/**
  * Build the dependency-complete frozen release baseline for `itemRevisionId`
  * INSIDE an already-open transaction.
  *
@@ -282,6 +332,9 @@ export async function buildReleaseBaselineInTransaction(
     itemRevisionId,
     maxClosureNodes,
   );
+
+  // B06: cheap structure check first, before any file resolution or hashing.
+  await assertClosureStructure(tx, organizationId, closure);
 
   const entries: Array<{
     cadDocumentId: string;
@@ -412,6 +465,9 @@ export async function buildReleaseBaselineInTransaction(
  *   ReleaseClosureInvalidError if `target === RELEASED` and the frozen
  *   package cannot be captured - the revision does NOT become RELEASED (the
  *   whole transaction rolls back).
+ * @throws ReleaseStructureIncompleteError (B06) if `target === RELEASED` and
+ *   an assembly or drawing in the closure has no recorded structure - also
+ *   rolled back, nothing written.
  */
 export async function advanceRevisionForActor(
   actor: Actor,

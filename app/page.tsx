@@ -15,7 +15,11 @@ import {
 } from "@/app/actions";
 import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { ActionNotice } from "@/app/components/action-notice";
-import { noticeMessage, parseNoticeCode } from "@/app/lib/action-notice-core";
+import {
+  noticeMessageFor,
+  parseNoticeCode,
+  parseNoticeSubject,
+} from "@/app/lib/action-notice-core";
 import { prisma } from "@/app/lib/prisma";
 import {
   hasRole,
@@ -291,8 +295,8 @@ export default async function Home({ searchParams }: PageProps<"/">) {
 
   // KI-2: a refused action redirects here with ?notice=<code>. Only an
   // allowlisted code is shown, as its fixed message; anything else is ignored.
-  const noticeCode = parseNoticeCode((await searchParams).notice);
-  const notice = noticeCode ? noticeMessage(noticeCode) : null;
+  const params = await searchParams;
+  const noticeCode = parseNoticeCode(params.notice);
 
   if (dashboard.status === "unavailable") {
     return (
@@ -324,6 +328,25 @@ export default async function Home({ searchParams }: PageProps<"/">) {
     lifecycleCounts,
     openRevisions,
   } = dashboard;
+
+  // B06: a subject-bearing notice (release refused for missing structure)
+  // may carry a document id. It is resolved ONLY among this organization's
+  // documents (already loaded above); if it does not match, the generic
+  // message is shown and the id itself is never rendered.
+  const noticeSubject = noticeCode
+    ? parseNoticeSubject(noticeCode, params.doc, params.more)
+    : null;
+  const noticeSubjectLabel = noticeSubject
+    ? (cadDocuments.find((document) => document.id === noticeSubject.cadDocumentId)
+        ?.documentNumber ?? null)
+    : null;
+  const notice = noticeCode
+    ? noticeMessageFor(
+        noticeCode,
+        noticeSubject ? { label: noticeSubjectLabel, more: noticeSubject.more } : null,
+      )
+    : null;
+
   const revisionsWithCad = revisions.filter(
     (revision) => revision.documentLinks.length > 0,
   );

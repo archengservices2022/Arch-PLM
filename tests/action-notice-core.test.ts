@@ -26,10 +26,14 @@ import {
   isUniqueViolationOn,
   noticeHref,
   noticeMessage,
+  noticeMessageFor,
+  noticeSubjectOf,
   parseNoticeCode,
+  parseNoticeSubject,
   refuseUnlessCanMutate,
   retryOnSerializationConflict,
   runRefusable,
+  runRefusableNotice,
   runSignInAttempt,
   SIGN_IN_ERROR_PARAM,
   SIGN_IN_FAILED_MESSAGE,
@@ -47,6 +51,9 @@ import {
   type LegacyRevalidationCode,
 } from "../app/lib/legacy-revalidation-core.ts";
 import { LifecycleStateError } from "../app/lib/lifecycle-errors-core.ts";
+import { ReleaseStructureIncompleteError } from "../app/lib/release-structure-guard-core.ts";
+import { ReleaseBaselineIncompleteError } from "../app/lib/release-baseline-core.ts";
+import { ReleaseClosureInvalidError, ReleaseClosureTooLargeError } from "../app/lib/release-closure-core.ts";
 
 // ------------------------------------------------------------
 // Helpers
@@ -512,4 +519,122 @@ test("the login error parameter accepts only its single fixed value; the message
     assert.equal(isSignInErrorParam(raw), false, JSON.stringify(raw));
   }
   assert.equal(SIGN_IN_FAILED_MESSAGE, "Invalid email or password.");
+});
+
+// ------------------------------------------------------------
+// B06: release refused for missing structure - a notice that names a document
+// ------------------------------------------------------------
+
+const assemblyGap = () =>
+  new ReleaseStructureIncompleteError([
+    { cadDocumentId: "cm3asm0000000000000000001", kind: "ASSEMBLY_WITHOUT_COMPONENTS" },
+    { cadDocumentId: "cm3drw0000000000000000002", kind: "DRAWING_WITHOUT_MODEL" },
+  ]);
+
+test("B06: a structure refusal maps to an allowlisted release notice by gap kind", () => {
+  assert.equal(classifyActionError(assemblyGap()), "release.STRUCTURE_ASSEMBLY");
+  const drawing = new ReleaseStructureIncompleteError([{ cadDocumentId: "d1", kind: "DRAWING_WITHOUT_MODEL" }]);
+  assert.equal(classifyActionError(drawing), "release.STRUCTURE_DRAWING");
+  assert.ok(allNoticeCodes().includes("release.STRUCTURE_ASSEMBLY" as NoticeCode));
+  assert.ok(allNoticeCodes().includes("release.STRUCTURE_DRAWING" as NoticeCode));
+});
+
+test("B06: the existing release INTEGRITY errors stay unexpected (error page), unchanged by B06", () => {
+  assert.equal(classifyActionError(new ReleaseBaselineIncompleteError("doc-1", "corrupt")), null);
+  assert.equal(classifyActionError(new ReleaseClosureTooLargeError(5000)), null);
+  assert.equal(classifyActionError(new ReleaseClosureInvalidError("ghost")), null);
+});
+
+test("B06: the subject of a structure refusal is its first document and the count of the others", () => {
+  assert.deepEqual(noticeSubjectOf(assemblyGap()), { cadDocumentId: "cm3asm0000000000000000001", more: 1 });
+  assert.equal(noticeSubjectOf(new ActionRefusalError("FIELD_REQUIRED")), null);
+  assert.equal(noticeSubjectOf(new Error("x")), null);
+});
+
+test("B06: runRefusableNotice returns the code AND the subject; runRefusable still returns the code only", async () => {
+  assert.deepEqual(
+    await runRefusableNotice(async () => {
+      throw assemblyGap();
+    }),
+    {
+      code: "release.STRUCTURE_ASSEMBLY",
+      subject: { cadDocumentId: "cm3asm0000000000000000001", more: 1 },
+    },
+  );
+  assert.equal(
+    await runRefusable(async () => {
+      throw assemblyGap();
+    }),
+    "release.STRUCTURE_ASSEMBLY",
+  );
+  assert.deepEqual(
+    await runRefusableNotice(async () => {
+      throw new ActionRefusalError("FIELD_REQUIRED");
+    }),
+    { code: "action.FIELD_REQUIRED", subject: null },
+  );
+  assert.equal(await runRefusableNotice(async () => undefined), null);
+});
+
+test("B06: noticeHref carries the validated id and count only for a subject-bearing code, and round-trips", () => {
+  const code = "release.STRUCTURE_ASSEMBLY" as NoticeCode;
+  const href = noticeHref(code, { cadDocumentId: "cm3asm0000000000000000001", more: 2 });
+  assert.equal(href, "/?notice=release.STRUCTURE_ASSEMBLY&doc=cm3asm0000000000000000001&more=2");
+  const url = new URL(href, "http://x");
+  assert.deepEqual(
+    parseNoticeSubject(code, url.searchParams.get("doc"), url.searchParams.get("more")),
+    { cadDocumentId: "cm3asm0000000000000000001", more: 2 },
+  );
+  // more = 0 is omitted; other codes never carry a subject; a bad id is dropped.
+  assert.equal(noticeHref(code, { cadDocumentId: "abc", more: 0 }), "/?notice=release.STRUCTURE_ASSEMBLY&doc=abc");
+  assert.equal(
+    noticeHref("action.FIELD_REQUIRED" as NoticeCode, { cadDocumentId: "abc", more: 1 }),
+    "/?notice=action.FIELD_REQUIRED",
+  );
+  assert.equal(noticeHref(code, { cadDocumentId: "a b<c>", more: 1 }), "/?notice=release.STRUCTURE_ASSEMBLY");
+  assert.equal(noticeHref(code), "/?notice=release.STRUCTURE_ASSEMBLY");
+});
+
+test("B06: parseNoticeSubject rejects malformed, injected and non-string ids, and ignores a bad count", () => {
+  const code = "release.STRUCTURE_ASSEMBLY" as NoticeCode;
+  for (const raw of [
+    undefined, null, "", "a b", "<script>", "doc/1", "doc?x=1", "doc%20", "x".repeat(65), ["abc"], 5, {},
+  ]) {
+    assert.equal(parseNoticeSubject(code, raw, "1"), null, JSON.stringify(raw));
+  }
+  for (const more of [undefined, "", "-1", "1.5", "12345", "1e3", ["2"], "<b>"]) {
+    assert.deepEqual(parseNoticeSubject(code, "abc", more), { cadDocumentId: "abc", more: 0 }, JSON.stringify(more));
+  }
+  assert.equal(parseNoticeSubject("action.FIELD_REQUIRED" as NoticeCode, "abc", "1"), null);
+});
+
+test("B06: the message names the document by its NUMBER; without a resolved number it is the generic text and never shows the id", () => {
+  const code = "release.STRUCTURE_ASSEMBLY" as NoticeCode;
+  const named = noticeMessageFor(code, { label: "ASM-1001", more: 0 });
+  assert.match(named, /^Release refused: assembly ASM-1001 has no components recorded in Arch PLM\./);
+  assert.ok(!/more document/.test(named));
+  assert.match(noticeMessageFor(code, { label: "ASM-1001", more: 1 }), /\(1 more document in this release also needs structure\.\)/);
+  assert.match(noticeMessageFor(code, { label: "ASM-1001", more: 3 }), /\(3 more documents in this release also need structure\.\)/);
+  assert.match(
+    noticeMessageFor("release.STRUCTURE_DRAWING" as NoticeCode, { label: "DRW-7", more: 0 }),
+    /^Release refused: drawing DRW-7 has no model recorded in Arch PLM\./,
+  );
+  // Lookup failed (foreign or unknown id): the fixed generic message, with no id in it.
+  const generic = noticeMessageFor(code, { label: null, more: 2 });
+  assert.equal(generic, noticeMessage(code));
+  assert.ok(!generic.includes("cm3asm"));
+  // A label is ignored for a code that cannot carry a subject.
+  assert.equal(
+    noticeMessageFor("action.FIELD_REQUIRED" as NoticeCode, { label: "ASM-1001", more: 0 }),
+    noticeMessage("action.FIELD_REQUIRED" as NoticeCode),
+  );
+  assert.equal(noticeMessageFor(code, null), noticeMessage(code));
+});
+
+test("B06: the dashboard resolves the subject among the organization's own documents and clears doc/more", () => {
+  const page = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /parseNoticeSubject\(noticeCode, params\.doc, params\.more\)/);
+  assert.match(page, /cadDocuments\.find\(\(document\) => document\.id === noticeSubject\.cadDocumentId\)/);
+  const component = readFileSync(new URL("../app/components/action-notice.tsx", import.meta.url), "utf8");
+  assert.match(component, /NOTICE_PARAMS = \["notice", "doc", "more"\]/);
 });

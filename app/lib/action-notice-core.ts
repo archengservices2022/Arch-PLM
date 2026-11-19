@@ -13,6 +13,10 @@ import {
   LifecycleStateError,
   type LifecycleStateErrorCode,
 } from "./lifecycle-errors-core.ts";
+import {
+  ReleaseStructureIncompleteError,
+  type StructureGapKind,
+} from "./release-structure-guard-core.ts";
 
 // ============================================================
 // Arch PLM - safe refusal notices for Server Actions (pilot UX fixes)
@@ -238,6 +242,42 @@ const ACTOR_NOT_ACTIVE_MESSAGE = "Your account is not active in this organizatio
 const COMMENT_TOO_LONG_MESSAGE = `The comment or reason is too long (maximum ${MAX_LIFECYCLE_COMMENT_LENGTH} characters).`;
 
 // ------------------------------------------------------------
+// B06: release refused because a document in the release has no recorded
+// structure. These notices may NAME the document (see NoticeSubject below).
+// ------------------------------------------------------------
+
+export type ReleaseRefusalCode = "STRUCTURE_ASSEMBLY" | "STRUCTURE_DRAWING";
+
+const RELEASE_STRUCTURE_ADVICE =
+  "Record its structure following the structure procedure, then release again.";
+
+/** The generic messages (used when the document cannot be named). */
+const RELEASE_REFUSAL_MESSAGES: Record<ReleaseRefusalCode, string> = {
+  STRUCTURE_ASSEMBLY: `Release refused: an assembly in this release has no components recorded in Arch PLM. ${RELEASE_STRUCTURE_ADVICE}`,
+  STRUCTURE_DRAWING: `Release refused: a drawing in this release has no model recorded in Arch PLM. ${RELEASE_STRUCTURE_ADVICE}`,
+};
+
+const RELEASE_CODE_FOR_GAP: Record<StructureGapKind, ReleaseRefusalCode> = {
+  ASSEMBLY_WITHOUT_COMPONENTS: "STRUCTURE_ASSEMBLY",
+  DRAWING_WITHOUT_MODEL: "STRUCTURE_DRAWING",
+};
+
+/** The messages that name the document (`label` = its document number). */
+function namedReleaseMessage(code: ReleaseRefusalCode, label: string, more: number): string {
+  const what =
+    code === "STRUCTURE_ASSEMBLY"
+      ? `assembly ${label} has no components recorded in Arch PLM`
+      : `drawing ${label} has no model recorded in Arch PLM`;
+  const others =
+    more === 1
+      ? " (1 more document in this release also needs structure.)"
+      : more > 1
+        ? ` (${more} more documents in this release also need structure.)`
+        : "";
+  return `Release refused: ${what}. ${RELEASE_STRUCTURE_ADVICE}${others}`;
+}
+
+// ------------------------------------------------------------
 // The allowlist: notice code -> fixed message
 // ------------------------------------------------------------
 
@@ -258,6 +298,7 @@ const NOTICE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   ...namespaced<LegacyRevalidationCode>("revalidation", LEGACY_REVALIDATION_MESSAGES),
   ...namespaced<LifecycleStateErrorCode>("state", LIFECYCLE_STATE_MESSAGES),
   ...namespaced<ActionRefusalCode>("action", ACTION_REFUSAL_MESSAGES),
+  ...namespaced<ReleaseRefusalCode>("release", RELEASE_REFUSAL_MESSAGES),
   "comment.INVALID": COMMENT_TOO_LONG_MESSAGE,
 });
 
@@ -290,9 +331,72 @@ export function noticeMessage(code: NoticeCode): string {
   return NOTICE_MESSAGES[code];
 }
 
-/** Where a refused action sends the user: the dashboard with the code only. */
-export function noticeHref(code: NoticeCode): string {
-  return `/?notice=${encodeURIComponent(code)}`;
+// ------------------------------------------------------------
+// B06: naming a document in a notice WITHOUT reflecting request text
+//
+// The URL may carry, next to the notice code, the ID of the document the
+// refusal is about (`doc`) and how many more documents are affected (`more`).
+// Both are strictly validated. The page resolves the id to a document number
+// ONLY among the signed-in user's own organization's documents; when that
+// fails, the generic message is shown and the id itself is never rendered.
+// ------------------------------------------------------------
+
+/** The notice codes that may carry a subject document. */
+const SUBJECT_NOTICE_CODES: ReadonlySet<string> = new Set(
+  (Object.keys(RELEASE_REFUSAL_MESSAGES) as ReleaseRefusalCode[]).map((code) => `release.${code}`),
+);
+
+/** Server-generated ids (cuid) - letters, digits, '-' and '_' only. */
+const SUBJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const SUBJECT_MORE_PATTERN = /^[0-9]{1,4}$/;
+
+export interface NoticeSubject {
+  cadDocumentId: string;
+  /** How many OTHER documents are affected (0 = none). */
+  more: number;
+}
+
+/** The subject of an expected refusal, when its notice can name a document. */
+export function noticeSubjectOf(error: unknown): NoticeSubject | null {
+  if (error instanceof ReleaseStructureIncompleteError) {
+    return { cadDocumentId: error.cadDocumentId, more: Math.max(0, error.gapCount - 1) };
+  }
+  return null;
+}
+
+/** Validate the `doc` / `more` search parameters for an allowlisted code. */
+export function parseNoticeSubject(code: NoticeCode, rawDoc: unknown, rawMore: unknown): NoticeSubject | null {
+  if (!SUBJECT_NOTICE_CODES.has(code)) return null;
+  if (typeof rawDoc !== "string" || !SUBJECT_ID_PATTERN.test(rawDoc)) return null;
+  const more = typeof rawMore === "string" && SUBJECT_MORE_PATTERN.test(rawMore) ? Number(rawMore) : 0;
+  return { cadDocumentId: rawDoc, more };
+}
+
+/**
+ * The message for a notice. `subjectLabel` is the subject document's number,
+ * looked up by the caller in the actor's own organization (null when there
+ * is no subject or the lookup failed - then the fixed message is used).
+ */
+export function noticeMessageFor(
+  code: NoticeCode,
+  subject: { label: string | null; more: number } | null,
+): string {
+  if (subject !== null && subject.label !== null && SUBJECT_NOTICE_CODES.has(code)) {
+    const releaseCode = code.slice("release.".length) as ReleaseRefusalCode;
+    return namedReleaseMessage(releaseCode, subject.label, subject.more);
+  }
+  return NOTICE_MESSAGES[code];
+}
+
+/** Where a refused action sends the user: the dashboard with the code only
+ *  (plus, for a subject-bearing notice, the validated subject id and count). */
+export function noticeHref(code: NoticeCode, subject: NoticeSubject | null = null): string {
+  const base = `/?notice=${encodeURIComponent(code)}`;
+  if (subject === null || !SUBJECT_NOTICE_CODES.has(code) || !SUBJECT_ID_PATTERN.test(subject.cadDocumentId)) {
+    return base;
+  }
+  const more = Number.isInteger(subject.more) && subject.more > 0 ? Math.min(subject.more, 9999) : 0;
+  return `${base}&doc=${encodeURIComponent(subject.cadDocumentId)}${more > 0 ? `&more=${more}` : ""}`;
 }
 
 // ------------------------------------------------------------
@@ -323,6 +427,9 @@ export function classifyActionError(error: unknown): NoticeCode | null {
   if (error instanceof InvalidLifecycleCommentError) {
     return allowlisted("comment.INVALID");
   }
+  if (error instanceof ReleaseStructureIncompleteError) {
+    return allowlisted(`release.${RELEASE_CODE_FOR_GAP[error.kind]}`);
+  }
   if (error.name === "LifecyclePermissionError") {
     const code = (error as { code?: unknown }).code;
     return typeof code === "string" ? allowlisted(`lifecycle.${code}`) : null;
@@ -346,6 +453,21 @@ export async function runRefusable(
     rethrowFramework?: (error: unknown) => void;
   } = {},
 ): Promise<NoticeCode | null> {
+  const notice = await runRefusableNotice(run, options);
+  return notice === null ? null : notice.code;
+}
+
+/**
+ * B06: like `runRefusable`, but also returns the refusal's subject document
+ * (if its notice can name one), for `noticeHref(code, subject)`.
+ */
+export async function runRefusableNotice(
+  run: () => Promise<unknown>,
+  options: {
+    classify?: (error: unknown) => NoticeCode | null;
+    rethrowFramework?: (error: unknown) => void;
+  } = {},
+): Promise<{ code: NoticeCode; subject: NoticeSubject | null } | null> {
   const classify = options.classify ?? classifyActionError;
   try {
     await run();
@@ -355,7 +477,7 @@ export async function runRefusable(
     if (isNextControlFlowError(error)) throw error;
     const code = classify(error);
     if (code === null) throw error;
-    return code;
+    return { code, subject: noticeSubjectOf(error) };
   }
 }
 
