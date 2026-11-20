@@ -38,6 +38,7 @@ import {
   loginThrottleKey,
   type LoginThrottle,
 } from "./login-throttle-core.ts";
+import { findSignInUserId } from "./sign-in-lookup-db.ts";
 
 export { DesktopAuthError };
 
@@ -56,7 +57,7 @@ export class DesktopLoginThrottledError extends DesktopAuthError {
 }
 
 /** The slice of PrismaClient this module needs. */
-export type DesktopAuthDb = Pick<PrismaClient, "user" | "desktopSession">;
+export type DesktopAuthDb = Pick<PrismaClient, "user" | "desktopSession" | "$queryRaw">;
 
 const GENERIC_CREDENTIAL_ERROR =
   "Sign-in failed. Check the email and password and try again.";
@@ -120,8 +121,12 @@ export async function authenticateDesktopClient(
   let user: AuthedUserRow | null;
   let passwordOk: boolean;
   try {
-    user = (await db.user.findFirst({
-      where: { email: { equals: normalizedEmail, mode: "insensitive" } },
+    // EXACT match ignoring case, never a pattern (SIGNIN-EXACT, Codex P-1b);
+    // an ambiguous address is refused like an unknown one. Inactive users
+    // are found and refused below, as before.
+    const userId = await findSignInUserId(db, normalizedEmail, { activeOnly: false });
+    user = userId === null ? null : ((await db.user.findFirst({
+      where: { id: userId },
       select: {
         id: true,
         organizationId: true,
@@ -132,7 +137,7 @@ export async function authenticateDesktopClient(
         active: true,
         organization: { select: { id: true, code: true, name: true } },
       },
-    })) as AuthedUserRow | null;
+    })) as AuthedUserRow | null);
 
     // Constant-ish work whether or not the user exists.
     const hashToCompare =

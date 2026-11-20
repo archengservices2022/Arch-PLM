@@ -8,6 +8,7 @@ import {
   loginThrottleKey,
 } from "@/app/lib/login-throttle-core";
 import { passwordVersion } from "@/app/lib/user-admin-core";
+import { findSignInUserId } from "@/app/lib/sign-in-lookup-db";
 
 /** WP-2A (Codex WP2A-L1): compared against when no account / no password
  *  hash exists, so a missing account costs the same bcrypt work. Same value
@@ -74,19 +75,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         let passwordValid = false;
         try {
           // ---------------------------------------------------
-          // Find active Arch PLM user
+          // Find active Arch PLM user - EXACT match ignoring case,
+          // never a pattern (SIGNIN-EXACT, Codex P-1b). An ambiguous
+          // address is refused like an unknown one.
           // ---------------------------------------------------
 
-          user = await prisma.user.findFirst({
-            where: {
-              email: {
-                equals: email,
-                mode: "insensitive",
-              },
-
-              active: true,
-            },
+          const userId = await findSignInUserId(prisma, email, {
+            activeOnly: true,
           });
+          user = userId
+            ? await prisma.user.findFirst({
+                where: { id: userId, active: true },
+              })
+            : null;
 
           // ---------------------------------------------------
           // Verify password. A bcrypt comparison is ALWAYS made

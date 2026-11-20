@@ -79,14 +79,25 @@ class FakeDb {
     const orgOf = (organizationId: string) =>
       self.orgs.get(organizationId) ?? { id: organizationId, code: organizationId, name: organizationId };
     return {
+      // SIGNIN-EXACT: the sign-in lookup - lower("email") = $1 [AND active], LIMIT 2.
+      $queryRaw: (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join("?");
+        assert.match(sql, /lower\("email"\) = \?/);
+        assert.doesNotMatch(sql, /LIKE/i);
+        const target = values[0] as string;
+        const activeOnly = /"active" = true/.test(sql);
+        return self.users
+          .filter((u) => u.email.toLowerCase() === target && (!activeOnly || u.active))
+          .slice(0, 2)
+          .map((u) => ({ id: u.id }));
+      }) as unknown as DesktopAuthDb["$queryRaw"],
       user: {
         findFirst: (async (args: {
-          where: { email?: { equals: string }; id?: string; active?: boolean };
+          where: { email?: unknown; id?: string; active?: boolean };
         }) => {
           let row: UserRow | undefined;
-          if (args.where.email) {
-            const target = args.where.email.equals.toLowerCase();
-            row = self.users.find((u) => u.email.toLowerCase() === target);
+          if (args.where.email !== undefined) {
+            throw new Error("sign-in must not look users up by an email pattern (SIGNIN-EXACT)");
           } else if (args.where.id) {
             row = self.users.find((u) => u.id === args.where.id);
           }
@@ -430,7 +441,11 @@ test("throttle (Codex WP2A-H1): a correct password inside a burst succeeds only 
 test("throttle: an unexpected database error releases the reservation (no failure counted)", async () => {
   const fake = new FakeDb();
   const { throttle } = throttleWithClock();
-  const broken = { ...fake.db, user: { ...fake.db.user, findFirst: async () => { throw new Error("db down"); } } } as unknown as DesktopAuthDb;
+  const broken = {
+    ...fake.db,
+    $queryRaw: async () => { throw new Error("db down"); },
+    user: { ...fake.db.user, findFirst: async () => { throw new Error("db down"); } },
+  } as unknown as DesktopAuthDb;
   for (let i = 0; i < 10; i += 1) {
     await assert.rejects(() => authenticateDesktopClient("eng@orga.com", "x", null, broken, { throttle }), /db down/);
   }
@@ -447,4 +462,57 @@ test("throttle: missing fields stay a 400 and are not counted against an account
     );
   }
   assert.equal(throttle.size, 0);
+});
+
+// ------------------------------------------------------------
+// SIGNIN-EXACT (Codex P-1b): the email is matched exactly (ignoring case),
+// never as an ILIKE pattern, so a wildcard input cannot reach another
+// account under a throttle key of its own.
+// ------------------------------------------------------------
+
+test("SIGNIN-EXACT: wildcard inputs never sign in as an existing user, even with that user's password", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  fake.addUser({ id: "u2", organizationId: "orgA", email: "a_b@orga.com" });
+  for (const email of ["%", "%@%", "_%", "%%", "e_g@orga.com", "ENG@ORGA.CO_", "a%@orga.com", "axb@orga.com"]) {
+    await assert.rejects(
+      () => authenticateDesktopClient(email, PASSWORD, null, fake.db, { throttle: throttleWithClock().throttle }),
+      (err: unknown) => err instanceof DesktopAuthError && err.status === 401,
+      email,
+    );
+  }
+  assert.equal(fake.sessions.length, 0);
+  // The exact address still works, in any letter case.
+  const ok = await authenticateDesktopClient(" A_B@OrgA.com ", PASSWORD, null, fake.db, { throttle: throttleWithClock().throttle });
+  assert.equal(ok.identity.userId, "u2");
+});
+
+test("SIGNIN-EXACT: an ambiguous address (two users, e.g. two organizations) is refused like an unknown one", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "dup@arch.test" });
+  fake.addUser({ id: "u2", organizationId: "orgB", email: "DUP@arch.test" });
+  await assert.rejects(
+    () => authenticateDesktopClient("dup@arch.test", PASSWORD, null, fake.db, { throttle: throttleWithClock().throttle }),
+    (err: unknown) => err instanceof DesktopAuthError && err.status === 401,
+  );
+  assert.equal(fake.sessions.length, 0);
+});
+
+test("SIGNIN-EXACT: failures under wildcard inputs do not unlock guessing - the victim's own key is what counts", async () => {
+  const fake = new FakeDb();
+  fake.addUser({ id: "u1", organizationId: "orgA", email: "eng@orga.com" });
+  const { throttle } = throttleWithClock();
+  for (let i = 0; i < 5; i += 1) {
+    await assert.rejects(() => authenticateDesktopClient("eng@orga.com", "wrong", null, fake.db, { throttle }));
+  }
+  // Victim blocked; a pattern input neither reaches the victim nor bypasses the block.
+  await assert.rejects(
+    () => authenticateDesktopClient("eng@orga.com", PASSWORD, null, fake.db, { throttle }),
+    (err: unknown) => err instanceof DesktopLoginThrottledError,
+  );
+  await assert.rejects(
+    () => authenticateDesktopClient("e%", PASSWORD, null, fake.db, { throttle }),
+    (err: unknown) => err instanceof DesktopAuthError && err.status === 401,
+  );
+  assert.equal(fake.sessions.length, 0);
 });
