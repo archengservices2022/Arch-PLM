@@ -231,7 +231,9 @@ export type UserAdminAction =
   | "deactivate_user"
   | "reactivate_user"
   | "reset_password"
-  | "unlock_sign_in";
+  | "unlock_sign_in"
+  /** G-5(a): scripts/create-first-admin.ts (actor = the operator script). */
+  | "create_first_admin";
 
 export interface UserAdminLogEntry {
   event: typeof USER_ADMIN_EVENT;
