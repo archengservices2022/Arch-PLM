@@ -53,7 +53,7 @@ test("email: refuses non-ASCII, wildcard/escape characters, spaces, missing part
 test("name: trimmed, 1-100 code points, no control characters", () => {
   assert.equal(normalizeName("  Jane Doe "), "Jane Doe");
   assert.equal(normalizeName("é".repeat(100)).length, 100);
-  for (const bad of ["", "   ", "x".repeat(101), "a\nb", undefined]) {
+  for (const bad of ["", "   ", "x".repeat(101), "a\nb", "Ann\u202eeK", "Bob\u2067x", "a\u200fb", "a\u0085b", "a\u200bb", "a\u061cb", "An\ufeffn", undefined]) {
     assert.throws(() => normalizeName(bad), refusedWith("USER_ADMIN_NAME_INVALID"));
   }
 });

@@ -1,8 +1,11 @@
+import Link from "next/link";
+
 import {
   LifecycleState,
   ItemType,
   CadDocumentType,
   CadDependencyType,
+  UserRole,
 } from "@/app/generated/prisma/enums";
 import {
   advanceRevision,
@@ -1388,6 +1391,15 @@ function SessionBar({ actor }: { actor: Actor }) {
           {formatState(actor.role)}
         </span>
       </span>
+      {/* B05: the users page re-checks ADMIN itself; this link is convenience. */}
+      {actor.role === UserRole.ADMIN ? (
+        <Link
+          href="/admin/users"
+          className="flex h-8 items-center rounded-md border border-slate-300 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+        >
+          Users
+        </Link>
+      ) : null}
       <form action={signOutAction}>
         <button className="h-8 rounded-md border border-slate-300 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-100">
           Sign out

@@ -35,15 +35,20 @@ export type UserAdminRefusalCode =
   | "USER_ADMIN_LAST_ADMIN"
   | "USER_ADMIN_NO_CHANGE"
   | "USER_ADMIN_USER_INACTIVE"
-  | "USER_ADMIN_USER_ACTIVE";
+  | "USER_ADMIN_USER_ACTIVE"
+  | "USER_ADMIN_CONFIRM_REQUIRED";
 
 export const USER_ADMIN_REFUSAL_MESSAGES: Record<UserAdminRefusalCode, string> = {
   USER_ADMIN_NOT_ADMIN: "Only an administrator can manage users.",
   USER_ADMIN_USER_NOT_FOUND: "That user was not found. Refresh the page and try again.",
   USER_ADMIN_EMAIL_INVALID:
     "Enter a valid email address (plain ASCII, no spaces, % or \\; at most 254 characters).",
-  USER_ADMIN_EMAIL_EXISTS: "A user with that email address already exists.",
-  USER_ADMIN_NAME_INVALID: "Enter a name of 1 to 100 characters.",
+  // Codex B05 INFO: "_" is compared as a sign-in wildcard too, so "a_b@x" and
+  // "axb@x" cannot both exist (a deliberate, conservative refusal).
+  USER_ADMIN_EMAIL_EXISTS:
+    "A user with that email address - or one that differs only where this address has an underscore (_) - already exists.",
+  USER_ADMIN_NAME_INVALID:
+    "Enter a name of 1 to 100 characters (no control or text-direction characters).",
   USER_ADMIN_ROLE_INVALID: "Choose one of the listed roles.",
   USER_ADMIN_PASSWORD_TOO_SHORT: "The password is too short.",
   USER_ADMIN_PASSWORD_TOO_LONG: "The password is too long (at most 72 bytes).",
@@ -56,6 +61,8 @@ export const USER_ADMIN_REFUSAL_MESSAGES: Record<UserAdminRefusalCode, string> =
   USER_ADMIN_USER_INACTIVE:
     "That user is deactivated. Reactivate the user instead (that sets a new password).",
   USER_ADMIN_USER_ACTIVE: "That user is already active.",
+  USER_ADMIN_CONFIRM_REQUIRED:
+    "Tick the confirmation box to deactivate the user (reactivating later needs a new password).",
 };
 
 /** An expected refusal of a user-administration action. Carries only a code,
@@ -104,12 +111,18 @@ export function normalizeEmail(raw: unknown): string {
   return email;
 }
 
+/** Control characters, and the bidirectional overrides / isolates / marks
+ *  that could make a name look like another user's in a list (Codex B05 L-2),
+ *  plus zero-width characters, the Arabic letter mark and the BOM (C2-L1).
+ *  Written as \u escapes on purpose: literal invisible characters cannot be reviewed. */
+const FORBIDDEN_NAME_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+
 /** Trimmed display name of 1-100 characters (code points). */
 export function normalizeName(raw: unknown): string {
   if (typeof raw !== "string") throw new UserAdminRefusalError("USER_ADMIN_NAME_INVALID");
   const name = raw.trim();
   const length = [...name].length;
-  if (length < 1 || length > MAX_NAME_LENGTH || /[\u0000-\u001f\u007f]/.test(name)) {
+  if (length < 1 || length > MAX_NAME_LENGTH || FORBIDDEN_NAME_CHARACTERS.test(name)) {
     throw new UserAdminRefusalError("USER_ADMIN_NAME_INVALID");
   }
   return name;

@@ -310,7 +310,7 @@ test("input is validated before any hash or transaction; a password is never has
 const ALL_ACTIONS: Array<[string, (actor: UserAdminActor, db: UserAdminDb, o: UserAdminOptions) => Promise<unknown>]> = [
   ["create", (a, db, o) => createUserForAdmin(a, { email: "z@arch.test", name: "Z", role: "ADMIN", password: PW, passwordConfirmation: PW }, db, o)],
   ["role", (a, db, o) => changeUserRoleForAdmin(a, "e1", "ADMIN", db, o)],
-  ["deactivate", (a, db, o) => deactivateUserForAdmin(a, "e1", db, o)],
+  ["deactivate", (a, db, o) => deactivateUserForAdmin(a, "e1", "yes", db, o)],
   ["reactivate", (a, db, o) => reactivateUserForAdmin(a, "i1", PW, PW, db, o)],
   ["reset", (a, db, o) => resetUserPasswordForAdmin(a, "e1", PW, PW, db, o)],
 ];
@@ -343,7 +343,7 @@ test("AC1 / B05-M2: a session that still says ADMIN but the database no longer d
 test("tenant: a target in another organization is 'not found' and nothing changes", async () => {
   const calls: Array<(o: UserAdminOptions, db: UserAdminDb) => Promise<unknown>> = [
     (o, db) => changeUserRoleForAdmin(admin1, "x1", "VIEWER", db, o),
-    (o, db) => deactivateUserForAdmin(admin1, "x1", db, o),
+    (o, db) => deactivateUserForAdmin(admin1, "x1", "yes", db, o),
     (o, db) => reactivateUserForAdmin(admin1, "x1", PW, PW, db, o),
     (o, db) => resetUserPasswordForAdmin(admin1, "x1", PW, PW, db, o),
   ];
@@ -369,7 +369,7 @@ test("U2: role change is written and logged with old and new role", async () => 
 test("self-protection: no self-demotion, no self-deactivation, no same-role change", async () => {
   const { fake, logs, options } = setup();
   await assert.rejects(changeUserRoleForAdmin(admin1, "a1", "VIEWER", fake.db, options), refusedWith("USER_ADMIN_SELF_ROLE"));
-  await assert.rejects(deactivateUserForAdmin(admin1, "a1", fake.db, options), refusedWith("USER_ADMIN_SELF_DEACTIVATE"));
+  await assert.rejects(deactivateUserForAdmin(admin1, "a1", "yes", fake.db, options), refusedWith("USER_ADMIN_SELF_DEACTIVATE"));
   await assert.rejects(changeUserRoleForAdmin(admin1, "e1", "ENGINEER", fake.db, options), refusedWith("USER_ADMIN_NO_CHANGE"));
   assert.equal(fake.users.find((u) => u.id === "a1")!.role, "ADMIN");
   assert.deepEqual(logs.map((l) => [l.code, l.targetUserId]), [
@@ -393,8 +393,8 @@ test("AC3: two admins demoting each other concurrently - exactly one succeeds, t
 
 test("AC3: two admins deactivating each other concurrently - one active admin remains", async () => {
   const { fake, options } = setup();
-  fake.interleave = () => deactivateUserForAdmin(admin2, "a1", fake.db, options);
-  await assert.rejects(deactivateUserForAdmin(admin1, "a2", fake.db, options), refusedWith("USER_ADMIN_NOT_ADMIN"));
+  fake.interleave = () => deactivateUserForAdmin(admin2, "a1", "yes", fake.db, options);
+  await assert.rejects(deactivateUserForAdmin(admin1, "a2", "yes", fake.db, options), refusedWith("USER_ADMIN_NOT_ADMIN"));
   assert.deepEqual(
     fake.users.filter((u) => u.role === "ADMIN" && u.active).map((u) => u.id),
     ["a2"],
@@ -403,7 +403,7 @@ test("AC3: two admins deactivating each other concurrently - one active admin re
 
 test("U3 deactivate: revokes every open desktop session of that user in the same transaction (AC2)", async () => {
   const { fake, logs, options } = setup();
-  const result = await deactivateUserForAdmin(admin1, "e1", fake.db, options);
+  const result = await deactivateUserForAdmin(admin1, "e1", "yes", fake.db, options);
   assert.equal(result.desktopSessionsRevoked, 2);
   assert.equal(fake.users.find((u) => u.id === "e1")!.active, false);
   assert.deepEqual(
@@ -421,7 +421,7 @@ test("U3 deactivate: revokes every open desktop session of that user in the same
 
 test("U3 deactivate: an already inactive user is 'no change'", async () => {
   const { fake, options } = setup();
-  await assert.rejects(deactivateUserForAdmin(admin1, "i1", fake.db, options), refusedWith("USER_ADMIN_NO_CHANGE"));
+  await assert.rejects(deactivateUserForAdmin(admin1, "i1", "yes", fake.db, options), refusedWith("USER_ADMIN_NO_CHANGE"));
 });
 
 test("U3 reactivate: requires a new password, sets it, and does not revive revoked desktop sessions (B05-M1)", async () => {
@@ -489,7 +489,7 @@ test("retry exhausted -> CONCURRENT_CHANGES, nothing written, one refused log li
   const { fake, logs, options } = setup();
   fake.conflictsToThrow = 3;
   const snapshot = JSON.stringify([fake.users, fake.sessions]);
-  await assert.rejects(deactivateUserForAdmin(admin1, "e1", fake.db, options), refusedWith("CONCURRENT_CHANGES"));
+  await assert.rejects(deactivateUserForAdmin(admin1, "e1", "yes", fake.db, options), refusedWith("CONCURRENT_CHANGES"));
   assert.equal(JSON.stringify([fake.users, fake.sessions]), snapshot);
   assert.equal(logs.length, 1);
   assert.deepEqual([logs[0].outcome, logs[0].code], ["refused", "CONCURRENT_CHANGES"]);
@@ -509,4 +509,21 @@ test("source: the db layer never reads FormData; sign-in and getActor carry and 
   assert.match(authTs, /token\.pwv = user\.pwv/);
   const login = readFileSync(new URL("../app/login/page.tsx", import.meta.url), "utf8");
   assert.match(login, /if \(await getActor\(\)\)/);
+});
+
+test("C2-L2: deactivation without the confirmation is refused before any write; a non-admin is still NOT_ADMIN", async () => {
+  for (const confirmation of [undefined, null, "", "on", "YES", "true"]) {
+    const { fake, logs, options } = setup();
+    await assert.rejects(
+      deactivateUserForAdmin(admin1, "e1", confirmation, fake.db, options),
+      refusedWith("USER_ADMIN_CONFIRM_REQUIRED"),
+      String(confirmation),
+    );
+    assert.deepEqual(fake.ops, []);
+    assert.equal(fake.users.find((u) => u.id === "e1")!.active, true);
+    assert.deepEqual([logs[0].code, logs[0].targetUserId], ["USER_ADMIN_CONFIRM_REQUIRED", "e1"]);
+  }
+  const { fake, logs, options } = setup();
+  await assert.rejects(deactivateUserForAdmin(engineer, "e1", undefined, fake.db, options), refusedWith("USER_ADMIN_NOT_ADMIN"));
+  assert.equal(logs[0].code, "USER_ADMIN_NOT_ADMIN");
 });

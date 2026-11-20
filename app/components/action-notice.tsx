@@ -17,7 +17,14 @@ import { useEffect } from "react";
  */
 const NOTICE_PARAMS = ["notice", "doc", "more"] as const;
 
-export function ActionNotice({ message }: { message: string }) {
+export function ActionNotice({
+  message,
+  kind = "refused",
+}: {
+  message: string;
+  /** B05: /admin/users also confirms a completed change. */
+  kind?: "refused" | "success";
+}) {
   useEffect(() => {
     const url = new URL(window.location.href);
     if (NOTICE_PARAMS.some((name) => url.searchParams.has(name))) {
@@ -25,6 +32,19 @@ export function ActionNotice({ message }: { message: string }) {
       window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     }
   });
+
+  if (kind === "success") {
+    return (
+      <div
+        role="status"
+        data-testid="action-notice"
+        className="mt-4 rounded-md border border-teal-300 bg-teal-50 px-4 py-3 text-sm text-teal-950"
+      >
+        <span className="font-semibold">Done: </span>
+        {message}
+      </div>
+    );
+  }
 
   return (
     <div

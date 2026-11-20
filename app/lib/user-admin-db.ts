@@ -111,12 +111,16 @@ export async function lockActiveAdmins(
 
 /**
  * G-3(a): is the address taken anywhere - any organization, any letter case,
- * active or not? Sign-in compares with Prisma's case-insensitive equality,
- * which PostgreSQL runs as ILIKE ("_" and "%" are wildcards there). So an
- * address is refused when it equals an existing one ignoring case, OR when
- * either one, used as a sign-in input, would match the other. Run inside the
- * SERIALIZABLE transaction: the scan takes a predicate lock, so two
- * concurrent creates of the same address cannot both commit.
+ * active or not? An address is refused when it equals an existing one
+ * ignoring case, OR when either one, used as an ILIKE pattern, would match the
+ * other ("_" and "%" are wildcards there). Sign-in itself has compared exactly
+ * since SIGNIN-EXACT (sign-in-lookup-db.ts); the two ILIKE directions are kept
+ * as the conservative rule reviewed for G-3, so any lookup that still uses
+ * Prisma's case-insensitive equality (an ILIKE) stays unambiguous.
+ * Run inside the SERIALIZABLE transaction: the scan takes a predicate lock,
+ * so two concurrent creates of the same address cannot both commit.
+ * (Codex L-3: a PRE-EXISTING stored address containing "%" would act as a
+ * pattern here - impossible on the pilot database, where B05 refuses "%".)
  */
 export async function emailTaken(tx: Prisma.TransactionClient, email: string): Promise<boolean> {
   const rows = await tx.$queryRaw<Array<{ id: string }>>`
@@ -325,15 +329,25 @@ export async function changeUserRoleForAdmin(
 // U3 deactivate / reactivate
 // ------------------------------------------------------------
 
+/** The value the deactivation form's confirmation checkbox must send. */
+export const DEACTIVATE_CONFIRMATION_VALUE = "yes";
+
+/**
+ * Deactivation needs an explicit confirmation (Codex C2-L2): undoing it means a
+ * reactivation with a new password handed over in person. Checked after the
+ * role pre-check, so a non-admin is still refused (and logged) as NOT_ADMIN.
+ */
 export async function deactivateUserForAdmin(
   actor: UserAdminActor,
   rawTargetUserId: unknown,
+  confirmation: unknown,
   db: UserAdminDb,
   options: UserAdminOptions = {},
 ): Promise<{ desktopSessionsRevoked: number }> {
   return perform(actor, "deactivate_user", db, options, async () => {
     const targetUserId = parseTargetId(rawTargetUserId);
     if (targetUserId === actor.userId) refuse("USER_ADMIN_SELF_DEACTIVATE", targetUserId);
+    if (confirmation !== DEACTIVATE_CONFIRMATION_VALUE) refuse("USER_ADMIN_CONFIRM_REQUIRED", targetUserId);
     return async (tx, lockedAdminIds, now) => {
       const target = await findTarget(tx, actor.organizationId, targetUserId);
       if (!target.active) refuse("USER_ADMIN_NO_CHANGE", target.id);
