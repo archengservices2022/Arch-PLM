@@ -6,6 +6,7 @@ import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { prisma } from "@/app/lib/prisma";
 import { UserRole } from "@/app/generated/prisma/enums";
+import { passwordVersionMatches } from "@/app/lib/user-admin-core";
 
 // ============================================================
 // Arch PLM server-side authorization foundation
@@ -36,8 +37,9 @@ export interface Actor {
  * Resolve the current authenticated actor.
  *
  * The JWT session is verified against the database on every call so that
- * deactivated users and stale tenant claims cannot act. Memoized per request
- * render pass via React `cache`.
+ * deactivated users, stale tenant claims and sessions issued before the
+ * user's current password (B05 G-6(a): reset or reactivation) cannot act.
+ * Memoized per request render pass via React `cache`.
  *
  * Returns `null` when there is no usable authenticated actor.
  */
@@ -60,6 +62,7 @@ export const getActor = cache(async (): Promise<Actor | null> => {
       role: true,
       name: true,
       email: true,
+      passwordHash: true,
     },
   });
 
@@ -73,6 +76,12 @@ export const getActor = cache(async (): Promise<Actor | null> => {
     session?.user?.organizationId &&
     session.user.organizationId !== user.organizationId
   ) {
+    return null;
+  }
+
+  // B05 G-6(a): the session must carry the version of the CURRENT password.
+  // A missing claim (a session from before B05) never matches.
+  if (!passwordVersionMatches(session?.user?.pwv, user.passwordHash)) {
     return null;
   }
 

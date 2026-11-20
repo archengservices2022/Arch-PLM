@@ -1,6 +1,7 @@
 import { redirect, unstable_rethrow } from "next/navigation";
 
-import { auth, signIn } from "@/auth";
+import { signIn } from "@/auth";
+import { getActor } from "@/app/lib/authz";
 import {
   isSignInErrorParam,
   runSignInAttempt,
@@ -9,9 +10,10 @@ import {
 } from "@/app/lib/action-notice-core";
 
 export default async function LoginPage({ searchParams }: PageProps<"/login">) {
-  const session = await auth();
-
-  if (session?.user) {
+  // B05: only a session that getActor() accepts (active user, current
+  // password version) counts as signed in. Checking the bare cookie here
+  // would bounce a refused session between "/" and "/login" forever.
+  if (await getActor()) {
     redirect("/");
   }
 

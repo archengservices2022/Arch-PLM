@@ -17,12 +17,15 @@ declare module "next-auth" {
       id: string;
       organizationId: string;
       role: UserRole;
+      /** B05 G-6(a): password version at sign-in (see user-admin-core.ts). */
+      pwv: string | null;
     } & DefaultSession["user"];
   }
 
   interface User {
     organizationId: string;
     role: UserRole;
+    pwv?: string | null;
   }
 }
 
@@ -33,5 +36,6 @@ declare module "@auth/core/jwt" {
     userId: string;
     organizationId: string;
     role: UserRole;
+    pwv?: string | null;
   }
 }

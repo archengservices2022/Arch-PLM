@@ -7,6 +7,7 @@ import {
   getSharedLoginThrottle,
   loginThrottleKey,
 } from "@/app/lib/login-throttle-core";
+import { passwordVersion } from "@/app/lib/user-admin-core";
 
 /** WP-2A (Codex WP2A-L1): compared against when no account / no password
  *  hash exists, so a missing account costs the same bcrypt work. Same value
@@ -139,6 +140,10 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 
           // Used later for permissions
           role: user.role,
+
+          // B05 G-6(a): password version. getActor() refuses the session
+          // once the user's password hash changes (reset / reactivation).
+          pwv: passwordVersion(user.passwordHash),
         };
       },
     }),
@@ -158,6 +163,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.userId = user.id;
         token.organizationId = user.organizationId;
         token.role = user.role;
+        token.pwv = user.pwv ?? null;
       }
 
       return token;
@@ -172,6 +178,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         session.user.id = token.userId;
         session.user.organizationId = token.organizationId;
         session.user.role = token.role;
+        session.user.pwv = token.pwv ?? null;
       }
 
       return session;
