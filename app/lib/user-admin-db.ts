@@ -1,9 +1,9 @@
 /**
  * Arch PLM - B05 minimal user administration: database layer.
  *
- * PO-signed B05 plan Rev1, actions U1-U4 (U5 "unlock sign-in" follows in its
- * own commit). Deliberately no "server-only" and only type imports from the
- * generated client, so the plain Node test runner loads it with a fake db.
+ * PO-signed B05 plan Rev1, actions U1-U5 (U5 = unlock sign-in, G-4).
+ * Deliberately no "server-only" and only type imports from the generated
+ * client, so the plain Node test runner loads it with a fake db.
  *
  * RULES FOR EVERY ACTION (plan section 2, B05-M2)
  *  - The actor (id, organization, role) comes from getActor() - the session
@@ -28,6 +28,7 @@ import type { PrismaClient, Prisma } from "@/app/generated/prisma/client";
 import { UserRole } from "../generated/prisma/enums.ts";
 import { ActionRefusalError, retryOnSerializationConflict } from "./action-notice-core.ts";
 import { isSerializationError } from "./db-concurrency-db.ts";
+import { getSharedLoginThrottle, loginThrottleKey, type LoginThrottle } from "./login-throttle-core.ts";
 import {
   assertActorIsLockedAdmin,
   assertNotLastActiveAdmin,
@@ -435,4 +436,41 @@ export async function resetUserPasswordForAdmin(
       };
     };
   });
+}
+
+// ------------------------------------------------------------
+// U5 unlock sign-in (G-4)
+// ------------------------------------------------------------
+
+/**
+ * Clear the WP-2A login-throttle lock of a user of the actor's organization.
+ * The authority re-check runs under the admin-row lock like every other
+ * action (the transaction reads only the target's email); the in-memory
+ * unlock happens AFTER the transaction has committed (Codex B05 I-1), so a
+ * refused or rolled-back attempt never touches the throttle. The key is the
+ * same as sign-in's: loginThrottleKey(email). Valid for this ONE server
+ * process (as WP-2A); a service restart also clears every lock.
+ */
+export async function unlockSignInForAdmin(
+  actor: UserAdminActor,
+  rawTargetUserId: unknown,
+  db: UserAdminDb,
+  options: UserAdminOptions & { throttle?: LoginThrottle } = {},
+): Promise<{ wasLocked: boolean }> {
+  const { email } = await perform(actor, "unlock_sign_in", db, options, async () => {
+    const targetUserId = parseTargetId(rawTargetUserId);
+    return async (tx) => {
+      const target = await tx.user.findFirst({
+        where: { id: targetUserId, organizationId: actor.organizationId },
+        select: { id: true, email: true },
+      });
+      if (target === null) throw new UserAdminRefusalError("USER_ADMIN_USER_NOT_FOUND");
+      return {
+        value: { email: target.email },
+        fields: { ...EMPTY_FIELDS, targetUserId: target.id },
+      };
+    };
+  });
+  const throttle = options.throttle ?? getSharedLoginThrottle();
+  return { wasLocked: throttle.unlock(loginThrottleKey(email)) };
 }

@@ -1,7 +1,7 @@
 "use server";
 
 /**
- * Arch PLM - B05: Server Actions of the /admin/users page (U1-U4).
+ * Arch PLM - B05: Server Actions of the /admin/users page (U1-U5).
  *
  * Each action:
  *  1. takes the actor ONLY from requireActor() (session re-read from the
@@ -28,6 +28,7 @@ import {
   deactivateUserForAdmin,
   reactivateUserForAdmin,
   resetUserPasswordForAdmin,
+  unlockSignInForAdmin,
   type UserAdminActor,
 } from "@/app/lib/user-admin-db";
 import {
@@ -123,5 +124,15 @@ export async function resetUserPasswordAction(formData: FormData) {
     // Own password changed: this session is no longer valid (G-6).
     await signOut({ redirectTo: "/login" });
   }
+  redirect(userAdminNoticeHref(code));
+}
+
+export async function unlockSignInAction(formData: FormData) {
+  const actor = await adminActor();
+  const { code } = await runUserAdminAction(
+    () => unlockSignInForAdmin(actor, field(formData, "userId"), prisma),
+    (result) => userAdminSuccessCode(result.wasLocked ? "UNLOCKED" : "NOT_LOCKED"),
+    RUN_OPTIONS,
+  );
   redirect(userAdminNoticeHref(code));
 }

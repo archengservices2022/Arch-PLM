@@ -31,7 +31,7 @@ test("notices: every refusal code, CONCURRENT_CHANGES, UNEXPECTED and the five s
   for (const code of Object.keys(USER_ADMIN_REFUSAL_MESSAGES)) {
     assert.ok(codes.includes(`refused.${code}` as UserAdminNoticeCode), code);
   }
-  for (const code of ["refused.CONCURRENT_CHANGES", "refused.UNEXPECTED", "ok.CREATED", "ok.ROLE_CHANGED", "ok.DEACTIVATED", "ok.REACTIVATED", "ok.PASSWORD_RESET"]) {
+  for (const code of ["refused.CONCURRENT_CHANGES", "refused.UNEXPECTED", "ok.CREATED", "ok.ROLE_CHANGED", "ok.DEACTIVATED", "ok.REACTIVATED", "ok.PASSWORD_RESET", "ok.UNLOCKED", "ok.NOT_LOCKED"]) {
     assert.ok(codes.includes(code as UserAdminNoticeCode), code);
   }
   for (const code of codes) {
@@ -142,15 +142,20 @@ test("AC1 page: VIEWER / ENGINEER / any non-admin gets no user data - nothing is
 
 test("AC1 page: an ADMIN gets the own organization's users, without password hashes, self marked", async () => {
   const { db, calls } = fakeViewDb();
-  const view = await loadAdminUsersView({ userId: "a1", organizationId: "o1", role: "ADMIN" }, db);
+  const asked: string[] = [];
+  const view = await loadAdminUsersView({ userId: "a1", organizationId: "o1", role: "ADMIN" }, db, (email) => {
+    asked.push(email);
+    return email === "eng@arch.test";
+  });
   assert.ok(view.allowed);
   assert.deepEqual(
-    view.users.map((u) => [u.id, u.isSelf]),
+    view.users.map((u) => [u.id, u.isSelf, u.signInLocked]),
     [
-      ["a1", true],
-      ["e1", false],
+      ["a1", true, false],
+      ["e1", false, true],
     ],
   );
+  assert.deepEqual(asked, ["admin@arch.test", "eng@arch.test"]);
   const args = calls[0] as { where: unknown; select: Record<string, boolean> };
   assert.deepEqual(args.where, { organizationId: "o1" });
   assert.equal(args.select.passwordHash, undefined);
@@ -184,10 +189,11 @@ test("source: the actions take the actor only from requireActor(); FormData neve
     "deactivateUserAction",
     "reactivateUserAction",
     "resetUserPasswordAction",
+    "unlockSignInAction",
   ]);
   // Every outcome goes through the notice runner, then a redirect.
-  assert.equal((actions.match(/runUserAdminAction\(/g) ?? []).length, 5);
-  assert.equal((actions.match(/redirect\(userAdminNoticeHref\(code\)\)/g) ?? []).length, 5);
+  assert.equal((actions.match(/runUserAdminAction\(/g) ?? []).length, 6);
+  assert.equal((actions.match(/redirect\(userAdminNoticeHref\(code\)\)/g) ?? []).length, 6);
 });
 
 test("source: the page gates its data on loadAdminUsersView and never selects a password hash", () => {

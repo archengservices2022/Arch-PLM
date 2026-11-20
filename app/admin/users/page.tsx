@@ -15,6 +15,7 @@ import {
   deactivateUserAction,
   reactivateUserAction,
   resetUserPasswordAction,
+  unlockSignInAction,
 } from "./actions";
 
 // ============================================================
@@ -83,7 +84,19 @@ function UserRowView({ user }: { user: AdminUserRow }) {
         </div>
         <div className="text-xs text-slate-600">{user.email}</div>
       </td>
-      <td className="px-3 py-3 text-sm">{user.active ? "Active" : "Deactivated"}</td>
+      <td className="space-y-2 px-3 py-3 text-sm">
+        <div>{user.active ? "Active" : "Deactivated"}</div>
+        {/* B05 U5: lock state of THIS server process's sign-in throttle. */}
+        {user.signInLocked ? (
+          <form action={unlockSignInAction} className="flex flex-wrap items-center gap-2">
+            <input type="hidden" name="userId" value={user.id} />
+            <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900">
+              Sign-in locked
+            </span>
+            <button className={buttonClass}>Unlock sign-in</button>
+          </form>
+        ) : null}
+      </td>
       <td className="px-3 py-3 text-xs text-slate-600">{formatDate(user.lastLoginAt)}</td>
       <td className="px-3 py-3">
         {user.isSelf ? (

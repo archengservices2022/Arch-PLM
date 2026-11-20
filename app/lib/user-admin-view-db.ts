@@ -11,6 +11,7 @@
  */
 import type { PrismaClient } from "@/app/generated/prisma/client";
 import { UserRole } from "../generated/prisma/enums.ts";
+import { getSharedLoginThrottle, loginThrottleKey } from "./login-throttle-core.ts";
 
 export type UserAdminViewDb = Pick<PrismaClient, "user">;
 
@@ -22,13 +23,21 @@ export interface AdminUserRow {
   active: boolean;
   lastLoginAt: Date | null;
   isSelf: boolean;
+  /** B05 U5: sign-in currently refused by the WP-2A throttle (this process). */
+  signInLocked: boolean;
 }
 
 export type AdminUsersView = { allowed: false } | { allowed: true; users: AdminUserRow[] };
 
+/** Default: ask this process's shared login throttle, with sign-in's key. */
+function sharedThrottleLocked(email: string): boolean {
+  return !getSharedLoginThrottle().check(loginThrottleKey(email)).allowed;
+}
+
 export async function loadAdminUsersView(
   actor: { userId: string; organizationId: string; role: UserRole },
   db: UserAdminViewDb,
+  isSignInLocked: (email: string) => boolean = sharedThrottleLocked,
 ): Promise<AdminUsersView> {
   if (actor.role !== UserRole.ADMIN) return { allowed: false };
   const rows = await db.user.findMany({
@@ -38,6 +47,10 @@ export async function loadAdminUsersView(
   });
   return {
     allowed: true,
-    users: rows.map((row) => ({ ...row, isSelf: row.id === actor.userId })),
+    users: rows.map((row) => ({
+      ...row,
+      isSelf: row.id === actor.userId,
+      signInLocked: isSignInLocked(row.email),
+    })),
   };
 }

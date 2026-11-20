@@ -192,6 +192,27 @@ export class LoginThrottle {
     if (this.#isExpired(entry, this.#now())) this.#entries.delete(key);
   }
 
+  /**
+   * B05 U5 (G-4): an administrator unlocks this account. Clears the failures,
+   * the block and the failure streak; KEEPS the in-flight count (those
+   * attempts are still being checked and must settle exactly once), and
+   * removes the entry only when nothing remains. Returns whether there was
+   * anything to clear (failures or a block). Like the throttle itself, valid
+   * for this ONE server process; a restart also clears every lock.
+   */
+  unlock(key: string): boolean {
+    const entry = this.#entries.get(key);
+    if (!entry) return false;
+    const now = this.#now();
+    this.#prune(entry, now);
+    const hadSomething = entry.failures.length > 0 || entry.blockedUntil > now || entry.level > 0;
+    entry.failures = [];
+    entry.level = 0;
+    entry.blockedUntil = 0;
+    if (entry.inFlight === 0) this.#entries.delete(key);
+    return hadSomething;
+  }
+
   /** Number of tracked accounts (tests / diagnostics). */
   get size(): number {
     return this.#entries.size;

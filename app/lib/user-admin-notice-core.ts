@@ -27,7 +27,9 @@ export type UserAdminSuccessCode =
   | "ROLE_CHANGED"
   | "DEACTIVATED"
   | "REACTIVATED"
-  | "PASSWORD_RESET";
+  | "PASSWORD_RESET"
+  | "UNLOCKED"
+  | "NOT_LOCKED";
 
 const SUCCESS_MESSAGES: Record<UserAdminSuccessCode, string> = {
   CREATED: "User created. Give them their password in person.",
@@ -37,6 +39,8 @@ const SUCCESS_MESSAGES: Record<UserAdminSuccessCode, string> = {
     "User reactivated with the new password. Give it to them in person; old sessions stay ended.",
   PASSWORD_RESET:
     "Password reset. Give the new password to the user in person; their existing sessions have ended.",
+  UNLOCKED: "Sign-in unlocked. The user can sign in again now.",
+  NOT_LOCKED: "That user's sign-in was not locked - nothing to unlock.",
 };
 
 const OTHER_MESSAGES = {

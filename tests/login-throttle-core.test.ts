@@ -205,3 +205,56 @@ test("one process-wide shared instance (kept on globalThis, survives a second mo
   const copy = await import(`../app/lib/login-throttle-core.ts?second-instance=${Date.now()}`);
   assert.equal(copy.getSharedLoginThrottle(), a, "a second copy of the module still returns the same throttle");
 });
+
+// ------------------------------------------------------------
+// B05 U5 (G-4): admin unlock
+// ------------------------------------------------------------
+
+/** Five admitted attempts, each settled as a failure (the real sign-in path). */
+function lockOut(th: LoginThrottle, key: string) {
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal(th.beginAttempt(key).allowed, true);
+    th.recordFailure(key);
+  }
+}
+
+test("unlock: clears a block and the failure streak; the next attempt is admitted and a new streak starts from zero", () => {
+  const c = clock(); const th = new LoginThrottle(undefined, c.now); const k = loginThrottleKey("eng@orga.com");
+  lockOut(th, k);
+  assert.equal(th.check(k).allowed, false);
+  assert.equal(th.unlock(k), true);
+  assert.equal(th.check(k).allowed, true);
+  assert.equal(th.size, 0, "nothing left to track");
+  // A fresh streak: 4 more failures are still admitted, the 5th blocks for the BASE time (level reset).
+  for (let i = 0; i < 4; i += 1) {
+    assert.equal(th.beginAttempt(k).allowed, true);
+    th.recordFailure(k);
+  }
+  assert.equal(th.check(k).allowed, true);
+  assert.equal(th.beginAttempt(k).allowed, true);
+  th.recordFailure(k);
+  const decision = th.check(k);
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.allowed === false && decision.retryAfterSeconds, 60);
+});
+
+test("unlock: keeps attempts still in flight (they settle exactly once) and is idempotent", () => {
+  const c = clock(); const th = new LoginThrottle(undefined, c.now); const k = loginThrottleKey("eng@orga.com");
+  failTimes(th, k, 3);
+  assert.equal(th.beginAttempt(k).allowed, true); // in flight
+  assert.equal(th.unlock(k), true);
+  assert.equal(th.size, 1, "the in-flight attempt keeps the entry");
+  th.recordSuccess(k);
+  assert.equal(th.size, 0);
+  assert.equal(th.unlock(k), false, "nothing to unlock");
+  assert.equal(th.unlock(loginThrottleKey("never-seen@orga.com")), false);
+});
+
+test("unlock: only the named account - other accounts stay blocked", () => {
+  const c = clock(); const th = new LoginThrottle(undefined, c.now);
+  const a = loginThrottleKey("a@orga.com"); const b = loginThrottleKey("b@orga.com");
+  lockOut(th, a); lockOut(th, b);
+  th.unlock(a);
+  assert.equal(th.check(a).allowed, true);
+  assert.equal(th.check(b).allowed, false);
+});

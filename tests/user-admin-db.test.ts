@@ -13,12 +13,14 @@ import {
   deactivateUserForAdmin,
   reactivateUserForAdmin,
   resetUserPasswordForAdmin,
+  unlockSignInForAdmin,
   type UserAdminActor,
   type UserAdminDb,
   type UserAdminOptions,
 } from "../app/lib/user-admin-db.ts";
 import { UserAdminRefusalError, type UserAdminLogEntry } from "../app/lib/user-admin-core.ts";
 import { ActionRefusalError } from "../app/lib/action-notice-core.ts";
+import { LoginThrottle, loginThrottleKey } from "../app/lib/login-throttle-core.ts";
 
 type Role = "ADMIN" | "ENGINEER" | "DESIGNER" | "REVIEWER" | "APPROVER" | "VIEWER";
 
@@ -129,7 +131,7 @@ class FakeDb {
           const u = this.users.find(
             (x) => x.id === args.where.id && x.organizationId === args.where.organizationId,
           );
-          return u ? { id: u.id, role: u.role, active: u.active } : null;
+          return u ? { id: u.id, role: u.role, active: u.active, email: u.email } : null;
         },
         updateMany: async (args: {
           where: { id: string; organizationId: string };
@@ -313,6 +315,7 @@ const ALL_ACTIONS: Array<[string, (actor: UserAdminActor, db: UserAdminDb, o: Us
   ["deactivate", (a, db, o) => deactivateUserForAdmin(a, "e1", "yes", db, o)],
   ["reactivate", (a, db, o) => reactivateUserForAdmin(a, "i1", PW, PW, db, o)],
   ["reset", (a, db, o) => resetUserPasswordForAdmin(a, "e1", PW, PW, db, o)],
+  ["unlock", (a, db, o) => unlockSignInForAdmin(a, "e1", db, o)],
 ];
 
 test("AC1: a non-admin actor is refused before any read or write, and the refusal is logged", async () => {
@@ -346,6 +349,7 @@ test("tenant: a target in another organization is 'not found' and nothing change
     (o, db) => deactivateUserForAdmin(admin1, "x1", "yes", db, o),
     (o, db) => reactivateUserForAdmin(admin1, "x1", PW, PW, db, o),
     (o, db) => resetUserPasswordForAdmin(admin1, "x1", PW, PW, db, o),
+    (o, db) => unlockSignInForAdmin(admin1, "x1", db, o),
   ];
   for (const call of calls) {
     const { fake, options } = setup();
@@ -526,4 +530,59 @@ test("C2-L2: deactivation without the confirmation is refused before any write; 
   const { fake, logs, options } = setup();
   await assert.rejects(deactivateUserForAdmin(engineer, "e1", undefined, fake.db, options), refusedWith("USER_ADMIN_NOT_ADMIN"));
   assert.equal(logs[0].code, "USER_ADMIN_NOT_ADMIN");
+});
+
+// ------------------------------------------------------------
+// U5 unlock sign-in (G-4)
+// ------------------------------------------------------------
+
+function lockedThrottle(...emails: string[]) {
+  const throttle = new LoginThrottle(undefined, () => NOW.getTime());
+  for (const email of emails) {
+    const key = loginThrottleKey(email);
+    for (let i = 0; i < 5; i += 1) {
+      assert.equal(throttle.beginAttempt(key).allowed, true);
+      throttle.recordFailure(key);
+    }
+  }
+  return throttle;
+}
+
+test("U5: an admin unlocks a locked user (sign-in's own key), one committed log line, nothing written to the database", async () => {
+  const { fake, logs, options } = setup();
+  const throttle = lockedThrottle("eng1@arch.test", "admin2@arch.test");
+  const result = await unlockSignInForAdmin(admin1, "e1", fake.db, { ...options, throttle });
+  assert.deepEqual(result, { wasLocked: true });
+  assert.equal(throttle.check(loginThrottleKey(" ENG1@arch.test ")).allowed, true);
+  assert.equal(throttle.check(loginThrottleKey("admin2@arch.test")).allowed, false, "other users stay locked");
+  assert.deepEqual(fake.ops, ["begin", "lock-admins", "find-target", "commit"]);
+  assert.deepEqual([logs[0].action, logs[0].outcome, logs[0].targetUserId], ["unlock_sign_in", "committed", "e1"]);
+  assertNoSecrets(logs, "eng1@arch.test");
+
+  const again = await unlockSignInForAdmin(admin1, "e1", fake.db, { ...options, throttle });
+  assert.deepEqual(again, { wasLocked: false });
+});
+
+test("U5: refused or rolled-back attempts never touch the throttle (the unlock runs only after the commit - I-1)", async () => {
+  const cases: Array<[string, (o: UserAdminOptions, db: UserAdminDb, fake: FakeDb) => Promise<unknown>]> = [
+    ["non-admin", (o, db) => unlockSignInForAdmin(engineer, "e1", db, o)],
+    ["demoted admin", (o, db, fake) => {
+      fake.users.find((u) => u.id === "a2")!.role = "VIEWER";
+      return unlockSignInForAdmin(admin2, "e1", db, o);
+    }],
+    ["other organization", (o, db) => unlockSignInForAdmin(admin1, "x1", db, o)],
+    ["retry exhausted", (o, db, fake) => {
+      fake.conflictsToThrow = 3;
+      return unlockSignInForAdmin(admin1, "e1", db, o);
+    }],
+  ];
+  for (const [name, call] of cases) {
+    const { fake, logs, options } = setup();
+    const throttle = lockedThrottle("eng1@arch.test", "other@else.test");
+    await assert.rejects(call({ ...options, throttle }, fake.db, fake), undefined, name);
+    assert.equal(throttle.check(loginThrottleKey("eng1@arch.test")).allowed, false, name);
+    assert.equal(throttle.check(loginThrottleKey("other@else.test")).allowed, false, name);
+    assert.equal(logs.length, 1, name);
+    assert.equal(logs[0].outcome, "refused", name);
+  }
 });
