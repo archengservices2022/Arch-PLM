@@ -93,6 +93,28 @@ export type FirstAdminResult =
       log: UserAdminLogEntry;
     };
 
+/**
+ * Validate and normalize the input. Throws UserAdminRefusalError (or
+ * FirstAdminUsageError for the organization code) - no database needed, so
+ * the script calls it BEFORE it connects (trial T-1: a short password must be
+ * refused at once, not after the connection). createFirstAdmin calls it too.
+ */
+export function validateFirstAdminInput(input: FirstAdminInput): {
+  email: string;
+  name: string;
+  organizationName: string;
+  organizationCode: string;
+  password: string;
+} {
+  return {
+    email: normalizeEmail(input.email),
+    name: normalizeName(input.name),
+    organizationName: normalizeName(input.organizationName),
+    organizationCode: normalizeOrganizationCode(input.organizationCode),
+    password: validateNewPassword(input.password, input.passwordConfirmation, MIN_FIRST_ADMIN_PASSWORD_CHARS),
+  };
+}
+
 async function bcryptHash(password: string): Promise<string> {
   const bcrypt = (await import("bcryptjs")).default;
   return bcrypt.hash(password, BCRYPT_COST);
@@ -109,11 +131,7 @@ export async function createFirstAdmin(
   } = {},
 ): Promise<FirstAdminResult> {
   // Input first - nothing is read before it is valid.
-  const email = normalizeEmail(input.email);
-  const name = normalizeName(input.name);
-  const organizationName = normalizeName(input.organizationName);
-  const organizationCode = normalizeOrganizationCode(input.organizationCode);
-  const password = validateNewPassword(input.password, input.passwordConfirmation, MIN_FIRST_ADMIN_PASSWORD_CHARS);
+  const { email, name, organizationName, organizationCode, password } = validateFirstAdminInput(input);
   const dryRun = options.dryRun === true;
   const passwordHash = dryRun ? null : await (options.hashPassword ?? bcryptHash)(password);
 

@@ -42,9 +42,9 @@ $ErrorActionPreference = 'Stop'
 # Any change to these files must update this table (a test checks it).
 # ------------------------------------------------------------
 $PinnedFiles = [ordered]@{
-  'scripts/create-first-admin.ts'   = '7B00CB95B41DD80DCC3FD5619368AF0903379E634EA2DA0BA0B880EDABDA0518'
+  'scripts/create-first-admin.ts'   = '3825C52FE5250786F193FA05C55A2EA2276482D48998A679A6AB042A60FDC19A'
   'app/lib/first-admin-core.ts'     = 'F1944E2551DE9AF1971C54F32D098B4F923EDE05CCCF798747F0490F1C793F78'
-  'app/lib/first-admin-db.ts'       = '2C4CEE24111914F167BEB4108EC944BFD6099EF06A6C75301A6D75D735359289'
+  'app/lib/first-admin-db.ts'       = '5130DD7D22CC95B54DAC88860FB82BB4221A5AD29D9B58F1FE3567FFEB7A8A6A'
   'app/lib/user-admin-core.ts'      = '5ACCACCD8677F66A85FA30348D71C7F5F21114ECAC0BAA206BC4BD09EED08BB4'
   'app/lib/user-admin-db.ts'        = 'FCB7EF77BF215CCDAA0CE0BFAC0578E67DF88A14A2AA0BAA3A6E3238F59BB0BA'
 }
@@ -135,8 +135,10 @@ Write-Host "Type it (or right-click to paste) and compare the number of asterisk
 $first = Read-Host -AsSecureString "Password"
 $second = Read-Host -AsSecureString "Password again"
 
+# Trial T-2: keep Node's module-type notice out of the output and the evidence.
 $arguments = @(
-  '--experimental-strip-types', "--env-file=$EnvFile", 'scripts/create-first-admin.ts',
+  '--experimental-strip-types', '--disable-warning=MODULE_TYPELESS_PACKAGE_JSON',
+  "--env-file=$EnvFile", 'scripts/create-first-admin.ts',
   '--email', $Email, '--name', $Name, '--org-name', $OrgName, '--org-code', $OrgCode,
   '--expected-database', $ExpectedDatabase
 )

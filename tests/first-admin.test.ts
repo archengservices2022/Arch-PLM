@@ -21,6 +21,7 @@ import {
   FirstAdminRefusalError,
   type FirstAdminDb,
   type FirstAdminInput,
+  validateFirstAdminInput,
 } from "../app/lib/first-admin-db.ts";
 import { UserAdminRefusalError } from "../app/lib/user-admin-core.ts";
 import { ActionRefusalError } from "../app/lib/action-notice-core.ts";
@@ -286,6 +287,28 @@ test("password: at least 16 characters, at most 72 bytes, typed twice - checked 
   }
 });
 
+test("validateFirstAdminInput (trial T-1): normalizes valid input and refuses bad input with no database at all", () => {
+  assert.deepEqual(validateFirstAdminInput(input()), {
+    email: "admin@arch.test",
+    name: "Pilot Admin",
+    organizationName: "Arch Engineering Services",
+    organizationCode: "ARCH",
+    password: PW,
+  });
+  for (const [overrides, code] of [
+    [{ password: "short", passwordConfirmation: "short" }, "USER_ADMIN_PASSWORD_TOO_SHORT"],
+    [{ password: "x".repeat(73), passwordConfirmation: "x".repeat(73) }, "USER_ADMIN_PASSWORD_TOO_LONG"],
+    [{ passwordConfirmation: `${PW}x` }, "USER_ADMIN_PASSWORD_MISMATCH"],
+  ] as const) {
+    assert.throws(
+      () => validateFirstAdminInput(input(overrides)),
+      (e: unknown) => e instanceof UserAdminRefusalError && e.code === code,
+    );
+  }
+  assert.throws(() => validateFirstAdminInput(input({ email: "not-an-email" })), UserAdminRefusalError);
+  assert.throws(() => validateFirstAdminInput(input({ organizationCode: "!" })), FirstAdminUsageError);
+});
+
 test("dry run: every check runs, nothing is hashed or written", async () => {
   const fake = new FakeDb();
   const { hashed, opts } = options({ dryRun: true });
@@ -343,6 +366,10 @@ test("script: password only from STDIN (never argv / environment), never printed
   const verify = script.indexOf("target.db !== args.expectedDatabase");
   const create = script.indexOf("await createFirstAdmin(");
   assert.ok(verify > 0 && create > verify, "target check comes first");
+  // Trial T-1: the input is checked before the database is contacted.
+  const validate = script.indexOf("validateFirstAdminInput(input)");
+  const connect = script.indexOf("new PrismaClient(");
+  assert.ok(validate > 0 && connect > validate, "input check comes before the connection");
 });
 
 function lfSha256(path: string): string {
@@ -354,6 +381,8 @@ test("wrapper: hidden prompt twice, STDIN only, SENT gate for a real run, ASCII 
   const wrapper = source("../scripts/create-first-admin.ps1");
   assert.equal((wrapper.match(/= Read-Host -AsSecureString/g) ?? []).length, 2);
   assert.match(wrapper, /\$psi\.RedirectStandardInput = \$true/);
+  // Trial T-2: Node's module-type notice stays out of the output and the evidence.
+  assert.match(wrapper, /'--disable-warning=MODULE_TYPELESS_PACKAGE_JSON'/);
   assert.match(wrapper, /if \(\$answer -cne 'SENT'\)/);
   // C4-L2: the hash the go cites uses the same LF rule as the pins.
   assert.match(wrapper, /\$selfHash = Get-LfSha256 -Path \$PSCommandPath/);

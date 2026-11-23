@@ -14,8 +14,11 @@
  * SAFETY
  *  - A password is never accepted as an argument or read from the
  *    environment; STDIN must not be a terminal (no echo).
- *  - Before any check: the connected database must be --expected-database;
- *    database, server address and port are printed for the evidence log.
+ *  - The input (password length, email, names, organization code) is checked
+ *    BEFORE the database is contacted (trial T-1).
+ *  - Then, before any database check: the connected database must be
+ *    --expected-database; database, server address and port are printed for
+ *    the evidence log.
  *  - The rules themselves (refuse when an active ADMIN exists anywhere or the
  *    email exists anywhere, never update a user, one SERIALIZABLE
  *    transaction) are in app/lib/first-admin-db.ts.
@@ -33,7 +36,7 @@ import {
   parsePasswordStdin,
   type FirstAdminArgs,
 } from "../app/lib/first-admin-core.ts";
-import { createFirstAdmin, FirstAdminRefusalError } from "../app/lib/first-admin-db.ts";
+import { createFirstAdmin, FirstAdminRefusalError, validateFirstAdminInput } from "../app/lib/first-admin-db.ts";
 import { UserAdminRefusalError } from "../app/lib/user-admin-core.ts";
 import { describeUnexpectedError } from "../app/lib/user-admin-notice-core.ts";
 
@@ -72,6 +75,25 @@ async function main(): Promise<void> {
     fail(2, `Could not read the input: ${describeUnexpectedError(error)}`);
   }
 
+  // Trial T-1: check the input (password length, email, names, code) BEFORE
+  // connecting, so a bad value is refused at once. createFirstAdmin checks again.
+  const input = {
+    email: args.email,
+    name: args.name,
+    organizationName: args.organizationName,
+    organizationCode: args.organizationCode,
+    password: secrets.password,
+    passwordConfirmation: secrets.passwordConfirmation,
+  };
+  try {
+    validateFirstAdminInput(input);
+  } catch (error) {
+    if (error instanceof UserAdminRefusalError || error instanceof FirstAdminUsageError) {
+      fail(1, `${error.message} Nothing written; the database was not contacted.`);
+    }
+    fail(1, `Failed: ${describeUnexpectedError(error)}. Nothing written.`);
+  }
+
   const prisma = new PrismaClient();
   try {
     const [target] = await prisma.$queryRaw<Array<{ db: string; addr: string | null; port: number | null }>>`
@@ -84,18 +106,7 @@ async function main(): Promise<void> {
       fail(2, `Target NOT verified: connected to "${target.db}", expected "${args.expectedDatabase}". Nothing written.`);
     }
 
-    const result = await createFirstAdmin(
-      {
-        email: args.email,
-        name: args.name,
-        organizationName: args.organizationName,
-        organizationCode: args.organizationCode,
-        password: secrets.password,
-        passwordConfirmation: secrets.passwordConfirmation,
-      },
-      prisma,
-      { dryRun: args.dryRun },
-    );
+    const result = await createFirstAdmin(input, prisma, { dryRun: args.dryRun });
 
     if (result.outcome === "dry-run") {
       console.log(
