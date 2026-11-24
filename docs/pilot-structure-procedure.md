@@ -30,6 +30,13 @@ Before **every** release of a revision whose documents include an assembly or a 
 
 Every part and sub-assembly in the assembly must be a CAD document in Arch PLM, including library and Content Center parts. A link can only point at a managed document. There is **no exception** in the pilot: register unmanaged parts first.
 
+**Document numbers have no file extension.** Enter `A-1001`, not `A-1001.ipt`. This is a pilot decision: D-D decision record Rev1, signed by the PO 2026-11-19, DD-3(a).
+
+- The server does **not** refuse or remove an extension. A number is stored as typed, with only the surrounding spaces trimmed.
+- **Scan References** prints the number exactly as stored, so the comparison in steps 2 and 3 still works if a number has an extension. The rule exists because of the decision, not because the comparison needs it.
+- On the dashboard, **CAD documents > Attach** has no document-number field. A document registered there gets its **file name**, extension included, as its number (e.g. `10073-MFD-AS210.iam`). Do not use that form to register pilot documents until it has a document-number field. Ask the pilot lead how to register them instead.
+- **Copy Design** in Inventor already sets each new document's number to the new file name **without** its extension.
+
 ### 2. Scan the assembly in Inventor
 
 For each assembly in the release, **including every sub-assembly**:
