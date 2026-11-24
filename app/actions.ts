@@ -29,11 +29,19 @@ import { removeCadDependencyForActor } from "@/app/lib/cad-dependency-remove-db"
 import {
   ActionRefusalError,
   isUniqueViolationOn,
+  keepsInputAfterRefusal,
   noticeHref,
+  noticeMessage,
   refuseUnlessCanMutate,
   retryOnSerializationConflict,
   runRefusableNotice,
 } from "@/app/lib/action-notice-core";
+import {
+  completedFormState,
+  KEPT_FORM_FIELDS,
+  refusedFormState,
+  type KeptFormState,
+} from "@/app/lib/kept-form-core";
 import {
   canCreateSuccessorFrom,
   isCarryForwardMode,
@@ -78,11 +86,36 @@ function optionalValue(formData: FormData, name: string) {
  * structure) also carries that document's server-side id, so the dashboard
  * can name it (resolved within the user's own organization).
  */
-async function runWithRefusalNotice(run: () => Promise<unknown>): Promise<void> {
+async function runWithRefusalNotice(run: () => Promise<unknown>): Promise<void>;
+/**
+ * FE-L3: with `keep`, a user-correctable refusal (keepsInputAfterRefusal) is
+ * RETURNED instead of redirected: the same fixed notice message plus the
+ * form's allowlisted, non-secret values (app/lib/kept-form-core.ts), for a
+ * form wrapped in <KeepInputForm>. Any other refusal (e.g. authorization)
+ * still redirects. Resolves to null when the body completed.
+ */
+async function runWithRefusalNotice(
+  run: () => Promise<unknown>,
+  keep: KeepInput,
+): Promise<KeptFormState | null>;
+async function runWithRefusalNotice(
+  run: () => Promise<unknown>,
+  keep?: KeepInput,
+): Promise<KeptFormState | null | void> {
   const notice = await runRefusableNotice(run, { rethrowFramework: unstable_rethrow });
-  if (notice !== null) {
-    redirect(noticeHref(notice.code, notice.subject));
+  if (notice === null) return null;
+  if (keep && keepsInputAfterRefusal(notice.code)) {
+    return refusedFormState(keep.previous, noticeMessage(notice.code), keep.formData, keep.fields);
   }
+  redirect(noticeHref(notice.code, notice.subject));
+}
+
+interface KeepInput {
+  /** The previous useActionState state (sent by the browser; only its counter is read). */
+  previous: unknown;
+  formData: FormData;
+  /** The form's allowlist from KEPT_FORM_FIELDS. */
+  fields: readonly string[];
 }
 
 /**
@@ -209,15 +242,15 @@ async function lockItemRevisionForCadMutation(
   };
 }
 
-export async function createItem(formData: FormData) {
+export async function createItem(previous: KeptFormState, formData: FormData): Promise<KeptFormState> {
   // Tenant + identity come only from the authenticated session.
   const actor = await requireActor();
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
-  // Form-errors follow-up: user-correctable refusals become a dashboard
-  // notice; nothing is written when one occurs.
-  await runWithRefusalNotice(async () => {
+  // Form-errors follow-up: user-correctable refusals become a notice;
+  // nothing is written when one occurs. FE-L3: the form keeps its input.
+  const refused = await runWithRefusalNotice(async () => {
     // Engineering revisions are single letters A–Z. "a" -> "A"; reject "01"/"BETA"/"A1".
     const rawRevision = optionalValue(formData, "revision");
     let revision = "A";
@@ -275,9 +308,11 @@ export async function createItem(formData: FormData) {
       }
       throw error;
     }
-  });
+  }, { previous, formData, fields: KEPT_FORM_FIELDS.createItem });
+  if (refused !== null) return refused;
 
   revalidatePath("/");
+  return completedFormState(previous);
 }
 
 /**
@@ -752,14 +787,18 @@ export async function linkExistingCadDocumentToRevision(formData: FormData) {
  * The CadDocument insert is in the SAME transaction, so any failure rolls it
  * back — no orphan CadDocument.
  */
-export async function createCadDocument(formData: FormData) {
+export async function createCadDocument(
+  previous: KeptFormState,
+  formData: FormData,
+): Promise<KeptFormState> {
   const actor = await requireActor();
   await refuseUnlessWriteRole(actor); // SD-I1: typed notice instead of HTTP 500
   assertCanMutate(actor);
 
   // Form-errors follow-up: refusals become a notice; the transaction has
-  // rolled back (or nothing was started) when one occurs.
-  await runWithRefusalNotice(async () => {
+  // rolled back (or nothing was started) when one occurs. FE-L3: the form
+  // keeps its input.
+  const refused = await runWithRefusalNotice(async () => {
     const itemRevisionId = requiredValue(formData, "itemRevisionId");
     const fileName = requiredValue(formData, "fileName");
     const documentNumber = optionalValue(formData, "documentNumber") ?? fileName;
@@ -829,9 +868,11 @@ export async function createCadDocument(formData: FormData) {
       }
       throw error;
     }
-  });
+  }, { previous, formData, fields: KEPT_FORM_FIELDS.createCadDocument });
+  if (refused !== null) return refused;
 
   revalidatePath("/");
+  return completedFormState(previous);
 }
 
 // FileVersion rows are created only by the storage upload path

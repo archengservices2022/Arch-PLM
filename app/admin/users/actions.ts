@@ -32,10 +32,13 @@ import {
   type UserAdminActor,
 } from "@/app/lib/user-admin-db";
 import {
+  isCreateUserCorrectableRefusal,
   runUserAdminAction,
+  userAdminNotice,
   userAdminNoticeHref,
   userAdminSuccessCode,
 } from "@/app/lib/user-admin-notice-core";
+import { KEPT_FORM_FIELDS, refusedFormState, type KeptFormState } from "@/app/lib/kept-form-core";
 
 function field(formData: FormData, name: string): unknown {
   return formData.get(name);
@@ -48,7 +51,14 @@ async function adminActor(): Promise<UserAdminActor> {
 
 const RUN_OPTIONS = { rethrowFramework: unstable_rethrow };
 
-export async function createUserAction(formData: FormData) {
+/**
+ * FE-L3: called through useActionState (<KeepInputForm>). A user-correctable
+ * refusal is returned as the same fixed message plus the typed email, name
+ * and role - NEVER the passwords (KEPT_FORM_FIELDS.createUser,
+ * app/lib/kept-form-core.ts). Success and every other refusal (above all
+ * USER_ADMIN_NOT_ADMIN) redirect to the guarded users page as before.
+ */
+export async function createUserAction(previous: KeptFormState, formData: FormData): Promise<KeptFormState> {
   const actor = await adminActor();
   const { code } = await runUserAdminAction(
     () =>
@@ -66,6 +76,9 @@ export async function createUserAction(formData: FormData) {
     () => userAdminSuccessCode("CREATED"),
     RUN_OPTIONS,
   );
+  if (isCreateUserCorrectableRefusal(code)) {
+    return refusedFormState(previous, userAdminNotice(code).message, formData, KEPT_FORM_FIELDS.createUser);
+  }
   redirect(userAdminNoticeHref(code));
 }
 

@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import { ActionNotice } from "@/app/components/action-notice";
+import { KeepInputForm, KeptInput, KeptSelect } from "@/app/components/keep-input-form";
 import { UserRole } from "@/app/generated/prisma/enums";
 import { requireDashboardActor } from "@/app/lib/authz";
 import { prisma } from "@/app/lib/prisma";
@@ -189,25 +190,25 @@ export default async function AdminUsersPage({
               web and CAD Connect sessions. Give new passwords to the user in person.
             </p>
 
-            <form
+            <KeepInputForm
               action={createUserAction}
               className="mt-6 grid gap-2 rounded-md border border-slate-300 bg-white p-4 md:grid-cols-[1fr_1fr_auto]"
             >
               <h2 className="text-sm font-semibold md:col-span-3">Create user</h2>
-              <input name="email" type="email" required maxLength={254} placeholder="Email" autoComplete="off" className={inputClass} />
-              <input name="name" required maxLength={100} placeholder="Name" autoComplete="off" className={inputClass} />
-              <select name="role" defaultValue={UserRole.VIEWER} className={inputClass} aria-label="Role">
+              <KeptInput name="email" type="email" required maxLength={254} placeholder="Email" autoComplete="off" className={inputClass} />
+              <KeptInput name="name" required maxLength={100} placeholder="Name" autoComplete="off" className={inputClass} />
+              <KeptSelect name="role" defaultValue={UserRole.VIEWER} className={inputClass} aria-label="Role">
                 {ROLES.map((role) => (
                   <option key={role} value={role}>
                     {role}
                   </option>
                 ))}
-              </select>
+              </KeptSelect>
               <div className="flex flex-wrap gap-2 md:col-span-3">
                 <PasswordPair idPrefix="create" />
                 <button className={primaryButtonClass}>Create user</button>
               </div>
-            </form>
+            </KeepInputForm>
 
             <div className="mt-6 overflow-x-auto rounded-md border border-slate-300 bg-white">
               <table className="w-full text-left text-sm">

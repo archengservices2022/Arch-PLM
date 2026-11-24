@@ -19,6 +19,7 @@ import {
 } from "@/app/actions";
 import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { ActionNotice } from "@/app/components/action-notice";
+import { KeepInputForm, KeptInput, KeptSelect } from "@/app/components/keep-input-form";
 import {
   noticeMessageFor,
   parseNoticeCode,
@@ -586,13 +587,14 @@ export default async function Home({ searchParams }: PageProps<"/">) {
               </span>
             </div>
 
-            <form
+            <KeepInputForm
               action={createCadDocument}
+              noticeClassName="px-5 pb-4"
               className="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_1fr_140px_110px]"
             >
               <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                 Item revision
-                <select
+                <KeptSelect
                   name="itemRevisionId"
                   required
                   defaultValue={revisions[0]?.id ?? ""}
@@ -606,11 +608,11 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                       {revision.item.itemNumber} Rev {revision.revision}
                     </option>
                   ))}
-                </select>
+                </KeptSelect>
               </label>
               <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                 File name
-                <input
+                <KeptInput
                   name="fileName"
                   required
                   placeholder="10073-MFD-AS210.iam"
@@ -619,7 +621,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
               </label>
               <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                 Type
-                <select
+                <KeptSelect
                   name="documentType"
                   defaultValue={CadDocumentType.IAM}
                   className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
@@ -629,7 +631,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                       {type}
                     </option>
                   ))}
-                </select>
+                </KeptSelect>
               </label>
               <button
                 className="h-10 self-end rounded-md bg-slate-950 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-40"
@@ -637,7 +639,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
               >
                 Attach
               </button>
-            </form>
+            </KeepInputForm>
 
             <div className="divide-y divide-slate-200">
               {revisionsWithCad.map((revision) => (
@@ -860,12 +862,12 @@ export default async function Home({ searchParams }: PageProps<"/">) {
         <aside className="flex flex-col gap-6">
           <section className="rounded-lg border border-slate-300 bg-white p-5">
             <h2 className="text-lg font-semibold">Create item</h2>
-            <form action={createItem} className="mt-5 flex flex-col gap-4">
+            <KeepInputForm action={createItem} className="mt-5 flex flex-col gap-4">
               <Field label="Item number" name="itemNumber" placeholder="10073-MFD-BR018" />
               <Field label="Description" name="description" placeholder="Bearing support bracket" />
               <label className="flex flex-col gap-2 text-sm font-medium">
                 Type
-                <select
+                <KeptSelect
                   name="type"
                   defaultValue={ItemType.PART}
                   className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm"
@@ -875,11 +877,11 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                       {formatState(type)}
                     </option>
                   ))}
-                </select>
+                </KeptSelect>
               </label>
               <label className="flex flex-col gap-2 text-sm font-medium">
                 Project
-                <select
+                <KeptSelect
                   name="projectId"
                   defaultValue={projects[0]?.id ?? ""}
                   className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm"
@@ -890,7 +892,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                       {project.projectNumber} - {project.name}
                     </option>
                   ))}
-                </select>
+                </KeptSelect>
               </label>
               <div className="grid grid-cols-[92px_1fr] gap-3">
                 <Field label="Rev" name="revision" placeholder="A" />
@@ -903,7 +905,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
               <button className="h-11 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white transition hover:bg-slate-800">
                 Add item
               </button>
-            </form>
+            </KeepInputForm>
           </section>
 
           <section className="rounded-lg border border-slate-300 bg-white p-5">
@@ -1447,7 +1449,7 @@ function Field({
   return (
     <label className="flex flex-col gap-2 text-sm font-medium">
       {label}
-      <input
+      <KeptInput
         className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700"
         name={name}
         placeholder={placeholder}

@@ -550,3 +550,29 @@ export async function runSignInAttempt(
     return "refused";
   }
 }
+
+// ------------------------------------------------------------
+// FE-L3: which refusals keep the typed input
+// ------------------------------------------------------------
+
+/**
+ * The form / data refusals a user can correct in the form itself. Only these
+ * are returned inline with the kept input (app/lib/kept-form-core.ts). An
+ * explicit allowlist: an authorization refusal (ROLE_NOT_PERMITTED, B03
+ * permission denials, ...) and anything else keep the dashboard redirect.
+ */
+const INPUT_KEEPING_NOTICE_CODES: ReadonlySet<string> = new Set([
+  "action.FIELD_REQUIRED",
+  "action.FIELD_INVALID",
+  "action.REVISION_LETTER_INVALID",
+  "action.ITEM_NUMBER_EXISTS",
+  "action.PROJECT_NOT_FOUND",
+  "action.ITEM_REVISION_NOT_FOUND",
+  "action.CAD_DOCUMENT_EXISTS",
+  "action.REVISION_TERMINAL_FOR_CAD",
+  "action.CONCURRENT_CHANGES",
+] satisfies `action.${ActionRefusalCode}`[]);
+
+export function keepsInputAfterRefusal(code: NoticeCode): boolean {
+  return INPUT_KEEPING_NOTICE_CODES.has(code);
+}

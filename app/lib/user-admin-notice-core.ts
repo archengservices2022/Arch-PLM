@@ -153,3 +153,26 @@ export async function runUserAdminAction<T>(
     return { code: "refused.UNEXPECTED" as UserAdminNoticeCode, value: null };
   }
 }
+
+/**
+ * FE-L3: the refusals of "Create user" that the admin can correct in the form,
+ * so the form is shown again with the typed email, name and role (never the
+ * passwords). An explicit allowlist: every other outcome - above all the
+ * authorization refusal USER_ADMIN_NOT_ADMIN (role revoked while the page was
+ * open) and an UNEXPECTED server error - keeps the redirect to the guarded
+ * users page.
+ */
+const CREATE_USER_CORRECTABLE: ReadonlySet<string> = new Set([
+  "refused.USER_ADMIN_EMAIL_INVALID",
+  "refused.USER_ADMIN_EMAIL_EXISTS",
+  "refused.USER_ADMIN_NAME_INVALID",
+  "refused.USER_ADMIN_ROLE_INVALID",
+  "refused.USER_ADMIN_PASSWORD_TOO_SHORT",
+  "refused.USER_ADMIN_PASSWORD_TOO_LONG",
+  "refused.USER_ADMIN_PASSWORD_MISMATCH",
+  "refused.CONCURRENT_CHANGES",
+]);
+
+export function isCreateUserCorrectableRefusal(code: UserAdminNoticeCode): boolean {
+  return CREATE_USER_CORRECTABLE.has(code);
+}

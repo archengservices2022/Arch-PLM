@@ -182,7 +182,12 @@ test("source: the actions take the actor only from requireActor(); FormData neve
   );
   assert.doesNotMatch(actions, /organizationId: field|userId: field|actorUserId/);
   assert.match(actions, /const actor = await requireActor\(\);/);
-  const exported = [...actions.matchAll(/export async function (\w+)\(formData: FormData\) \{\r?\n  const actor = await adminActor\(\);/g)].map((m) => m[1]);
+  // FE-L3: createUserAction also takes the useActionState state first.
+  const exported = [
+    ...actions.matchAll(
+      /export async function (\w+)\((?:previous: KeptFormState, )?formData: FormData\)(?:: Promise<KeptFormState>)? \{\r?\n  const actor = await adminActor\(\);/g,
+    ),
+  ].map((m) => m[1]);
   assert.deepEqual(exported.sort(), [
     "changeUserRoleAction",
     "createUserAction",
