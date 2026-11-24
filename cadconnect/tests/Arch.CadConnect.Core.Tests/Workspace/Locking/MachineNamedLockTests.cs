@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using Arch.CadConnect.Core.Workspace.Locking;
 using Microsoft.Win32.SafeHandles;
@@ -255,24 +256,35 @@ public sealed class MachineNamedLockTests
         {
             using var readControl = Native.OpenEventW(Native.ReadControl, false, MachineNamedLock.NameFor(LockScope.Operation, key));
             var sddl = Native.Sddl(readControl);
+            var descriptor = new RawSecurityDescriptor(sddl);
 
-            // The object takes the creating token's default owner. For a normal
-            // (non-elevated) user that is the user's own SID. For an ELEVATED
-            // administrator token (e.g. a CI runner) Windows makes BUILTIN\
-            // Administrators ("BA") the default owner instead. Accept BA only
-            // in that case; a non-elevated run must still be owned by the user.
-            var me = WindowsIdentity.GetCurrent();
-            var userOwner = "O:" + me.User!.Value;
+            using var me = WindowsIdentity.GetCurrent();
+            var user = me.User!;
+            var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            // CheckTokenMembership: true only when BUILTIN\Administrators is an
+            // ENABLED group of this token, i.e. an elevated (full) admin token. A
+            // UAC-filtered admin token has it as deny-only and reports false.
             var elevatedAdmin = new WindowsPrincipal(me).IsInRole(WindowsBuiltInRole.Administrator);
-            var ownedAsExpected = sddl.StartsWith(userOwner, StringComparison.Ordinal)
-                || (elevatedAdmin && sddl.StartsWith("O:BA", StringComparison.Ordinal));
-            Assert.True(ownedAsExpected, $"unexpected owner (elevated admin: {elevatedAdmin}): {sddl}");
-            Assert.Contains("D:", sddl, StringComparison.Ordinal);
-            Assert.DoesNotContain("D:NO_ACCESS_CONTROL", sddl, StringComparison.Ordinal); // never a NULL DACL
-            foreach (var everyoneLike in new[] { ";;;WD)", ";;;AU)", ";;;BU)", ";;;IU)", ";;;AN)" })
-            {
-                Assert.DoesNotContain(everyoneLike, sddl, StringComparison.Ordinal);
-            }
+            var tokenOwner = Native.TokenDefaultOwner(me);
+            var logonSid = Native.TokenLogonSid(me);
+            var context = $"(elevated admin: {elevatedAdmin}, token owner: {tokenOwner}, logon SID: {logonSid?.Value ?? "none"}): {sddl}";
+
+            // OWNER. The object takes the creating token's default owner, exactly.
+            // That owner is the user's own SID, except on an ELEVATED admin token
+            // (e.g. a CI runner), where Windows makes BUILTIN\Administrators the
+            // default owner. Accept Administrators only in that case.
+            Assert.Equal(tokenOwner, descriptor.Owner);
+            Assert.True(
+                descriptor.Owner == user || (elevatedAdmin && descriptor.Owner == administrators),
+                "unexpected owner " + context);
+
+            // DACL. The product leaves the DACL to the creator token's default,
+            // which differs by environment, so judge it against an allow-list of
+            // the creator's own principals (see LockAclPolicy; its fixture tests
+            // cover the rejected shapes): never NULL, never a broad group, never
+            // an unknown principal.
+            var violation = LockAclPolicy.Violation(descriptor, user, logonSid);
+            Assert.True(violation is null, violation + " " + context);
         }
         finally
         {
@@ -318,6 +330,61 @@ public sealed class MachineNamedLockTests
         public const uint EventModifyState = 0x0002;
         public const uint Synchronize = 0x00100000;
         public const uint ReadControl = 0x00020000;
+        private const int TokenGroupsClass = 2;
+        private const int TokenOwnerClass = 4;
+        private const uint SeGroupLogonId = 0xC0000000;
+
+        /// <summary>The token's default owner (TOKEN_OWNER) for new objects.</summary>
+        public static SecurityIdentifier TokenDefaultOwner(WindowsIdentity identity)
+        {
+            var buffer = TokenInformation(identity, TokenOwnerClass);
+            try { return new SecurityIdentifier(Marshal.ReadIntPtr(buffer)); }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        /// <summary>The token's logon-session SID (S-1-5-5-x-y), if it has one.</summary>
+        public static SecurityIdentifier? TokenLogonSid(WindowsIdentity identity)
+        {
+            var buffer = TokenInformation(identity, TokenGroupsClass);
+            try
+            {
+                // TOKEN_GROUPS: DWORD GroupCount, then pointer-aligned SID_AND_ATTRIBUTES[].
+                var count = Marshal.ReadInt32(buffer);
+                var entrySize = IntPtr.Size * 2;
+                for (var i = 0; i < count; i++)
+                {
+                    var entry = buffer + IntPtr.Size + (i * entrySize);
+                    var attributes = (uint)Marshal.ReadInt32(entry + IntPtr.Size);
+                    if ((attributes & SeGroupLogonId) == SeGroupLogonId)
+                    {
+                        return new SecurityIdentifier(Marshal.ReadIntPtr(entry));
+                    }
+                }
+                return null;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static IntPtr TokenInformation(WindowsIdentity identity, int informationClass)
+        {
+            GetTokenInformation(identity.AccessToken, informationClass, IntPtr.Zero, 0, out var length);
+            Assert.True(length > 0, $"GetTokenInformation({informationClass}) size query failed: {Marshal.GetLastWin32Error()}");
+            var buffer = Marshal.AllocHGlobal(length);
+            if (!GetTokenInformation(identity.AccessToken, informationClass, buffer, length, out _))
+            {
+                var error = Marshal.GetLastWin32Error();
+                Marshal.FreeHGlobal(buffer);
+                Assert.Fail($"GetTokenInformation({informationClass}) failed: {error}");
+            }
+            return buffer;
+        }
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(SafeAccessTokenHandle token, int informationClass, IntPtr information, int length, out int returnLength);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeWaitHandle OpenEventW(uint desiredAccess, bool inheritHandle, string name);
