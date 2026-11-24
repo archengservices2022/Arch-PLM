@@ -119,6 +119,89 @@ public sealed class BomCsvWriterTests
         Assert.Equal("'=1+1", record[2]);
     }
 
+    public static readonly TheoryData<string> LeadingWhitespace = new()
+    {
+        " ", "   ", "\t", "\t\t", "\r", "\n", "\r\n", " \t\r\n ",
+        " ",       // no-break space
+        " ",       // em space
+        "　",       // ideographic space
+    };
+
+    [Theory]
+    [MemberData(nameof(LeadingWhitespace))]
+    public void Every_trigger_after_any_leading_whitespace_is_guarded_in_every_text_column(string whitespace)
+    {
+        foreach (var trigger in new[] { "=", "+", "-", "@", "＝", "＋", "－", "＠" })
+        {
+            var value = whitespace + trigger + "1+1";
+            var record = ParseCsv(BomCsvWriter.Write(Structured(Row(
+                item: value, partNumber: value, unit: value, description: value, material: value,
+                mass: new BomMass(1m, value), source: BomSourceDocument.Resolved(value)))))[1];
+
+            foreach (var column in new[] { 1, 2, 3, 5, 6, 8, 11 })
+            {
+                Assert.Equal("'" + trigger + "1+1", record[column]);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("＋1", "'＋1")]   // full-width +
+    [InlineData("－1", "'－1")]   // full-width -
+    [InlineData("＠A1", "'＠A1")] // full-width @
+    [InlineData("=", "'=")]               // a bare trigger
+    [InlineData("-", "'-")]
+    [InlineData("\t", "\"'\t\"")]         // a lone TAB: guarded, then quoted (leading whitespace)
+    [InlineData("\r", "\"'\r\"")]
+    [InlineData("\t1", "'\t1")]           // TAB / CR are triggers whatever follows
+    [InlineData("\r1", "\"'\r1\"")]
+    [InlineData("'=1", "'=1")]            // already starts with a quote: left alone
+    [InlineData("a\t=1", "a\t=1")]        // a trigger that is not the FIRST character is harmless
+    [InlineData("1+1", "1+1")]
+    [InlineData("+/- 0.1 mm", "'+/- 0.1 mm")]
+    public void More_formula_prefixes_are_guarded_and_non_leading_ones_are_not(string value, string expected)
+    {
+        Assert.Equal(expected, BomCsvWriter.Field(value, guard: true));
+    }
+
+    [Theory]
+    [InlineData("=1+1")]
+    [InlineData("-5")]
+    [InlineData("@x")]
+    [InlineData("\t1")]
+    public void Unguarded_fields_are_never_prefixed(string value)
+    {
+        Assert.DoesNotContain("'", BomCsvWriter.Field(value, guard: false), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Negative_numbers_in_text_columns_are_guarded_but_numeric_columns_are_not()
+    {
+        // Intent (see BomCsvWriter remarks): every TEXT value from the model is
+        // guarded - Excel then shows "-5" as the text it was, not a number -
+        // while level, quantity and mass are formatted by the writer itself and
+        // written as plain numbers. A negative quantity is a validation error,
+        // but the writer still exports it as a number, unguarded.
+        var record = ParseCsv(BomCsvWriter.Write(Structured(Row(
+            item: "-1", partNumber: "-5", quantity: -2.50m, unit: "-1", description: "-0.5",
+            material: "  -3", mass: new BomMass(-0.250m, "kg")))))[1];
+
+        Assert.Equal("'-1", record[1]);
+        Assert.Equal("'-5", record[2]);
+        Assert.Equal("'-0.5", record[3]);
+        Assert.Equal("-2.5", record[4]);
+        Assert.Equal("'-1", record[5]);
+        Assert.Equal("'-3", record[6]);
+        Assert.Equal("-0.25", record[7]);
+    }
+
+    [Fact]
+    public void The_header_is_never_guarded()
+    {
+        var header = BomCsvWriter.Write(Structured()).Split("\r\n")[0];
+        Assert.Equal(string.Join(',', BomCsvWriter.Header), header);
+    }
+
     // ---------------- numbers, units and flags ----------------
 
     [Fact]

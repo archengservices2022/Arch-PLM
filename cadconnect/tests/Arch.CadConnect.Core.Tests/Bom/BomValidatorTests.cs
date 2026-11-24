@@ -387,6 +387,75 @@ public sealed class BomFileNameAndDuplicatePolicyTests
         Assert.Contains(result.Issues, i => i.Code == BomIssueCode.UnresolvedComponent);
     }
 
+    public static readonly TheoryData<string> ReservedDeviceNames = new()
+    {
+        "CON", "con", "Prn", "aux", "NUL",
+        "COM1", "com9", "LPT1", "lpt9",
+        "COM¹", "lpt³",                // superscript digits are reserved too
+        "con.txt", "NUL.ipt", "Aux.iam", "com1.ipt", "LPT2.idw",
+        "con.tar.gz",                            // only the part before the first '.' counts
+        "con .ipt", "NUL  .iam",                 // trailing spaces before the extension
+        "CON ", " con",                          // surrounding whitespace is trimmed first
+        "con.", "nul. ",                         // trailing dots (already refused as such)
+    };
+
+    [Theory]
+    [MemberData(nameof(ReservedDeviceNames))]
+    public void A_windows_reserved_device_name_is_reported_and_refused_as_row_source_and_root(string name)
+    {
+        var row = Structured(Row("1", "BR-1", source: BomSourceDocument.Resolved(name)));
+        var rowIssue = Assert.Single(BomValidator.Validate(row).Issues, i => i.Code == BomIssueCode.InvalidFileName);
+        Assert.Equal(BomIssueSeverity.Error, rowIssue.Severity);
+        Assert.Equal("1", rowIssue.Path);
+        Assert.StartsWith("The component file name ", rowIssue.Message, StringComparison.Ordinal);
+        Assert.Throws<BomIntegrityException>(() => BomCanonicalSerializer.ComputeSha256(row));
+        Assert.Throws<BomIntegrityException>(() => BomCsvWriter.Write(row));
+
+        var root = Frame() with { RootFileName = name };
+        var rootIssue = Assert.Single(BomValidator.Validate(root).Issues, i => i.Code == BomIssueCode.InvalidFileName);
+        Assert.Null(rootIssue.Path);
+        Assert.StartsWith("The assembly file name ", rootIssue.Message, StringComparison.Ordinal);
+        Assert.Throws<BomIntegrityException>(() => BomCanonicalSerializer.ComputeSha256(root));
+        Assert.Throws<BomIntegrityException>(() => BomCsvWriter.Write(root));
+    }
+
+    [Fact]
+    public void A_reserved_device_name_has_its_own_message()
+    {
+        var issue = Assert.Single(
+            BomValidator.Validate(Structured(Row("1", "BR-1", source: BomSourceDocument.Resolved("Con.ipt")))).Issues,
+            i => i.Code == BomIssueCode.InvalidFileName);
+        Assert.Equal(
+            "The component file name is a reserved Windows device name (such as CON, NUL, COM1 or LPT1), with or without an extension.",
+            issue.Message);
+    }
+
+    [Theory]
+    [InlineData("bracket.con")]          // reserved word only as the extension
+    [InlineData("console.ipt")]
+    [InlineData("auxiliary.iam")]
+    [InlineData("nul-bracket.ipt")]
+    [InlineData("CON1.ipt")]
+    [InlineData("COM10.ipt")]
+    [InlineData("LPT.ipt")]
+    [InlineData("my con.ipt")]
+    [InlineData("ＣＯＮ.ipt")] // full-width CON: not reserved (NFC keeps it full-width)
+    // Intentional exclusions from the conservative naming policy (see BomFileName):
+    [InlineData("COM0")]
+    [InlineData("COM0.ipt")]
+    [InlineData("LPT0")]
+    [InlineData("lpt0.ipt")]
+    [InlineData("CONIN$")]
+    [InlineData("conin$.ipt")]
+    [InlineData("CONOUT$")]
+    [InlineData("CONOUT$.ipt")]
+    public void Names_that_merely_contain_a_reserved_word_or_are_excluded_by_policy_are_accepted(string name)
+    {
+        var extract = Structured(Row("1", "BR-1", source: BomSourceDocument.Resolved(name))) with { RootFileName = name };
+        Assert.DoesNotContain(BomValidator.Validate(extract).Issues, i => i.Code == BomIssueCode.InvalidFileName);
+        Assert.Matches("^[0-9a-f]{64}$", BomCanonicalSerializer.ComputeSha256(extract));
+    }
+
     [Theory]
     [InlineData("bracket.ipt")]
     [InlineData("Bracket - LH (v2).ipt")]

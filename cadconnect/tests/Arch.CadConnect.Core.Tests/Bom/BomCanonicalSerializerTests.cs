@@ -35,6 +35,59 @@ public sealed class BomCanonicalSerializerTests
         Assert.Equal(GoldenSha256, BomCanonicalSerializer.ComputeSha256(Golden()));
     }
 
+    // ---------------- Unicode hash stability (BOM-L4) ----------------
+
+    /// <summary>Non-ASCII fixture: Latin-1, CJK, an astral emoji, and a file
+    /// name delivered DECOMPOSED ("o" + U+0308) that NFC composes.</summary>
+    private static BomExtract UnicodeGolden() => Structured(
+        Row("1", "Ø-100", description: "Möbel 中文 \U0001F600",
+            source: BomSourceDocument.Resolved("Möbel.ipt")));
+
+    /// <summary>Written by hand (NFC applied by hand to the file name).</summary>
+    private const string UnicodeGoldenCanonical =
+        "{\"format\":\"arch-plm.bom.canonical.v1\",\"view\":\"STRUCTURED_ALL_LEVELS\",\"rootFileName\":\"top.iam\",\"rootPartNumber\":\"TOP-100\",\"rows\":[{\"level\":1,\"item\":\"1\",\"partNumber\":\"Ø-100\",\"description\":\"Möbel 中文 \U0001F600\",\"quantity\":\"1\",\"unit\":\"Each\",\"material\":null,\"mass\":null,\"massUnit\":null,\"structure\":\"NORMAL\",\"sourceFileName\":\"Möbel.ipt\",\"resolved\":true,\"virtual\":false}]}";
+
+    /// <summary>SHA-256 of the UTF-8 bytes of <see cref="UnicodeGoldenCanonical"/>,
+    /// computed independently with PowerShell / .NET Framework SHA256. If this
+    /// changes, existing BOM hashes of non-ASCII names change: that needs a new
+    /// <see cref="BomCanonicalSerializer.FormatId"/>, not a new constant.</summary>
+    private const string UnicodeGoldenSha256 = "7d2e3fb0e0c8c3016ed002480c7b38133cb0dc48110b3dcbc410c0ee79528139";
+
+    [Fact]
+    public void Non_ascii_text_is_nfc_normalized_and_hashed_as_utf8_with_a_pinned_value()
+    {
+        Assert.Equal(UnicodeGoldenCanonical, BomCanonicalSerializer.Serialize(UnicodeGolden()));
+        Assert.Equal(UnicodeGoldenSha256, BomCanonicalSerializer.ComputeSha256(UnicodeGolden()));
+        Assert.Equal(
+            UnicodeGoldenSha256,
+            Convert.ToHexString(SHA256.HashData(new UTF8Encoding(false).GetBytes(UnicodeGoldenCanonical))).ToLowerInvariant());
+    }
+
+    [Theory]
+    [InlineData("ö", "ö")]          // precomposed vs decomposed
+    [InlineData("Å", "Å")]          // A-ring vs Angstrom sign (canonical singleton)
+    [InlineData("ệ", "ệ")]   // combining marks in canonical order
+    [InlineData("ệ", "ệ")]   // ... and in non-canonical order
+    public void Canonically_equivalent_names_hash_identically(string a, string b)
+    {
+        Assert.Equal(HashOfName(a), HashOfName(b));
+    }
+
+    [Theory]
+    [InlineData("fi", "ﬁ")]               // ligature (compatibility only)
+    [InlineData("A", "Ａ")]                // full-width letter
+    [InlineData("a", "а")]                // Latin a vs Cyrillic a (homoglyph)
+    [InlineData("ab", "a​b")]             // zero-width space
+    [InlineData("ab", "a­b")]             // soft hyphen
+    [InlineData("bracket", "Bracket")]         // letter case
+    public void Look_alike_names_that_are_not_canonically_equivalent_hash_differently(string a, string b)
+    {
+        Assert.NotEqual(HashOfName(a), HashOfName(b));
+    }
+
+    private static string HashOfName(string name) => BomCanonicalSerializer.ComputeSha256(
+        Structured(Row("1", "P-" + name, description: name, source: BomSourceDocument.Resolved(name + ".ipt"))));
+
     [Fact]
     public void Hash_is_lowercase_hex_sha256_of_the_utf8_canonical_text()
     {

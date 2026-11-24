@@ -382,6 +382,9 @@ internal sealed class BomGraph
         Array.Sort(childNodes, CompareNodes);
         node.Children = childNodes;
 
+        // Subtree digest (sibling tie-break only): SHA-256 over the UTF-8 bytes
+        // of the row's canonical fields, whose text is already NFC-normalized
+        // by BomText.Normalize - the same Unicode rules as the content hash.
         var sb = new StringBuilder(node.SelfKey.Length + (childNodes.Length * 65) + 1);
         sb.Append(node.SelfKey).Append('\u001E');
         foreach (var child in childNodes)
@@ -468,14 +471,30 @@ internal sealed class BomGraph
 }
 
 /// <summary>
-/// Source file names must be plain file names - never a path. A path is a
-/// reader defect, so it is REPORTED, never silently stripped.
+/// Source file names must be plain file names - never a path, and never one
+/// of the reserved names in Microsoft's portable file-naming guidance (CON,
+/// PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 and the superscript-digit forms
+/// COM¹-COM³ / LPT¹-LPT³), in any letter case, with or without an extension
+/// ("con.txt") and with trailing spaces before the extension ("con .txt").
+/// This is a CONSERVATIVE naming policy, not device detection: it does not
+/// mirror what a given Windows build resolves as a device (recent builds
+/// treat "NUL.txt" or "con .txt" as ordinary files, and do resolve bare
+/// CONIN$ / CONOUT$ as devices). COM0, LPT0, CONIN$ and CONOUT$ are
+/// deliberately NOT refused. A path is a reader defect, so it is REPORTED,
+/// never silently stripped.
 /// </summary>
 internal static class BomFileName
 {
     private const int MaxLength = 255;
 
     private static readonly char[] InvalidCharacters = ['<', '>', '"', '|', '?', '*'];
+
+    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+    };
 
     /// <summary>Null when acceptable; otherwise the end of a sentence describing the problem.</summary>
     public static string? Problem(string? raw, bool required)
@@ -516,6 +535,24 @@ internal static class BomFileName
             return "must not end with '.'.";
         }
 
+        if (IsReservedDeviceName(name))
+        {
+            return "is a reserved Windows device name (such as CON, NUL, COM1 or LPT1), with or without an extension.";
+        }
+
         return null;
+    }
+
+    /// <summary>
+    /// Naming policy (not device detection): true when the part before the
+    /// first '.', without trailing spaces, is one of the reserved names above
+    /// (ignoring case). The name is already normalized (trimmed) and does not
+    /// end with '.'.
+    /// </summary>
+    private static bool IsReservedDeviceName(string name)
+    {
+        var dot = name.IndexOf('.', StringComparison.Ordinal);
+        var stem = (dot < 0 ? name : name[..dot]).TrimEnd(' ');
+        return ReservedDeviceNames.Contains(stem);
     }
 }

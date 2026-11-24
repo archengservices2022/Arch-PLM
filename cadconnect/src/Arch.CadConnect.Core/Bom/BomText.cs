@@ -14,6 +14,40 @@ public static class BomText
     /// replaced by U+FFFD, Unicode NFC, surrounding whitespace trimmed; empty
     /// becomes null. Inner whitespace and letter case are preserved.
     /// </summary>
+    /// <remarks>
+    /// UNICODE AND HASH STABILITY. This is the only normalization applied
+    /// before text is hashed (<see cref="BomCanonicalSerializer.ComputeSha256"/>,
+    /// which hashes the UTF-8 bytes, no byte-order mark, of the canonical text).
+    ///  - Normalization is NFC (canonical composition) only, done by the .NET
+    ///    runtime's globalization layer: ICU by default where available (Linux,
+    ///    Windows 10 1903+), but Windows can run in NLS mode
+    ///    (System.Globalization.UseNls / DOTNET_SYSTEM_GLOBALIZATION_USENLS).
+    ///    Both are expected to give the same NFC result for assigned
+    ///    characters, but that is not proven here; the pinned non-ASCII golden
+    ///    hash test guards it on whatever mode the tests run in. Other
+    ///    transformations: lone surrogates -> U+FFFD, trim, empty -> null.
+    ///    There is NO compatibility folding (NFKC), NO
+    ///    case folding, NO confusable/homoglyph mapping and NO removal of
+    ///    invisible format characters; trimming removes only leading and
+    ///    trailing <see cref="char.IsWhiteSpace(char)"/> characters.
+    ///  - Visually identical text therefore hashes identically ONLY when it is
+    ///    canonically equivalent: precomposed "ö" (U+00F6) and "o" + U+0308,
+    ///    or the Angstrom sign U+212B and "Å" U+00C5, give the same hash.
+    ///    Look-alikes that are not canonically equivalent give DIFFERENT
+    ///    hashes: full-width vs ASCII letters, ligatures ("ﬁ" vs "fi"), Cyrillic
+    ///    "а" vs Latin "a", a different letter case, or an embedded zero-width
+    ///    character (U+200B, U+200D, U+FEFF).
+    ///  - Lone UTF-16 surrogates become U+FFFD, so texts differing only in
+    ///    which lone surrogate they hold hash alike (the validator reports such
+    ///    text as <see cref="BomIssueCode.InvalidText"/>).
+    ///  - Across runtime / Unicode versions: under the Unicode normalization
+    ///    stability policy the NFC form of text made of characters ASSIGNED in
+    ///    the runtime's Unicode version never changes, so its hash is stable.
+    ///    Code points unassigned in that version are passed through unchanged
+    ///    today; if a later Unicode version assigns one as a combining mark,
+    ///    NFC may reorder it and the hash of such text could change. Any change
+    ///    to these rules must change <see cref="BomCanonicalSerializer.FormatId"/>.
+    /// </remarks>
     public static string? Normalize(string? value)
     {
         if (value is null)

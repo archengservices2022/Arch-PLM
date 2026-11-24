@@ -27,7 +27,13 @@ namespace Arch.CadConnect.Core.Bom;
 ///    read in - including rows whose item and part numbers are equal.
 ///  - Only structurally sound extracts with plain source file names are
 ///    serialized (<see cref="BomIntegrityException"/> otherwise).
-///  - Text is <see cref="BomText.Normalize"/>d (NFC, trimmed, empty -> null).
+///  - Text is <see cref="BomText.Normalize"/>d (lone surrogates -> U+FFFD,
+///    NFC, trimmed, empty -> null). NFC is the only Unicode normalization: canonically equivalent text
+///    (precomposed vs decomposed accents) hashes identically, but visually
+///    similar text that is not canonically equivalent (full-width forms,
+///    ligatures, homoglyphs from other scripts, letter case, zero-width
+///    characters) hashes differently. See the remarks on
+///    <see cref="BomText.Normalize"/> for stability across Unicode versions.
 ///  - Decimals are JSON STRINGS formatted by <see cref="BomText.FormatDecimal"/>
 ///    (exact, invariant, no trailing zeros), never JSON numbers, so 1.5 and
 ///    1.50 hash identically and no floating-point rounding can occur.
@@ -81,7 +87,12 @@ public static class BomCanonicalSerializer
         return sb.ToString();
     }
 
-    /// <summary>Lowercase hex SHA-256 of the canonical text's UTF-8 bytes.</summary>
+    /// <summary>Lowercase hex SHA-256 of the canonical text's UTF-8 bytes
+    /// (no byte-order mark). Each text value is transformed by
+    /// <see cref="BomText.Normalize"/> exactly as follows and in no other way:
+    /// lone UTF-16 surrogates replaced by U+FFFD, Unicode NFC, leading and
+    /// trailing whitespace trimmed, empty -> null. See its remarks for what
+    /// that means for visually identical names.</summary>
     public static string ComputeSha256(BomExtract extract)
     {
         var bytes = Encoding.UTF8.GetBytes(Serialize(extract));
