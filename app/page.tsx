@@ -21,6 +21,8 @@ import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { ActionNotice } from "@/app/components/action-notice";
 import { KeepInputForm, KeptInput, KeptSelect } from "@/app/components/keep-input-form";
 import { AttachNumberFields } from "@/app/components/attach-number-fields";
+import { GettingStarted } from "@/app/components/getting-started";
+import { gettingStartedSteps } from "@/app/lib/getting-started-core";
 import {
   noticeMessageFor,
   parseNoticeCode,
@@ -448,6 +450,17 @@ export default async function Home({ searchParams }: PageProps<"/">) {
 
       <section className="mx-auto grid max-w-7xl gap-6 px-6 py-6 xl:grid-cols-[1fr_380px]">
         <div className="flex flex-col gap-6">
+          <GettingStarted
+            steps={gettingStartedSteps({
+              itemCount: items.length,
+              cadDocumentCount,
+              lifecycleCounts,
+            })}
+          />
+          <p className="-mb-3 text-xs text-slate-600">
+            How many revisions are in each stage. A revision moves Working → In Review →
+            Approved → Released; a newer released revision makes the old one Superseded.
+          </p>
           <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
             {lifecycleOrder.map((state) => (
               <Metric
@@ -458,9 +471,13 @@ export default async function Home({ searchParams }: PageProps<"/">) {
             ))}
           </div>
 
-          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
+          <section id="item-master" className="scroll-mt-4 overflow-hidden rounded-lg border border-slate-300 bg-white">
             <div className="border-b border-slate-200 px-5 py-4">
               <h2 className="text-lg font-semibold">Item master</h2>
+              <p className="mt-1 text-xs text-slate-600">
+                Every part, assembly and drawing number in your workspace, with its latest
+                revision and stage. Add new ones with the “Create item” form.
+              </p>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[760px] border-collapse text-left text-sm">
@@ -506,13 +523,19 @@ export default async function Home({ searchParams }: PageProps<"/">) {
             </div>
           </section>
 
-          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-              <h2 className="text-lg font-semibold">Engineering revisions</h2>
-              <span className="text-xs uppercase tracking-wide text-slate-500">
-                {openRevisions.length} open · lifecycle transitions are enforced
-                server-side
-              </span>
+          <section id="revisions" className="scroll-mt-4 overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <div className="border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">Engineering revisions</h2>
+                <span className="text-xs uppercase tracking-wide text-slate-500">
+                  {openRevisions.length} open
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-slate-600">
+                Move a revision to its next stage with “Move to” and Update. Approve and
+                Release must be done by another person with the Approver or Admin role -
+                not by whoever created or submitted the revision.
+              </p>
             </div>
             <div className="divide-y divide-slate-200">
               {revisionsByItem.map((group) => (
@@ -579,13 +602,19 @@ export default async function Home({ searchParams }: PageProps<"/">) {
             ) : null}
           </section>
 
-          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-              <h2 className="text-lg font-semibold">CAD documents</h2>
-              <span className="text-xs uppercase tracking-wide text-slate-500">
-                {cadDocumentCount} document{cadDocumentCount === 1 ? "" : "s"} in workspace ·
-                linked to revisions · file versions independent of the revision
-              </span>
+          <section id="cad-documents" className="scroll-mt-4 overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <div className="border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">CAD documents</h2>
+                <span className="text-xs uppercase tracking-wide text-slate-500">
+                  {cadDocumentCount} document{cadDocumentCount === 1 ? "" : "s"}
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-slate-600">
+                Attach a CAD file (.ipt, .iam, .idw…) to a revision. The document number is
+                filled from the file name without its extension. Uploading again later adds a
+                new file version; the revision stays the same.
+              </p>
             </div>
 
             <KeepInputForm
@@ -718,14 +747,19 @@ export default async function Home({ searchParams }: PageProps<"/">) {
             </div>
           </section>
 
-          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-              <h2 className="text-lg font-semibold">CAD references</h2>
-              <span className="text-xs uppercase tracking-wide text-slate-500">
-                {cadDependencies.length} relationship
-                {cadDependencies.length === 1 ? "" : "s"} · document-to-document ·
-                independent of file versions
-              </span>
+          <section id="cad-references" className="scroll-mt-4 overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <div className="border-b border-slate-200 px-5 py-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">CAD references</h2>
+                <span className="text-xs uppercase tracking-wide text-slate-500">
+                  {cadDependencies.length} link{cadDependencies.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-slate-600">
+                Which files an assembly or drawing uses: choose the assembly (.iam) or drawing
+                (.idw) as parent and the part it uses as child, then click Link. An assembly or drawing can only
+                be released when these links are recorded.
+              </p>
             </div>
 
             <form
@@ -856,9 +890,13 @@ export default async function Home({ searchParams }: PageProps<"/">) {
         </div>
 
         <aside className="flex flex-col gap-6">
-          <section className="rounded-lg border border-slate-300 bg-white p-5">
+          <section id="create-item" className="scroll-mt-4 rounded-lg border border-slate-300 bg-white p-5">
             <h2 className="text-lg font-semibold">Create item</h2>
-            <KeepInputForm action={createItem} className="mt-5 flex flex-col gap-4">
+            <p className="mt-1 text-xs text-slate-600">
+              Start here for a new part, assembly or drawing. It is created with its first
+              revision in the Working stage. Item numbers cannot be reused.
+            </p>
+            <KeepInputForm action={createItem} className="mt-4 flex flex-col gap-4">
               <Field label="Item number" name="itemNumber" placeholder="10073-MFD-BR018" />
               <Field label="Description" name="description" placeholder="Bearing support bracket" />
               <label className="flex flex-col gap-2 text-sm font-medium">
@@ -893,7 +931,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
               <div className="grid grid-cols-[92px_1fr] gap-3">
                 <Field label="Rev" name="revision" placeholder="A" />
                 <Field
-                  label="Revision note"
+                  label="Revision note (required)"
                   name="revisionDescription"
                   placeholder="Initial design baseline"
                 />
@@ -1207,11 +1245,18 @@ function RevisionCard({
       ) : null}
 
       {blockedApprovalReasons.length > 0 ? (
-        <ul className="mt-2 flex flex-col gap-0.5 text-xs text-slate-500">
-          {blockedApprovalReasons.map((reason) => (
-            <li key={reason}>{reason}</li>
-          ))}
-        </ul>
+        <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <p className="font-semibold">Why you can&apos;t approve or release this revision:</p>
+          <ul className="mt-1 flex list-disc flex-col gap-0.5 pl-4">
+            {blockedApprovalReasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+          <p className="mt-1">
+            Ask another person with the Approver or Admin role to do it. An Admin can add
+            that person under Users (top right).
+          </p>
+        </div>
       ) : null}
 
       {recentEvents.length > 0 ? (
