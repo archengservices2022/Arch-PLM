@@ -24,8 +24,9 @@
  *
  * SAFETY (same pattern as the B06 gate):
  *  1. BEFORE any connection: DATABASE_URL must be
- *     postgres://...@127.0.0.1|localhost:5432/<db> with no redirecting query
- *     parameters; <db> must equal B05_EXPECTED_DATABASE, match
+ *     postgres://...@127.0.0.1|localhost:<port>/<db> with no redirecting query
+ *     parameters; <port> is B05_EXPECTED_PORT (optional, default 5432, for a
+ *     throwaway instance on another loopback port); <db> must equal B05_EXPECTED_DATABASE, match
  *     ^arch_plm_[a-z0-9_]*scratch[a-z0-9_]*$ and not be protected.
  *  2. AFTER connecting, BEFORE any write: current database, server address,
  *     port and system identifier (B05_EXPECTED_SYSTEM_ID) must match; only
@@ -36,7 +37,7 @@
  *  The PostgreSQL version and transaction_isolation are printed as evidence.
  *
  * Run (DATABASE_URL must point at the scratch database):
- *   B05_EXPECTED_DATABASE=<db> B05_EXPECTED_SYSTEM_ID=<id> \
+ *   B05_EXPECTED_DATABASE=<db> B05_EXPECTED_SYSTEM_ID=<id> [B05_EXPECTED_PORT=<port>] \
  *     node --experimental-strip-types scripts/itest-b05-user-admin.ts
  *
  * Exit codes: 0 all checks passed; 1 a check failed; 2 target not verified
@@ -91,7 +92,7 @@ function verifyBeforeConnecting(): void {
   }
   if (url.protocol !== "postgresql:" && url.protocol !== "postgres:") refuse(`protocol ${url.protocol}`);
   if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") refuse(`host ${url.hostname} is not loopback`);
-  if ((url.port || "5432") !== "5432") refuse(`port ${url.port}`);
+  if ((url.port || "5432") !== EXPECTED_PORT) refuse(`port ${url.port || "5432"} != expected port ${EXPECTED_PORT}`);
   const dbName = decodeURIComponent(url.pathname.replace(/^\//, ""));
   if (dbName !== expectedDb) refuse(`URL database '${dbName}' != B05_EXPECTED_DATABASE '${expectedDb}'`);
   for (const key of url.searchParams.keys()) {
@@ -102,6 +103,21 @@ function verifyBeforeConnecting(): void {
   log(`URL CHECK: postgres @ ${url.hostname}:${url.port || "5432"}/${dbName} (credentials not shown)`);
 }
 
+/** B05_EXPECTED_PORT (optional, default 5432): lets the gate run against a
+ *  throwaway PostgreSQL instance on another loopback port. Must be a plain
+ *  decimal port 1024-65535; checked before connecting (URL) and after
+ *  connecting (inet_server_port). */
+function expectedPort(): string {
+  const raw = process.env.B05_EXPECTED_PORT ?? "5432";
+  const n = Number(raw);
+  if (!/^[1-9][0-9]{3,4}$/.test(raw) || n < 1024 || n > 65535) {
+    log(`TARGET NOT VERIFIED (before connecting): B05_EXPECTED_PORT '${raw}' is not a port 1024-65535`);
+    process.exit(2);
+  }
+  return raw;
+}
+
+const EXPECTED_PORT = expectedPort();
 verifyBeforeConnecting();
 
 const prisma = new PrismaClient();
@@ -156,7 +172,7 @@ async function verifyTargetChecks() {
     row.db === process.env.B05_EXPECTED_DATABASE &&
     row.sysid === process.env.B05_EXPECTED_SYSTEM_ID &&
     (row.addr === "127.0.0.1" || row.addr === "::1") &&
-    Number(row.port) === 5432 &&
+    String(row.port) === EXPECTED_PORT &&
     Number(row.foreignOrgs) === 0;
   if (!ok) {
     log(`TARGET NOT VERIFIED (after connecting): ${JSON.stringify({ ...row, foreignOrgs: row ? Number(row.foreignOrgs) : null })}`);
