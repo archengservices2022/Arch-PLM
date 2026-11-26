@@ -32,9 +32,9 @@ Every part and sub-assembly in the assembly must be a CAD document in Arch PLM, 
 
 **Document numbers have no file extension.** Enter `A-1001`, not `A-1001.ipt`. This is a pilot decision: D-D decision record Rev1, signed by the PO 2026-11-19, DD-3(a).
 
-- The server does **not** refuse or remove an extension. A number is stored as typed, with only the surrounding spaces trimmed.
+- Documents are registered in two places, and both follow the rule: the dashboard **Attach** form (below) and **Copy Design** in Inventor.
 - **Scan References** prints the number exactly as stored, so the comparison in steps 2 and 3 still works if a number has an extension. The rule exists because of the decision, not because the comparison needs it.
-- On the dashboard, **CAD documents > Attach** has no document-number field. A document registered there gets its **file name**, extension included, as its number (e.g. `10073-MFD-AS210.iam`). Do not use that form to register pilot documents until it has a document-number field. Ask the pilot lead how to register them instead.
+- On the dashboard, **CAD documents > Attach** has a **Document number (no extension)** field. Typing the file name fills it with the name minus ONE recognized extension from the list below (`10073-MFD-AS210.iam` gives `10073-MFD-AS210`; `notes.txt` stays `notes.txt`, because `.txt` is not in the list). Once you type in the number box yourself, a later file-name change no longer touches it; clear the box to get the automatic number back. If you leave it empty, the server uses that same name minus one recognized extension. The server **refuses** a number that still ends in a CAD or drawing extension (`.ipt`, `.iam`, `.idw`, `.dwg`, `.pdf`, `.ipn`, `.dxf`, `.step`, `.stp`, `.iges`, `.igs`, `.sat`, `.stl`, any letter case) and keeps what you typed so you can correct it. A number such as `PUMP-REV.2` is not an extension and is accepted.
 - **Copy Design** in Inventor already sets each new document's number to the new file name **without** its extension.
 
 ### 2. Scan the assembly in Inventor

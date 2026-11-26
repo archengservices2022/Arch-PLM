@@ -42,6 +42,7 @@ import {
   refusedFormState,
   type KeptFormState,
 } from "@/app/lib/kept-form-core";
+import { resolveAttachDocumentNumber } from "@/app/lib/document-number-core";
 import {
   canCreateSuccessorFrom,
   isCarryForwardMode,
@@ -801,7 +802,18 @@ export async function createCadDocument(
   const refused = await runWithRefusalNotice(async () => {
     const itemRevisionId = requiredValue(formData, "itemRevisionId");
     const fileName = requiredValue(formData, "fileName");
-    const documentNumber = optionalValue(formData, "documentNumber") ?? fileName;
+    // DD-ATTACH (D-D DD-3(a)): the number is the typed one, else the file name's
+    // stem; a number that still ends in a known CAD extension is refused.
+    const resolvedNumber = resolveAttachDocumentNumber(optionalValue(formData, "documentNumber"), fileName);
+    if (!resolvedNumber.ok) {
+      throw resolvedNumber.reason === "HAS_EXTENSION"
+        ? new ActionRefusalError(
+            "DOCUMENT_NUMBER_HAS_EXTENSION",
+            "Document number must not end in a file extension.",
+          )
+        : new ActionRefusalError("FIELD_REQUIRED", "documentNumber is required");
+    }
+    const documentNumber = resolvedNumber.documentNumber;
     const documentType = formEnumValue(
       CadDocumentType,
       requiredValue(formData, "documentType"),

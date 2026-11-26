@@ -98,6 +98,7 @@ export type ActionRefusalCode =
   | "CAD_DOCUMENT_NOT_FOUND"
   | "CAD_DOCUMENT_NOT_ON_SOURCE"
   | "CAD_DOCUMENT_EXISTS"
+  | "DOCUMENT_NUMBER_HAS_EXTENSION"
   | "REVISION_TERMINAL_FOR_CAD"
   | "CAD_SELF_DEPENDENCY"
   | "CAD_DEPENDENCY_CYCLE"
@@ -145,6 +146,8 @@ export const ACTION_REFUSAL_MESSAGES: Record<ActionRefusalCode, string> = {
   CAD_DOCUMENT_NOT_ON_SOURCE:
     "A selected CAD document is not linked to the source revision. Refresh the page and try again.",
   CAD_DOCUMENT_EXISTS: "A CAD document with that document number and type already exists.",
+  DOCUMENT_NUMBER_HAS_EXTENSION:
+    "Enter the document number without the file extension (for example 10073-MFD-AS210, not 10073-MFD-AS210.iam).",
   REVISION_TERMINAL_FOR_CAD:
     "CAD documents cannot be added to or linked to a released or terminal revision.",
   CAD_SELF_DEPENDENCY: "A CAD document cannot depend on itself.",
@@ -569,6 +572,7 @@ const INPUT_KEEPING_NOTICE_CODES: ReadonlySet<string> = new Set([
   "action.PROJECT_NOT_FOUND",
   "action.ITEM_REVISION_NOT_FOUND",
   "action.CAD_DOCUMENT_EXISTS",
+  "action.DOCUMENT_NUMBER_HAS_EXTENSION",
   "action.REVISION_TERMINAL_FOR_CAD",
   "action.CONCURRENT_CHANGES",
 ] satisfies `action.${ActionRefusalCode}`[]);

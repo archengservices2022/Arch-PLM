@@ -52,7 +52,7 @@ export const KEPT_FORM_FIELDS = Object.freeze({
     "revision",
     "revisionDescription",
   ] as const),
-  createCadDocument: Object.freeze(["itemRevisionId", "fileName", "documentType"] as const),
+  createCadDocument: Object.freeze(["itemRevisionId", "fileName", "documentNumber", "documentType"] as const),
   // B05: the password pair is deliberately NOT kept; the admin types it again.
   createUser: Object.freeze(["email", "name", "role"] as const),
 });

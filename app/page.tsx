@@ -20,6 +20,7 @@ import {
 import { UploadFileVersion } from "@/app/components/upload-file-version";
 import { ActionNotice } from "@/app/components/action-notice";
 import { KeepInputForm, KeptInput, KeptSelect } from "@/app/components/keep-input-form";
+import { AttachNumberFields } from "@/app/components/attach-number-fields";
 import {
   noticeMessageFor,
   parseNoticeCode,
@@ -590,7 +591,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
             <KeepInputForm
               action={createCadDocument}
               noticeClassName="px-5 pb-4"
-              className="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_1fr_140px_110px]"
+              className="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-[1fr_1fr_1fr_140px_110px]"
             >
               <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                 Item revision
@@ -610,15 +611,10 @@ export default async function Home({ searchParams }: PageProps<"/">) {
                   ))}
                 </KeptSelect>
               </label>
-              <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
-                File name
-                <KeptInput
-                  name="fileName"
-                  required
-                  placeholder="10073-MFD-AS210.iam"
-                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
-                />
-              </label>
+              <AttachNumberFields
+                labelClassName="flex flex-col gap-1 text-xs font-medium text-slate-600"
+                inputClassName="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-teal-700"
+              />
               <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                 Type
                 <KeptSelect

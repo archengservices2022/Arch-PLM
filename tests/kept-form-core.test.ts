@@ -206,7 +206,15 @@ test("wiring: the three main create forms use KeepInputForm with kept fields; pa
   for (const name of ["itemRevisionId", "documentType", "type", "projectId"]) {
     assert.match(page, new RegExp(`<KeptSelect\\n\\s+name="${name}"`), name);
   }
-  assert.match(page, /<KeptInput\n\s+name="fileName"/);
+  // DD-ATTACH: File name + Document number live in AttachNumberFields, inside the Attach form.
+  assert.match(page, /<AttachNumberFields\n/);
+  const attach = source("../app/components/attach-number-fields.tsx");
+  assert.match(attach, /<KeptInput\n\s+name="fileName"/);
+  // DD-1: an explicit "the user owns the number" flag, set by the number box's own edits and on mount.
+  assert.match(attach, /if \(number && !userOwnsNumber\.current\) number\.value = fileNameStem/);
+  assert.match(attach, /userOwnsNumber\.current = event\.currentTarget\.value !== ""/);
+  assert.match(attach, /userOwnsNumber\.current = \(numberRef\.current\?\.value \?\? ""\) !== ""/);
+  assert.match(attach, /<KeptInput\n\s+ref=\{numberRef\}\n\s+name="documentNumber"/);
   const admin = source("../app/admin/users/page.tsx");
   assert.match(admin, /<KeepInputForm\n\s+action=\{createUserAction\}/);
   assert.match(admin, /<KeptInput name="email"/);
